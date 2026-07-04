@@ -2,7 +2,7 @@ import { createLoopbackPair, createVirtualClock, decodeMessage, MessageType, wit
 import { FIXED_DT, type InputFrame } from "@vg/sim";
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
-import { INTERP_DELAY_TICKS, RemoteInterpolator, type RemotePose } from "../src/interpolation.js";
+import { RemoteInterpolator, type RemotePose } from "../src/interpolation.js";
 import { createScriptedInputSender } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
@@ -18,8 +18,28 @@ function strafeInput(t: number): InputFrame {
   return { forward: 0, right: phase === 0 ? 1 : -1, yaw: 0, pitch: 0, jump: t % 40 === 20, crouch: false, walk: false, fire: false };
 }
 
+/** Linearly interpolates the recorded ground-truth path to a fractional tick. */
+function groundTruthAt(path: Map<number, RemotePose>, targetTick: number): RemotePose | null {
+  const lo = Math.floor(targetTick);
+  const hi = Math.ceil(targetTick);
+  const a = path.get(lo);
+  const b = path.get(hi);
+  if (!a || !b) return null;
+  const t = hi === lo ? 0 : targetTick - lo;
+  return {
+    posX: a.posX + (b.posX - a.posX) * t,
+    posY: a.posY + (b.posY - a.posY) * t,
+    posZ: a.posZ + (b.posZ - a.posZ) * t,
+    yaw: a.yaw,
+    pitch: a.pitch,
+    crouching: a.crouching,
+    grounded: a.grounded,
+    connected: true,
+  };
+}
+
 describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
-  it("remote interp buffer starves on < 1% of rendered frames; render error vs the true delayed path stays < 15cm for 99% of frames", () => {
+  it("remote interp buffer starves on < 1% of rendered frames; render error vs the true delayed path (at the interpolator's own continuous target time) stays < 15cm for 99% of frames", () => {
     const host = new ServerHost({ numPlayers: 2 });
     const [rawObserver, rawObserverServer] = createLoopbackPair();
     const [rawStrafer, rawStraferServer] = createLoopbackPair();
@@ -41,7 +61,10 @@ describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
     expect(observerIndex).toBe(0);
     expect(straferIndex).toBe(1);
 
-    const interpolator = new RemoteInterpolator();
+    // The interpolator's clock is the same virtual clock driving the
+    // network, so "render frames" (sampled far more often than network
+    // ticks, below) advance in lockstep with it deterministically.
+    const interpolator = new RemoteInterpolator({ now: clock.now });
     const trueServerPathByTick = new Map<number, RemotePose>();
 
     observerTransport.onMessage((data) => {
@@ -66,53 +89,61 @@ describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
     const sendObserver = createScriptedInputSender(observerTransport);
     const sendStrafer = createScriptedInputSender(rawStrafer);
 
-    const TICKS = 2000;
-    let starvedFramesBefore = 0;
+    const TICKS = 2000; // network/server ticks, per the acceptance criterion
+    const RENDER_SUBSTEPS_PER_TICK = 4; // simulate rendering ~4x the 64Hz network tick rate
+    const subStepMs = FIXED_DT_MS / RENDER_SUBSTEPS_PER_TICK;
+
+    let starvedFrames = 0;
+    let renderedFrames = 0;
     const errors: number[] = [];
 
     for (let i = 0; i < TICKS; i++) {
-      sendObserver(i, { forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
-      sendStrafer(i, strafeInput(i));
-      clock.advance(FIXED_DT_MS);
-      host.step();
+      for (let sub = 0; sub < RENDER_SUBSTEPS_PER_TICK; sub++) {
+        clock.advance(subStepMs);
 
-      const s = host.getState();
-      trueServerPathByTick.set(s.tick, {
-        posX: s.posX[straferIndex]!,
-        posY: s.posY[straferIndex]!,
-        posZ: s.posZ[straferIndex]!,
-        yaw: s.yaw[straferIndex]!,
-        pitch: s.pitch[straferIndex]!,
-        crouching: s.crouching[straferIndex] === 1,
-        grounded: s.grounded[straferIndex] === 1,
-        connected: true,
-      });
+        if (sub === RENDER_SUBSTEPS_PER_TICK - 1) {
+          // One full network tick's worth of time has now elapsed.
+          sendObserver(i, { forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
+          sendStrafer(i, strafeInput(i));
+          host.step();
 
-      const before = interpolator.getStarvedFrameCount();
-      const sample = interpolator.sample();
-      const starvedThisFrame = interpolator.getStarvedFrameCount() > before;
-      if (starvedThisFrame) starvedFramesBefore++;
-
-      if (sample) {
-        const rendered = sample[straferIndex]!;
-        // Ground truth: the true server position at the tick the
-        // interpolator is *actually targeting* (its own newest-received tick
-        // minus the render delay) — this measures the interpolator's
-        // lerp/bracketing fidelity given whatever it has received, not "how
-        // close to live" it is, which is fundamentally bounded by network
-        // delay/jitter/loss and not a fair thing to grade the interpolator on.
-        const trueTick = interpolator.getNewestTick() - INTERP_DELAY_TICKS;
-        const truth = trueServerPathByTick.get(trueTick);
-        if (truth) {
-          const err = Math.hypot(rendered.posX - truth.posX, rendered.posY - truth.posY, rendered.posZ - truth.posZ);
-          errors.push(err);
+          const s = host.getState();
+          trueServerPathByTick.set(s.tick, {
+            posX: s.posX[straferIndex]!,
+            posY: s.posY[straferIndex]!,
+            posZ: s.posZ[straferIndex]!,
+            yaw: s.yaw[straferIndex]!,
+            pitch: s.pitch[straferIndex]!,
+            crouching: s.crouching[straferIndex] === 1,
+            grounded: s.grounded[straferIndex] === 1,
+            connected: true,
+          });
         }
+
+        // Render substep: sample at continuous fractional render time, every substep.
+        renderedFrames++;
+        const targetTick = interpolator.getCurrentTargetTick();
+        const before = interpolator.getStarvedFrameCount();
+        const sample = interpolator.sample();
+        if (interpolator.getStarvedFrameCount() > before) {
+          starvedFrames++;
+          continue;
+        }
+        if (!sample || !Number.isFinite(targetTick)) continue;
+
+        const truth = groundTruthAt(trueServerPathByTick, targetTick);
+        if (!truth) continue;
+
+        const rendered = sample[straferIndex]!;
+        const err = Math.hypot(rendered.posX - truth.posX, rendered.posY - truth.posY, rendered.posZ - truth.posZ);
+        errors.push(err);
       }
     }
 
-    const starvedRate = starvedFramesBefore / TICKS;
+    const starvedRate = starvedFrames / renderedFrames;
     expect(starvedRate).toBeLessThan(0.01);
 
+    expect(errors.length).toBeGreaterThan(1000); // sanity: we actually measured something
     errors.sort((a, b) => a - b);
     const p99Index = Math.floor(errors.length * 0.99);
     const p99 = errors[Math.min(p99Index, errors.length - 1)]!;

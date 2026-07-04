@@ -1,12 +1,24 @@
 // Remote-player interpolation: buffers snapshots keyed by serverTick and
 // renders remote players ~100 ms in the past (two snapshot intervals),
 // lerping between the two bracketing snapshots. Pure logic, no rendering.
+//
+// Sampling is at *continuous* render time, not snapshot cadence: the target
+// tick is `newestTick + renderAlpha - INTERP_DELAY_TICKS`, where renderAlpha
+// is how many ticks' worth of wall-clock time have elapsed since the newest
+// snapshot arrived (grows smoothly between arrivals, resets — mostly to a
+// small residual, since arrivals are roughly periodic — when the next one
+// lands). Calling sample() once per *rendered* frame (not once per fixed
+// network tick) is what actually makes remote players glide instead of
+// stepping at the 32 Hz snapshot rate; see net.ts / main.ts.
+import { FIXED_DT } from "@vg/sim";
 
 /** Render delay behind the newest received snapshot, in ticks (~94 ms @ 64 Hz, two 32 Hz snapshot intervals). */
 export const INTERP_DELAY_TICKS = 6;
 
 /** Snapshots older than this many ticks behind the newest are dropped. */
 const RETENTION_TICKS = 32;
+
+const FIXED_DT_MS = FIXED_DT * 1000;
 
 export interface RemotePose {
   posX: number;
@@ -17,6 +29,11 @@ export interface RemotePose {
   crouching: boolean;
   grounded: boolean;
   connected: boolean;
+}
+
+export interface RemoteInterpolatorOptions {
+  /** Clock in ms, defaults to performance.now. Tests inject a virtual clock for determinism. */
+  now?: () => number;
 }
 
 function wrapAngleDiff(a: number, b: number): number {
@@ -44,14 +61,23 @@ function lerpPose(a: RemotePose, b: RemotePose, t: number): RemotePose {
 
 export class RemoteInterpolator {
   private readonly snapshots = new Map<number, readonly RemotePose[]>();
+  private readonly now: () => number;
   private newestTick = -1;
+  private newestArrivalMs = 0;
   private starvedFrames = 0;
   private lastSample: readonly RemotePose[] | null = null;
+
+  constructor(options: RemoteInterpolatorOptions = {}) {
+    this.now = options.now ?? (() => performance.now());
+  }
 
   ingest(serverTick: number, players: readonly RemotePose[]): void {
     if (serverTick <= this.newestTick && this.snapshots.has(serverTick)) return;
     this.snapshots.set(serverTick, players);
-    if (serverTick > this.newestTick) this.newestTick = serverTick;
+    if (serverTick > this.newestTick) {
+      this.newestTick = serverTick;
+      this.newestArrivalMs = this.now();
+    }
     for (const t of this.snapshots.keys()) {
       if (t < this.newestTick - RETENTION_TICKS) this.snapshots.delete(t);
     }
@@ -61,19 +87,31 @@ export class RemoteInterpolator {
     return this.starvedFrames;
   }
 
-  /** The newest serverTick actually received so far (-1 if none yet). */
+  /** The newest serverTick actually received so far (-1 if none yet); an integer, used e.g. for FireCmd.viewTick. */
   getNewestTick(): number {
     return this.newestTick;
   }
 
-  /** Interpolated poses for all players at (newestTick - INTERP_DELAY_TICKS), or the last good sample if starved. */
+  /**
+   * The continuous (fractional) tick this instant's render should target:
+   * newestTick + renderAlpha - INTERP_DELAY_TICKS, where renderAlpha is the
+   * wall-clock time elapsed since the newest snapshot arrived, expressed in
+   * ticks. Grows smoothly frame to frame; not gated to snapshot cadence.
+   */
+  getCurrentTargetTick(): number {
+    if (this.newestTick < 0) return Number.NEGATIVE_INFINITY;
+    const renderAlpha = (this.now() - this.newestArrivalMs) / FIXED_DT_MS;
+    return this.newestTick + renderAlpha - INTERP_DELAY_TICKS;
+  }
+
+  /** Interpolated poses for all players at the current continuous target tick, or the last good sample if starved. */
   sample(): readonly RemotePose[] | null {
-    if (this.newestTick < 0) {
+    const targetTick = this.getCurrentTargetTick();
+    if (!Number.isFinite(targetTick)) {
       this.starvedFrames++;
       return this.lastSample;
     }
 
-    const targetTick = this.newestTick - INTERP_DELAY_TICKS;
     let lower = -Infinity;
     let upper = Infinity;
     for (const t of this.snapshots.keys()) {
@@ -91,7 +129,8 @@ export class RemoteInterpolator {
     const a = this.snapshots.get(lower)!;
     const b = this.snapshots.get(upper)!;
     const t = upper === lower ? 0 : (targetTick - lower) / (upper - lower);
-    const result = a.map((pa, i) => lerpPose(pa, b[i] ?? pa, t));
+    const clampedT = Math.max(0, Math.min(1, t));
+    const result = a.map((pa, i) => lerpPose(pa, b[i] ?? pa, clampedT));
     this.lastSample = result;
     return result;
   }

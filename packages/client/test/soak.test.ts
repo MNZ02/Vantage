@@ -95,8 +95,8 @@ describe("10-client soak (acceptance criterion 8)", () => {
         const predicted = predictedByIndex.get(slot);
         if (!predicted) continue;
         const input = wanderInput(slot, t);
-        const seq = predicted.queueAndPredict(input);
-        senders[slot]!(seq, input);
+        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        senders[slot]!(seq, quantizedInput);
       }
       clock.advance(FIXED_DT_MS);
       host.step();
@@ -111,8 +111,8 @@ describe("10-client soak (acceptance criterion 8)", () => {
         const predicted = predictedByIndex.get(slot);
         if (!predicted) continue;
         const input: InputFrame = { forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false };
-        const seq = predicted.queueAndPredict(input);
-        senders[slot]!(seq, input);
+        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        senders[slot]!(seq, quantizedInput);
       }
       clock.advance(FIXED_DT_MS);
       host.step();

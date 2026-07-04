@@ -16,7 +16,7 @@ import {
 } from "@vg/sim";
 import {
   MessageType,
-  decodeMessage,
+  decodeMessageSafely,
   encodeMessage,
   type FireCmdMessage,
   type InputSample,
@@ -83,6 +83,9 @@ export class ServerHost {
   /** p95-friendly per-tick timing samples (wall-clock ms spent inside step()), for the soak test. */
   readonly stepDurationsMs: number[] = [];
 
+  /** Count of frames dropped at the decode boundary (unknown tag, truncated, etc.) — see handleMessage(). */
+  private malformedFrameCount = 0;
+
   constructor(opts: ServerHostOptions = {}) {
     this.numPlayers = opts.numPlayers ?? MAX_PLAYERS;
     this.seed = opts.seed ?? 1;
@@ -130,6 +133,11 @@ export class ServerHost {
   /** Hits registered so far (for tests/telemetry); also broadcast on the wire as HitEvent. */
   getHits(): readonly HitRecord[] {
     return this.hits;
+  }
+
+  /** Count of frames dropped for failing to decode (unknown tag, truncated, empty, ...). */
+  getMalformedFrameCount(): number {
+    return this.malformedFrameCount;
   }
 
   private findFreeSlot(): number {
@@ -189,7 +197,14 @@ export class ServerHost {
   }
 
   private handleMessage(record: ClientRecord, data: Uint8Array): void {
-    const msg = decodeMessage(data);
+    // A single malformed/truncated/unknown-tag frame from one client must
+    // never take down the whole process (or even just that client's
+    // connection) — decodeMessageSafely() never throws, it returns null.
+    const msg = decodeMessageSafely(data);
+    if (msg === null) {
+      this.malformedFrameCount++;
+      return;
+    }
     if (msg.type === MessageType.InputBatch) {
       for (let i = 0; i < msg.frames.length; i++) {
         record.jitter.arrive(msg.firstSeq + i, msg.frames[i]!);

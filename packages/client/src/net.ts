@@ -4,7 +4,7 @@
 import {
   MessageType,
   WebSocketTransport,
-  decodeMessage,
+  decodeMessageSafely,
   encodeMessage,
   withLatency,
   type FireCmdMessage,
@@ -13,7 +13,7 @@ import {
   type Transport,
 } from "@vg/protocol";
 import { LEVEL_BOXES, type InputFrame } from "@vg/sim";
-import { INTERP_DELAY_TICKS, RemoteInterpolator, type RemotePose } from "./interpolation.js";
+import { RemoteInterpolator, type RemotePose } from "./interpolation.js";
 import { PredictedClient, type AuthoritativeSnapshot } from "./prediction.js";
 
 const CONNECT_TIMEOUT_MS = 2000;
@@ -167,7 +167,11 @@ export function connectNetClient(): Promise<NetClient | null> {
     }
 
     transport.onMessage((data) => {
-      const msg = decodeMessage(data);
+      // A malformed/truncated frame (corrupt packet, a stray non-protocol
+      // byte, etc.) must be dropped, not thrown from inside a WebSocket
+      // message handler — decodeMessageSafely() never throws.
+      const msg = decodeMessageSafely(data);
+      if (msg === null) return;
       if (msg.type === MessageType.Welcome) {
         if (settled) return;
         settled = true;
@@ -179,8 +183,11 @@ export function connectNetClient(): Promise<NetClient | null> {
           isOnline: () => true,
           sendInput(input: InputFrame) {
             if (!predicted) return;
-            const thisSeq = predicted.queueAndPredict(input);
-            inputHistory.push(input);
+            // Send exactly the quantized input PredictedClient predicted
+            // with (F4 fix) — not the raw one — so the wire bytes agree
+            // bit-for-bit with what local prediction/replay assumed.
+            const { seq: thisSeq, quantizedInput } = predicted.queueAndPredict(input);
+            inputHistory.push(quantizedInput);
             if (inputHistory.length > INPUT_REDUNDANCY) inputHistory.shift();
             const firstSeq = thisSeq - inputHistory.length + 1;
             transport.send(encodeMessage({ type: MessageType.InputBatch, firstSeq, frames: inputHistory.slice() }));
@@ -195,9 +202,12 @@ export function connectNetClient(): Promise<NetClient | null> {
           },
           getLocalIndex: () => localIndex,
           getRemotePoses: () => interpolator.sample(),
-          getViewTick: () => interpolator.getNewestTick() - INTERP_DELAY_TICKS,
+          getViewTick: () => Math.round(interpolator.getCurrentTargetTick()),
           fire() {
-            const viewTick = interpolator.getNewestTick() - INTERP_DELAY_TICKS;
+            // FireCmd.viewTick is a wire u32 — round the continuous render
+            // target to the nearest integer tick (this is exactly the tick
+            // the client was visually rendering remote players at).
+            const viewTick = Math.max(0, Math.round(interpolator.getCurrentTargetTick()));
             const msg: FireCmdMessage = { type: MessageType.FireCmd, seq: fireSeq++, viewTick };
             transport.send(encodeMessage(msg));
           },

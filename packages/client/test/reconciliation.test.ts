@@ -82,8 +82,8 @@ describe("reconciliation correctness (acceptance criterion 3)", () => {
       // that there's nothing to predict or buffer against yet.
       if (predicted) {
         const input = scriptedInput(t);
-        const seq = predicted.queueAndPredict(input);
-        send(seq, input);
+        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        send(seq, quantizedInput);
       }
       t++;
       clock.advance(FIXED_DT_MS);

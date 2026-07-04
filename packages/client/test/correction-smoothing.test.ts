@@ -67,8 +67,8 @@ describe("correction smoothing (acceptance criterion 4)", () => {
     for (let i = 0; i < 400; i++) {
       if (predicted) {
         const input = idleInput();
-        const seq = predicted.queueAndPredict(input);
-        send(seq, input);
+        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        send(seq, quantizedInput);
         renderPositions.push(predicted.getRenderPosition());
       }
 

@@ -5,6 +5,25 @@
 // out-of-order older frame can still overtake a newer one that arrived
 // first, as long as it shows up before its slot is drained) without
 // requiring strict per-tick seq alignment.
+//
+// Design note (reviewer finding F5, deliberately left as-is): once
+// `started`, consume() drains greedily whenever the queue is non-empty and
+// never re-enters a "wait until targetDepth is rebuilt" pause after a
+// starvation event. That means growing targetDepth on starvation doesn't
+// actually restore a cushion for the *next* burst of jitter — it only
+// raises the bar a brand-new client's initial warm-up gate has to clear.
+// In steady state, the input redundancy (each frame resent up to 3x) is
+// doing the real resilience work: a single dropped/delayed arrival is
+// almost always still covered by an earlier copy already in the queue, or
+// arrives in time via a later duplicate before its slot would be missed.
+//
+// The alternative — pausing consumption (re-starving on purpose) until the
+// queue rebuilds to targetDepth after every starvation event — would trade
+// a few extra ticks of added input latency for every player on the server
+// each time *any* single tick starves, which felt like the wrong trade for
+// a feel-sensitive path. Chose to document this clearly instead of change
+// the behavior; revisit if the acceptance numbers (criterion 6) stop
+// holding under harsher jitter profiles than tested here.
 export interface JitterBufferStats {
   starvedRate: number; // fraction of consume() calls that had nothing buffered
   minDepth: number;
@@ -75,7 +94,11 @@ export class JitterBuffer<T> {
     if (this.queue.length === 0) {
       this.starvedCount++;
       // Starving means targetDepth wasn't enough buffering for the observed
-      // jitter; grow it (up to maxTargetDepth) so future ticks buffer more.
+      // jitter; grow it (up to maxTargetDepth). Note this is a secondary,
+      // best-effort signal, not the primary defense — see the file-level
+      // comment (F5): it doesn't pause draining to rebuild a cushion right
+      // now, it only raises the warm-up gate a *future* re-sync would have
+      // to clear. Input redundancy is what actually absorbs this tick's loss.
       this.targetDepth = Math.min(this.maxTargetDepth, this.targetDepth + 1);
       this.overfullStreak = 0;
       this.starvedHistory.push(true);

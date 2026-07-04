@@ -75,6 +75,12 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
+// Deliberately called once per *rendered* frame (see the call site in
+// frame(), outside the fixed-tick input loop) rather than once per fixed
+// 64Hz tick: RemoteInterpolator.sample() now targets a continuous
+// (fractional) render time, not a snapshot-cadence-aligned tick, so calling
+// it every rendered frame is what makes remote players glide instead of
+// visibly stepping at the 32Hz snapshot rate.
 function syncRemoteProxies(): void {
   if (!netClient) return;
   const poses = netClient.getRemotePoses();

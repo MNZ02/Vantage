@@ -1,5 +1,5 @@
 import { createPrngState, nextRandom } from "@vg/sim";
-import { MessageType, decodeMessage, encodeMessage, type InputSample, type ProtocolMessage, type Transport } from "@vg/protocol";
+import { MessageType, decodeMessageSafely, encodeMessage, type InputSample, type ProtocolMessage, type Transport } from "@vg/protocol";
 
 // Bot movement/action lives here (server-side), not sim/src, so it is not
 // bound by the sim's purity guard — it's free to use ordinary Math.* — but it
@@ -31,7 +31,10 @@ export class Bot {
   ) {
     this.prngState = createPrngState(seed);
     this.waypointIndex = this.randInt(WAYPOINTS.length);
-    transport.onMessage((data) => this.handleMessage(decodeMessage(data)));
+    transport.onMessage((data) => {
+      const msg = decodeMessageSafely(data);
+      if (msg !== null) this.handleMessage(msg);
+    });
   }
 
   private rand(): number {

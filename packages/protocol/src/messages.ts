@@ -154,7 +154,21 @@ class Writer {
   }
 }
 
-/** Little-endian byte reader with bounds-checked reads. */
+/** Thrown for any malformed/truncated/oversized message; callers must catch this at the decode boundary. */
+export class MalformedMessageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MalformedMessageError";
+  }
+}
+
+/**
+ * Little-endian byte reader, genuinely bounds-checked: every read verifies
+ * enough bytes remain *before* touching the DataView, rather than relying on
+ * DataView's own out-of-bounds RangeError. A single malformed/truncated
+ * frame must never crash the process it's decoded in — see
+ * decodeMessageSafely() below, which is what callers should actually use.
+ */
 class Reader {
   private view: DataView;
   private offset = 0;
@@ -163,25 +177,37 @@ class Reader {
     this.view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   }
 
+  private ensureReadable(size: number): void {
+    if (this.offset + size > this.view.byteLength) {
+      throw new MalformedMessageError(
+        `truncated message: need ${size} more byte(s) at offset ${this.offset}, have ${this.view.byteLength - this.offset}`,
+      );
+    }
+  }
+
   u8(): number {
+    this.ensureReadable(1);
     const v = this.view.getUint8(this.offset);
     this.offset += 1;
     return v;
   }
 
   i8(): number {
+    this.ensureReadable(1);
     const v = this.view.getInt8(this.offset);
     this.offset += 1;
     return v;
   }
 
   u32(): number {
+    this.ensureReadable(4);
     const v = this.view.getUint32(this.offset, true);
     this.offset += 4;
     return v;
   }
 
   f32(): number {
+    this.ensureReadable(4);
     const v = this.view.getFloat32(this.offset, true);
     this.offset += 4;
     return v;
@@ -192,6 +218,33 @@ function quantizeAxis(v: number): number {
   if (v > 0.5) return 1;
   if (v < -0.5) return -1;
   return 0;
+}
+
+const f32RoundScratch = new Float32Array(1);
+function quantizeF32(v: number): number {
+  f32RoundScratch[0] = v;
+  return f32RoundScratch[0]!;
+}
+
+/**
+ * Quantizes an input sample's numeric fields to exactly what the wire format
+ * will carry: forward/right collapse to -1/0/1 (i8), yaw/pitch round to f32
+ * precision. Reviewer finding F4: the client was predicting/replaying with
+ * raw f64/analog values while the server only ever sees this quantized
+ * form (having decoded it off the wire) — an unquantized client prediction
+ * disagrees with the server by a tiny but *systematic* (not random) amount
+ * every tick, which compounds over a long match. Call this once, at input
+ * time, and use the result for prediction, replay, *and* the wire send, so
+ * there is exactly one "true" value per tick and it round-trips exactly.
+ */
+export function quantizeInputSample<T extends { forward: number; right: number; yaw: number; pitch: number }>(input: T): T {
+  return {
+    ...input,
+    forward: quantizeAxis(input.forward),
+    right: quantizeAxis(input.right),
+    yaw: quantizeF32(input.yaw),
+    pitch: quantizeF32(input.pitch),
+  };
 }
 
 function encodeButtons(s: Pick<InputSample, "jump" | "crouch" | "walk" | "fire">): number {
@@ -343,7 +396,25 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
     }
     default: {
       const exhaustive: never = type;
-      throw new Error(`unknown message type: ${exhaustive as number}`);
+      throw new MalformedMessageError(`unknown message type tag: ${exhaustive as number}`);
     }
+  }
+}
+
+/**
+ * Safe decode boundary: every socket message handler (server and client)
+ * must go through this, not decodeMessage() directly. A single malformed,
+ * truncated, empty, or oversized frame from one client/peer must never take
+ * down the process or the connection for anyone else — it's just dropped.
+ * Returns null for anything that fails to decode.
+ */
+export function decodeMessageSafely(data: Uint8Array): ProtocolMessage | null {
+  try {
+    return decodeMessage(data);
+  } catch (err) {
+    if (err instanceof MalformedMessageError) return null;
+    // Defensively treat any other decode-time exception the same way — a
+    // bad frame must degrade to "ignored", never to a crash.
+    return null;
   }
 }

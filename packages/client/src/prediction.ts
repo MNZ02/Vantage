@@ -2,6 +2,7 @@
 // no DOM/rendering — net.ts wires this to the real WebSocket, tests wire it
 // to a loopback @vg/server ServerHost directly.
 import { createState, tick, type Box, type InputFrame, type SimState } from "@vg/sim";
+import { quantizeInputSample } from "@vg/protocol";
 
 /** Per-tick decay applied to the render-only correction offset (see reconcile()). */
 const CORRECTION_DECAY_PER_TICK = 0.85;
@@ -80,13 +81,23 @@ export class PredictedClient {
     return tick(state, inputs as readonly InputFrame[], this.boxes);
   }
 
-  /** Call once per fixed tick with this tick's built input. Returns the sequence number sent on the wire. */
-  queueAndPredict(input: InputFrame): number {
+  /**
+   * Call once per fixed tick with this tick's built input. Quantizes it to
+   * exactly what the wire will carry (forward/right -> -1/0/1, yaw/pitch ->
+   * f32) *before* predicting or buffering — reviewer finding F4: predicting
+   * with the raw analog/f64 input while the server only ever applies the
+   * post-wire-quantized version produces a small but systematic drift that
+   * compounds over a long match. Returns the sequence number and the exact
+   * (quantized) input the caller must send on the wire, so prediction,
+   * replay, and the sent bytes all agree on one "true" value per tick.
+   */
+  queueAndPredict(input: InputFrame): { seq: number; quantizedInput: InputFrame } {
+    const quantizedInput = quantizeInputSample(input);
     const seq = this.nextSeq++;
-    this.inputBuffer.set(seq, input);
-    this.state = this.stepLocalOnly(this.state, input);
+    this.inputBuffer.set(seq, quantizedInput);
+    this.state = this.stepLocalOnly(this.state, quantizedInput);
     this.decayCorrection();
-    return seq;
+    return { seq, quantizedInput };
   }
 
   private decayCorrection(): void {
