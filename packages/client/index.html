@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Graybox — M0</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+      }
+      #app {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        cursor: crosshair;
+      }
+      #hint {
+        position: fixed;
+        bottom: 8px;
+        left: 8px;
+        font: 12px monospace;
+        color: #ddd;
+        background: rgba(0, 0, 0, 0.5);
+        padding: 4px 8px;
+        z-index: 10;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="app"></canvas>
+    <div id="hint">click to lock pointer — WASD move, Shift walk, Ctrl crouch, Space jump</div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

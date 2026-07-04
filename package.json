@@ -1,0 +1,16 @@
+{
+  "name": "valorant-clone",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @vg/client dev",
+    "build": "pnpm --filter @vg/sim build && pnpm --filter @vg/client build",
+    "test": "pnpm --filter @vg/sim test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "packageManager": "pnpm@11.1.3",
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
