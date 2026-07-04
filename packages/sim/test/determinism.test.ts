@@ -15,9 +15,11 @@ function scriptedInput(t: number): InputFrame {
     forward: Math.sin(t * 0.05),
     right: Math.cos(t * 0.07) * 0.5,
     yaw,
+    pitch: Math.sin(t * 0.011) * 0.2,
     jump: t % 97 === 0,
     crouch: t % 150 < 40,
     walk: t % 200 < 30,
+    fire: t % 61 === 0,
   };
 }
 

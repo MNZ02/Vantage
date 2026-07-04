@@ -17,13 +17,15 @@ export interface InputFrame {
   readonly forward: number; // -1..1, local +forward
   readonly right: number; // -1..1, local +right
   readonly yaw: number; // radians, look yaw used to build the world-space wish direction
+  readonly pitch: number; // radians, look pitch; movement ignores it, carried for view/raycast purposes
   readonly jump: boolean;
   readonly crouch: boolean;
   readonly walk: boolean;
+  readonly fire: boolean; // movement ignores it; consumed by the server's hitscan handling
 }
 
-export function defaultInput(yaw = 0): InputFrame {
-  return { forward: 0, right: 0, yaw, jump: false, crouch: false, walk: false };
+export function defaultInput(yaw = 0, pitch = 0): InputFrame {
+  return { forward: 0, right: 0, yaw, pitch, jump: false, crouch: false, walk: false, fire: false };
 }
 
 /**
@@ -45,6 +47,7 @@ export interface SimState {
   readonly velZ: Float64Array;
 
   readonly yaw: Float64Array;
+  readonly pitch: Float64Array;
   readonly crouching: Uint8Array;
   readonly grounded: Uint8Array;
 }
@@ -64,6 +67,7 @@ export function createState(seed: number, numPlayers: number = MAX_PLAYERS): Sim
     velY: new Float64Array(numPlayers),
     velZ: new Float64Array(numPlayers),
     yaw: new Float64Array(numPlayers),
+    pitch: new Float64Array(numPlayers),
     crouching: new Uint8Array(numPlayers),
     grounded: new Uint8Array(numPlayers),
   };
@@ -82,6 +86,7 @@ export function cloneState(state: SimState): SimState {
     velY: state.velY.slice(),
     velZ: state.velZ.slice(),
     yaw: state.yaw.slice(),
+    pitch: state.pitch.slice(),
     crouching: state.crouching.slice(),
     grounded: state.grounded.slice(),
   };
@@ -100,6 +105,7 @@ export function serializeState(state: SimState): string {
     `velY:${Array.from(state.velY).join(",")}`,
     `velZ:${Array.from(state.velZ).join(",")}`,
     `yaw:${Array.from(state.yaw).join(",")}`,
+    `pitch:${Array.from(state.pitch).join(",")}`,
     `crouch:${Array.from(state.crouching).join(",")}`,
     `grounded:${Array.from(state.grounded).join(",")}`,
   ];

@@ -26,6 +26,7 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
     next.grounded[i] = result.grounded ? 1 : 0;
     next.crouching[i] = input.crouch ? 1 : 0;
     next.yaw[i] = input.yaw;
+    next.pitch[i] = input.pitch;
   }
 
   const rng = nextRandom(state.prngState);
