@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm --filter @vg/client dev",
-    "build": "pnpm --filter @vg/sim build && pnpm --filter @vg/client build",
-    "test": "pnpm --filter @vg/sim test",
-    "typecheck": "pnpm -r typecheck"
+    "dev:server": "pnpm --filter @vg/server dev",
+    "build:libs": "pnpm --filter @vg/sim build && pnpm --filter @vg/protocol build && pnpm --filter @vg/server build",
+    "build": "pnpm run build:libs && pnpm --filter @vg/client build",
+    "test": "pnpm run build:libs && pnpm --filter @vg/sim test && pnpm --filter @vg/protocol test && pnpm --filter @vg/server test && pnpm --filter @vg/client test",
+    "typecheck": "pnpm run build:libs && pnpm -r typecheck"
   },
   "packageManager": "pnpm@11.1.3",
   "devDependencies": {

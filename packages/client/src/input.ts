@@ -6,6 +6,11 @@ const MAX_PITCH = Math.PI / 2 - 0.01;
 const keys = new Set<string>();
 let yaw = 0;
 let pitch = 0;
+let firePending = false;
+
+function onMouseDown(e: MouseEvent): void {
+  if (e.button === 0) firePending = true;
+}
 
 function onKeyDown(e: KeyboardEvent): void {
   keys.add(e.code);
@@ -47,6 +52,7 @@ export function setupInput(canvas: HTMLCanvasElement): void {
   document.addEventListener("keydown", onKeyDown);
   document.addEventListener("keyup", onKeyUp);
   document.addEventListener("mousemove", (e) => onMouseMove(e, canvas));
+  document.addEventListener("mousedown", onMouseDown);
   document.addEventListener("pointerlockerror", () => {
     // eslint-disable-next-line no-console
     console.warn("Pointer lock request failed");
@@ -61,16 +67,20 @@ export function getPitch(): number {
   return pitch;
 }
 
-/** Builds this instant's InputFrame for player 0 from held keys + current look yaw. */
+/** Builds this instant's InputFrame for player 0 from held keys + current look yaw/pitch. */
 export function buildInputFrame(): InputFrame {
   const forward = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
   const right = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0);
+  const fire = firePending;
+  firePending = false;
   return {
     forward,
     right,
     yaw,
+    pitch,
     jump: keys.has("Space"),
     crouch: keys.has("ControlLeft") || keys.has("ControlRight"),
     walk: keys.has("ShiftLeft") || keys.has("ShiftRight"),
+    fire,
   };
 }
