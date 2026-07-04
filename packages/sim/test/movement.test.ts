@@ -126,15 +126,21 @@ describe("wall collision", () => {
     for (let i = 0; i < 600; i++) {
       state = tick(state, [input], boxes);
       const x = state.posX[0]!;
+      const y = state.posY[0]!;
       const z = state.posZ[0]!;
       maxX = Math.max(maxX, x);
 
-      // distance from capsule center to the wall's XZ rectangle
-      const closestX = Math.min(WALL.maxX, Math.max(WALL.minX, x));
-      const closestZ = Math.min(WALL.maxZ, Math.max(WALL.minZ, z));
-      const dist = Math.hypot(x - closestX, z - closestZ);
-      const penetration = 0.4 - dist; // capsule radius = 0.4
-      maxPenetration = Math.max(maxPenetration, penetration);
+      // Horizontal penetration against every box in the scene (not just the
+      // wall we're aiming at) — acceptance criterion 4d says "any box".
+      for (const b of boxes) {
+        const height = 1.8; // standing capsule height, matches STAND_HEIGHT
+        if (y + height <= b.minY || y >= b.maxY) continue; // no vertical overlap
+        const closestX = Math.min(b.maxX, Math.max(b.minX, x));
+        const closestZ = Math.min(b.maxZ, Math.max(b.minZ, z));
+        const dist = Math.hypot(x - closestX, z - closestZ);
+        const penetration = 0.4 - dist; // capsule radius = 0.4
+        maxPenetration = Math.max(maxPenetration, penetration);
+      }
 
       if (i === 100) zAtStart = z;
     }
@@ -144,5 +150,72 @@ describe("wall collision", () => {
     expect(maxX).toBeLessThan(WALL.minX + 0.5);
     // kept sliding tangentially (z kept increasing) after first making contact
     expect(state.posZ[0]!).toBeGreaterThan(zAtStart + 1);
+  });
+});
+
+describe("grounded step-up (stairs)", () => {
+  // Mirrors packages/client/src/graybox.ts's ramp: 10 steps, 0.2 m tall
+  // (under MAX_STEP_HEIGHT), 0.9 m deep, topped by a flat landing.
+  function buildStaircase(): { boxes: Box[]; topHeight: number } {
+    const floor: Box = { minX: -100, minY: -1, minZ: -100, maxX: 100, maxY: 0, maxZ: 100 };
+    const stepCount = 10;
+    const stepHeight = 0.2;
+    const stepDepth = 0.9;
+    const width = 3;
+    const boxes: Box[] = [floor];
+    for (let i = 0; i < stepCount; i++) {
+      const top = (i + 1) * stepHeight;
+      const z = 10 + i * stepDepth;
+      boxes.push({
+        minX: -width / 2,
+        maxX: width / 2,
+        minY: 0,
+        maxY: top,
+        minZ: z - stepDepth / 2,
+        maxZ: z + stepDepth / 2,
+      });
+    }
+    const topHeight = stepCount * stepHeight;
+    const lastStepFarZ = 10 + (stepCount - 1) * stepDepth + stepDepth / 2;
+    boxes.push({
+      minX: -width / 2,
+      maxX: width / 2,
+      minY: 0,
+      maxY: topHeight,
+      minZ: lastStepFarZ,
+      maxZ: lastStepFarZ + 4,
+    });
+    return { boxes, topHeight };
+  }
+
+  it("climbs the ramp to the top platform holding forward only, no jump", () => {
+    const { boxes, topHeight } = buildStaircase();
+    let state = createState(6, 1);
+    state = stepMany(state, defaultInput(0), boxes, 5);
+
+    const input: InputFrame = { ...defaultInput(0), forward: 1 }; // jump stays false throughout
+    let maxY = 0;
+    for (let i = 0; i < 500; i++) {
+      state = tick(state, [input], boxes);
+      maxY = Math.max(maxY, state.posY[0]!);
+    }
+
+    expect(maxY).toBeGreaterThan(topHeight - 0.05);
+  });
+
+  it("does not change flat-ground run speed convergence", () => {
+    let state = createState(7, 1);
+    const boxes = [FLOOR];
+    state = stepMany(state, defaultInput(0), boxes, 5);
+    const input: InputFrame = { ...defaultInput(0), forward: 1 };
+
+    let maxSpeed = 0;
+    for (let i = 0; i < 400; i++) {
+      state = tick(state, [input], boxes);
+      maxSpeed = Math.max(maxSpeed, speed(state));
+    }
+    expect(speed(state)).toBeGreaterThan(RUN_SPEED - 0.01);
+    expect(speed(state)).toBeLessThan(RUN_SPEED + 0.01);
+    expect(maxSpeed).toBeLessThanOrEqual(RUN_SPEED + 1e-9);
   });
 });

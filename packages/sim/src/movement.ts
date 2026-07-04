@@ -9,6 +9,7 @@ import {
   GROUND_PROBE_EPSILON,
   GRAVITY,
   JUMP_SPEED,
+  MAX_STEP_HEIGHT,
   RUN_SPEED,
   SKIN_WIDTH,
   STAND_HEIGHT,
@@ -79,6 +80,11 @@ function applyAccelerate(
 // within the capsule radius (a horizontal-only concern) — a tall wall the
 // player is walking toward would otherwise look "vertically embedded" the
 // moment it enters the radius, well before it's actually a wall hit.
+//
+// TODO: this gates on the capsule's center point only, not its radius, so a
+// player standing right at a platform's edge (center just outside, but the
+// capsule disc overlapping it) won't be considered "on" it — noted, not fixed,
+// per reviewer triage (deferred as optional for M0's graybox geometry).
 function columnCenterInsideFootprint(box: Box, x: number, z: number): boolean {
   return x >= box.minX && x <= box.maxX && z >= box.minZ && z <= box.maxZ;
 }
@@ -232,6 +238,18 @@ function resolveHorizontal(
   return { x: px, z: pz, velX: vx, velZ: vz, penetration: maxPenetration };
 }
 
+/** Highest box top at or below `atOrBelowY` whose footprint contains (x, z), or null if none. */
+function findFloorBelow(x: number, z: number, atOrBelowY: number, boxes: readonly Box[]): number | null {
+  let best: number | null = null;
+  for (const box of boxes) {
+    if (!columnCenterInsideFootprint(box, x, z)) continue;
+    if (box.maxY <= atOrBelowY + 1e-6 && (best === null || box.maxY > best)) {
+      best = box.maxY;
+    }
+  }
+  return best;
+}
+
 export interface MovementResult {
   posX: number;
   posY: number;
@@ -290,14 +308,41 @@ export function movePlayer(
   const vertical = resolveVertical(prevFeetY, newFeetYUnresolved, height, newX, newZ, velY, boxes);
   const horizontal = resolveHorizontal(newX, newZ, vertical.feetY, height, velX, velZ, boxes);
 
+  let finalFeetY = vertical.feetY;
+  let finalHorizontal = horizontal;
+  let finalGrounded = vertical.grounded;
+  let finalVelY = vertical.velY;
+
+  // Grounded step-up (stairs/curbs/low ledges): if we were blocked moving
+  // horizontally, retry the same move with the feet raised by MAX_STEP_HEIGHT.
+  // Re-running resolveHorizontal at that height also re-checks for a ceiling
+  // there (any box overlapping the raised capsule still blocks it the same
+  // way), so "is there headroom to step up" falls out of the same collision
+  // test rather than needing a separate check.
+  if (wasGrounded && horizontal.penetration > 1e-6) {
+    const raisedFeetY = vertical.feetY + MAX_STEP_HEIGHT;
+    const stepped = resolveHorizontal(newX, newZ, raisedFeetY, height, velX, velZ, boxes);
+    const blockedDist = Math.hypot(newX - horizontal.x, newZ - horizontal.z);
+    const steppedDist = Math.hypot(newX - stepped.x, newZ - stepped.z);
+    if (steppedDist < blockedDist - 1e-4) {
+      const floorY = findFloorBelow(stepped.x, stepped.z, raisedFeetY, boxes);
+      if (floorY !== null && floorY >= vertical.feetY - 1e-6 && floorY - vertical.feetY <= MAX_STEP_HEIGHT + 1e-6) {
+        finalFeetY = floorY;
+        finalHorizontal = stepped;
+        finalGrounded = true;
+        finalVelY = 0;
+      }
+    }
+  }
+
   return {
-    posX: horizontal.x,
-    posY: vertical.feetY,
-    posZ: horizontal.z,
-    velX: horizontal.velX,
-    velY: vertical.velY,
-    velZ: horizontal.velZ,
-    grounded: vertical.grounded,
-    penetration: horizontal.penetration,
+    posX: finalHorizontal.x,
+    posY: finalFeetY,
+    posZ: finalHorizontal.z,
+    velX: finalHorizontal.velX,
+    velY: finalVelY,
+    velZ: finalHorizontal.velZ,
+    grounded: finalGrounded,
+    penetration: finalHorizontal.penetration,
   };
 }

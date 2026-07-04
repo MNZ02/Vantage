@@ -33,3 +33,8 @@ export const EYE_HEIGHT_CROUCH = 1.15;
 // Collision tolerances.
 export const GROUND_PROBE_EPSILON = 0.05; // m, how far below feet counts as "grounded"
 export const SKIN_WIDTH = 1e-4; // m, small separation kept after push-out to avoid re-penetration jitter
+
+// Source-style grounded step-up: a box top at or below this height above the
+// current feet, when grounded and otherwise blocked, is climbed automatically
+// instead of treated as a wall (stairs, curbs, low ledges).
+export const MAX_STEP_HEIGHT = 0.45;
