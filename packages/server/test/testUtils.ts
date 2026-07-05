@@ -33,5 +33,11 @@ export function idleInput(): InputSample {
     reload: false,
     slot1: false,
     slot2: false,
+    interact: false,
+    ping: false,
+    ability1: false,
+    ability2: false,
+    signature: false,
+    ult: false,
   };
 }

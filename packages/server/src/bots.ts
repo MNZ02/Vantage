@@ -1,4 +1,9 @@
 import {
+  AGENT_LUMEN,
+  AGENT_NONE,
+  AGENT_SONAR,
+  AGENT_UMBRA,
+  AGENT_ZEPHYR,
   CROUCH_HEIGHT,
   EYE_HEIGHT_STAND,
   MODE_MATCH,
@@ -51,7 +56,13 @@ interface KnownOther {
   alive: boolean;
   connected: boolean;
   team: number;
+  health: number;
 }
+
+/** Ability-cast probability per tick when a heuristic condition is met (kept low — spec: "occasionally cast", not every tick). */
+const ABILITY_CAST_CHANCE = 0.02;
+const HURT_TEAMMATE_HEALTH_THRESHOLD = 70;
+const MEND_RANGE_M = 15; // a bit under Mend's 20m cast range, so the bot is reliably in range when it presses the button
 
 export class Bot {
   private prngState: number;
@@ -79,6 +90,18 @@ export class Bot {
   private spikeZ = 0;
   /** Which of the two sites this bot commits to (stable per-instance so a squad naturally splits). */
   private readonly assignedSiteIndex: number;
+
+  // ---- M4a ability awareness ----
+  private agentId = AGENT_NONE;
+  private abilityCharges: readonly [number, number, number, number] = [0, 0, 0, 0];
+  private ultPoints = 0;
+  /** Set once per tick when a cast heuristic fires; consumed by the send() call at the end of that tick's tick(). */
+  private wantCast: { ability1: boolean; ability2: boolean; signature: boolean; ult: boolean } = {
+    ability1: false,
+    ability2: false,
+    signature: false,
+    ult: false,
+  };
 
   constructor(
     private readonly transport: Transport,
@@ -125,10 +148,43 @@ export class Bot {
         this.alive = me.alive;
         this.hasPrimary = me.weaponPrimary !== 255;
         this.team = me.team;
+        this.agentId = me.agentId;
+        this.abilityCharges = me.abilityCharges;
+        this.ultPoints = me.ultPoints;
       }
       this.others = msg.players
         .filter((_, i) => i !== this.playerIndex)
-        .map((p) => ({ x: p.posX, y: p.posY, z: p.posZ, crouching: p.crouching, alive: p.alive, connected: p.connected, team: p.team }));
+        .map((p) => ({ x: p.posX, y: p.posY, z: p.posZ, crouching: p.crouching, alive: p.alive, connected: p.connected, team: p.team, health: p.health }));
+    }
+  }
+
+  /**
+   * Simple per-agent cast heuristics, evaluated once per tick (spec: bots
+   * "occasionally cast" — shock darts at enemies, smokes at sites, Lumen
+   * heals hurt teammates, dash for the duelist bot). Deliberately scripted,
+   * not combat-aware AI: enough to exercise every kit in the soak, no more.
+   * `enemy`/`pos` are whatever this tick's movement logic already computed.
+   */
+  private evaluateAbilityHeuristics(pos: { x: number; z: number }, enemy: KnownOther | null): void {
+    this.wantCast = { ability1: false, ability2: false, signature: false, ult: false };
+    if (!this.alive || this.agentId === AGENT_NONE) return;
+
+    if (this.agentId === AGENT_SONAR) {
+      // Shock dart at a spotted enemy.
+      if (enemy && this.abilityCharges[0] > 0 && this.rand() < ABILITY_CAST_CHANCE) this.wantCast.ability1 = true;
+      if (this.ultPoints >= 8 && this.rand() < ABILITY_CAST_CHANCE * 0.3) this.wantCast.ult = true;
+    } else if (this.agentId === AGENT_UMBRA) {
+      // Smoke (signature/shroud) roughly at a site while pushing/holding.
+      if (this.abilityCharges[2] > 0 && this.rand() < ABILITY_CAST_CHANCE) this.wantCast.signature = true;
+    } else if (this.agentId === AGENT_LUMEN) {
+      const hurtTeammateNearby = this.others.some(
+        (o) => o.alive && o.team === this.team && o.health > 0 && o.health < HURT_TEAMMATE_HEALTH_THRESHOLD && Math.hypot(o.x - pos.x, o.z - pos.z) <= MEND_RANGE_M,
+      );
+      if (hurtTeammateNearby && this.abilityCharges[2] > 0 && this.rand() < ABILITY_CAST_CHANCE * 2) this.wantCast.signature = true;
+    } else if (this.agentId === AGENT_ZEPHYR) {
+      // Dash while actually moving somewhere (signature).
+      if (this.abilityCharges[2] > 0 && this.rand() < ABILITY_CAST_CHANCE) this.wantCast.signature = true;
+      if (this.ultPoints >= 7 && enemy && this.rand() < ABILITY_CAST_CHANCE * 0.3) this.wantCast.ult = true;
     }
   }
 
@@ -210,6 +266,10 @@ export class Bot {
       slot2: false,
       interact: false,
       ping: false,
+      ability1: false,
+      ability2: false,
+      signature: false,
+      ult: false,
     };
   }
 
@@ -302,6 +362,7 @@ export class Bot {
       right = wishX * Math.cos(yaw) - wishZ * Math.sin(yaw);
     }
 
+    this.evaluateAbilityHeuristics(pos, enemy);
     this.send({
       forward,
       right,
@@ -317,6 +378,10 @@ export class Bot {
       slot2: false,
       interact: shouldInteract,
       ping: false,
+      ability1: this.wantCast.ability1,
+      ability2: this.wantCast.ability2,
+      signature: this.wantCast.signature,
+      ult: this.wantCast.ult,
     });
   }
 
@@ -377,6 +442,7 @@ export class Bot {
       this.ticksUntilNextBurst = 5 + this.randInt(20);
     }
 
+    this.evaluateAbilityHeuristics(pos, enemy);
     this.send({
       forward: 1,
       right: 0,
@@ -392,6 +458,10 @@ export class Bot {
       slot2: false,
       interact: false,
       ping: false,
+      ability1: this.wantCast.ability1,
+      ability2: this.wantCast.ability2,
+      signature: this.wantCast.signature,
+      ult: this.wantCast.ult,
     });
   }
 }
