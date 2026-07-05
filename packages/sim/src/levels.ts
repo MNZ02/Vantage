@@ -102,3 +102,51 @@ export const DM_SPAWNS: ReadonlyArray<{ x: number; y: number; z: number; yaw: nu
   { x: 8, y: 0, z: -16, yaw: PI / 3 },
   { x: -8, y: 0, z: -16, yaw: -PI / 3 },
 ];
+
+// ---- M3 match-mode level data ----
+//
+// Graybox layout (top-down, +Z is "north"): attackers spawn deep south
+// (z ~ -18), defenders deep north (z ~ +18); two site zones sit off to the
+// east/west of the open mid lane around z in [-1, 9], well clear of the
+// existing interior wall/crates (x in [-8, 8], z in [-4, 4]) and the ramp
+// (z >= 10). Two BARRIER boxes bisect the mid lane at z = -8 and z = +8 —
+// each blocks only ONE team, so during the buy phase attackers are held
+// south of z=-8 and defenders north of z=+8, leaving a no-man's-land between
+// them; both barriers disappear (are simply not added to the collision list)
+// once the round phase starts. Kept intentionally simple per the M3 spec
+// ("a few added boxes are fine — keep it shared collision+render data").
+
+/** Attacker (team 0) spawn points, south end of the map, facing north (+Z, yaw 0). */
+export const ATTACKER_SPAWNS: ReadonlyArray<{ x: number; y: number; z: number; yaw: number }> = [
+  { x: -8, y: 0, z: -18, yaw: 0 },
+  { x: -4, y: 0, z: -18, yaw: 0 },
+  { x: 0, y: 0, z: -18, yaw: 0 },
+  { x: 4, y: 0, z: -18, yaw: 0 },
+  { x: 8, y: 0, z: -18, yaw: 0 },
+];
+
+/** Defender (team 1) spawn points, north end of the map, facing south (-Z, yaw PI). */
+export const DEFENDER_SPAWNS: ReadonlyArray<{ x: number; y: number; z: number; yaw: number }> = [
+  { x: -8, y: 0, z: 18, yaw: PI },
+  { x: -4, y: 0, z: 18, yaw: PI },
+  { x: 0, y: 0, z: 18, yaw: PI },
+  { x: 4, y: 0, z: 18, yaw: PI },
+  { x: 8, y: 0, z: 18, yaw: PI },
+];
+
+/** Plant/defuse site zones — purely logical regions (not collision), tested by point-in-box. */
+export const SITE_ZONES: ReadonlyArray<{ name: "A" | "B"; box: Box }> = [
+  { name: "A", box: box([-14, 0.5, 4], [8, 3, 10]) },
+  { name: "B", box: box([14, 0.5, 4], [8, 3, 10]) },
+];
+
+/**
+ * Buy-phase-only collision barriers. `team` names which team the box blocks —
+ * the OTHER team walks through it freely. Both entries are simply omitted
+ * from a player's effective collision list once matchPhase leaves PHASE_BUY
+ * — see tick.ts's per-player effective-boxes assembly.
+ */
+export const BARRIERS: ReadonlyArray<{ box: Box; team: 0 | 1 }> = [
+  { box: box([0, 1.5, -8], [FLOOR_SIZE, 3, 1]), team: 0 }, // blocks attackers from pushing north past z=-8
+  { box: box([0, 1.5, 8], [FLOOR_SIZE, 3, 1]), team: 1 }, // blocks defenders from pushing south past z=8
+];

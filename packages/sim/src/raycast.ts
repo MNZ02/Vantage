@@ -11,6 +11,7 @@ import {
   HEAD_REGION_HEIGHT_M,
   LEG_REGION_HEIGHT_FRACTION,
   STAND_HEIGHT,
+  TEAM_NONE,
 } from "./constants.js";
 import { cosApprox, sinApprox } from "./math.js";
 import type { Box, SimState } from "./state.js";
@@ -209,18 +210,34 @@ export function regionForHitHeight(hitY: number, feetY: number, height: number):
   return "body";
 }
 
-/** Nearest LIVING player (excluding the shooter) the ray hits within maxDist, or null. Dead players never block or receive hits. */
+/**
+ * Nearest LIVING player (excluding the shooter) the ray hits within maxDist,
+ * or null. Dead players never block or receive hits.
+ *
+ * `excludeTeammates` (M3, friendly fire off in match mode): when true,
+ * players sharing the shooter's team are skipped entirely — never a hit,
+ * never a blocker — so a teammate standing directly in the shot's path
+ * doesn't even absorb it (the ray passes through to whoever's behind, same
+ * as it would if the teammate weren't there). Only applied when the
+ * shooter's own team is a real team (not TEAM_NONE/255), so it's a safe
+ * no-op in DM (team arrays are all TEAM_NONE there). Callers must pass the
+ * SAME value here for the server's authoritative resolution and the
+ * client's cosmetic predicted-hit raycast, or hit-reg telemetry desyncs.
+ */
 export function raycastPlayers(
   state: SimState,
   shooterIndex: number,
   origin: Vec3Like,
   dir: Vec3Like,
   maxDist: number,
+  excludeTeammates = false,
 ): PlayerHit | null {
+  const shooterTeam = state.team[shooterIndex];
   let best: PlayerHit | null = null;
   for (let i = 0; i < state.numPlayers; i++) {
     if (i === shooterIndex) continue;
     if (state.alive[i] === 0) continue;
+    if (excludeTeammates && shooterTeam !== TEAM_NONE && state.team[i] === shooterTeam) continue;
     const height = state.crouching[i] === 1 ? CROUCH_HEIGHT : STAND_HEIGHT;
     const feetY = state.posY[i]!;
     const hit = raycastCapsule(state.posX[i]!, feetY, state.posZ[i]!, height, origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, maxDist);

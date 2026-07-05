@@ -9,3 +9,4 @@ export * from "./levels.js";
 export * from "./damage.js";
 export * from "./weapons/data.js";
 export * from "./weapons/logic.js";
+export * from "./match.js";

@@ -5,7 +5,7 @@
 // `prev` (last tick's state) and writes into `next` (this tick's state,
 // already cloned by tick()), never touching wall-clock/random ambient state.
 
-import { COUNTER_STRAFE_DEADZONE, FIXED_DT, RESPAWN_TICKS, RUN_SPEED, SPAWN_HEALTH, SPRAY_RESET_TICKS, WEAPON_NONE } from "../constants.js";
+import { COUNTER_STRAFE_DEADZONE, FIXED_DT, MODE_MATCH, RESPAWN_TICKS, RUN_SPEED, SPAWN_HEALTH, SPRAY_RESET_TICKS, WEAPON_NONE } from "../constants.js";
 import { DM_SPAWNS } from "../levels.js";
 import { PI, clamp, cosApprox, length2D, sinApprox } from "../math.js";
 import { hashRandom2, hashSeed3, nextRandom } from "../prng.js";
@@ -251,10 +251,15 @@ export function respawnPlayer(next: SimState, playerIndex: number, currentTick: 
   }
 }
 
-/** Schedules a death: called by damage.ts's applyDamage when health hits 0. */
+/**
+ * Schedules a death: called by damage.ts's applyDamage when health hits 0.
+ * In match mode there is no auto-respawn — a dead player stays dead until
+ * the next buy-phase transition revives everyone (see match.ts
+ * enterBuyPhase), so respawnTick is left at -1 (never eligible).
+ */
 export function scheduleDeath(next: SimState, playerIndex: number, currentTick: number): void {
   next.alive[playerIndex] = 0;
-  next.respawnTick[playerIndex] = currentTick + RESPAWN_TICKS;
+  next.respawnTick[playerIndex] = next.mode === MODE_MATCH ? -1 : currentTick + RESPAWN_TICKS;
   next.tagTicksLeft[playerIndex] = 0;
   next.landPenaltyTicksLeft[playerIndex] = 0;
 }

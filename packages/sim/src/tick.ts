@@ -1,4 +1,5 @@
-import { FIXED_DT, LAND_PENALTY_TICKS, TAG_MULT } from "./constants.js";
+import { FIXED_DT, LAND_PENALTY_TICKS, MODE_MATCH, TAG_MULT } from "./constants.js";
+import { advanceMatchState, computeChannelDecisions, effectiveBoxesForPlayer, isChanneling } from "./match.js";
 import { movePlayer } from "./movement.js";
 import { nextRandom } from "./prng.js";
 import { cloneState, type Box, type InputFrame, type ShotEvent, type SimState } from "./state.js";
@@ -20,11 +21,20 @@ export interface TickResult {
  * whether a shot happens is pure sim; hit resolution/damage is NOT (see
  * damage.ts's documented mutation boundary, applied by the server between
  * ticks).
+ *
+ * M3: in match mode (state.mode === MODE_MATCH), plant/defuse channel
+ * eligibility is decided up front from *this tick's starting* state (see
+ * match.ts's computeChannelDecisions) so it can gate movement (channeling
+ * zeroes the wish-direction) BEFORE per-player movement runs; round/spike
+ * state machine progress and phase transitions are then advanced by
+ * advanceMatchState() AFTER the per-player loop, so it sees this tick's
+ * resulting positions/alive flags. DM mode (mode 0) takes neither path.
  */
 export function tick(state: SimState, inputs: readonly InputFrame[], boxes: readonly Box[]): TickResult {
   const next = cloneState(state);
   const shots: ShotEvent[] = [];
   const currentTick = state.tick;
+  const channelDecisions = computeChannelDecisions(state, inputs);
 
   for (let i = 0; i < next.numPlayers; i++) {
     const input = inputs[i];
@@ -35,7 +45,9 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
       // (server and the owning client's own prediction/replay agree bit-
       // for-bit); movement/weapon logic for the newly-live player resumes
       // next tick so this tick's spawn position is exact and untouched by
-      // this tick's input.
+      // this tick's input. Match mode never schedules a respawn (see
+      // weapons/logic.ts scheduleDeath) — revival happens only at the next
+      // buy-phase transition (see match.ts enterBuyPhase).
       const respawnAt = state.respawnTick[i]!;
       if (respawnAt !== -1 && currentTick >= respawnAt) {
         respawnPlayer(next, i, currentTick);
@@ -57,7 +69,11 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
       if (weapon) speedMultiplier *= weapon.adsMoveSpeedMult;
     }
 
-    const result = movePlayer(state, i, input, boxes, FIXED_DT, speedMultiplier);
+    const effectiveBoxes = effectiveBoxesForPlayer(state, boxes, i);
+    const channeling = isChanneling(channelDecisions, i);
+    const movementInput: InputFrame = channeling ? { ...input, forward: 0, right: 0, jump: false } : input;
+
+    const result = movePlayer(state, i, movementInput, effectiveBoxes, FIXED_DT, speedMultiplier);
 
     next.posX[i] = result.posX;
     next.posY[i] = result.posY;
@@ -80,6 +96,10 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
 
     const shot = stepWeaponLogic(state, next, i, input, currentTick);
     if (shot) shots.push(shot);
+  }
+
+  if (next.mode === MODE_MATCH) {
+    advanceMatchState(state, next, channelDecisions, currentTick);
   }
 
   const rng = nextRandom(state.prngState);

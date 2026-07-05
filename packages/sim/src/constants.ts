@@ -97,3 +97,59 @@ export const BUY_ITEM_HEAVY_ARMOR = 201;
 
 /** Sentinel weapon id meaning "no weapon equipped in this slot". */
 export const WEAPON_NONE = 255;
+
+// ---- M3 match/round constants ----
+
+/** SimState.mode values. */
+export const MODE_DM = 0;
+export const MODE_MATCH = 1;
+
+/** Team assignment (SimState.team per player). 255 = unassigned (waiting phase / DM). */
+export const TEAM_ATTACKERS = 0;
+export const TEAM_DEFENDERS = 1;
+export const TEAM_NONE = 255;
+
+/** SimState.matchPhase values. */
+export const PHASE_WAITING = 0;
+export const PHASE_BUY = 1;
+export const PHASE_ROUND = 2;
+export const PHASE_ROUND_END = 3;
+export const PHASE_MATCH_END = 4;
+
+/** SimState.spikeState values. */
+export const SPIKE_CARRIED = 0;
+export const SPIKE_DROPPED = 1;
+export const SPIKE_PLANTED = 2;
+export const SPIKE_DETONATED = 3;
+export const SPIKE_DEFUSED = 4;
+
+/** Sentinel "no player" index for team/carrier/planter/defuser fields. */
+export const NO_PLAYER = 255;
+
+/** Round-end reason codes, mirrored on the wire (@vg/protocol MatchEvent.reason). */
+export const ROUND_END_ELIMINATION = 0;
+export const ROUND_END_DETONATION = 1;
+export const ROUND_END_DEFUSE = 2;
+export const ROUND_END_TIMEOUT = 3;
+export const ROUND_END_NONE = 255;
+
+/** Radius (m) a living defender must be within a PLANTED spike to channel a defuse. */
+export const DEFUSE_RADIUS_M = 1.5;
+/** Below this horizontal speed (m/s), a plant-channeling carrier counts as "roughly stationary". */
+export const CHANNEL_STATIONARY_SPEED_MPS = 1.0;
+
+/** Default match config (64 Hz ticks unless noted). See @vg/sim state.ts's MatchConfig. */
+export const DEFAULT_BUY_TICKS = 1920; // 30s
+export const DEFAULT_FIRST_ROUND_BUY_TICKS = 2880; // 45s
+export const DEFAULT_ROUND_TICKS = 6400; // 100s
+export const DEFAULT_SPIKE_TICKS = 2880; // 45s
+export const DEFAULT_PLANT_TICKS = 256; // 4s
+export const DEFAULT_DEFUSE_TICKS = 448; // 7s
+export const DEFAULT_DEFUSE_CHECKPOINT_TICKS = 224; // 3.5s
+export const DEFAULT_ROUND_END_TICKS = 320; // 5s freeze
+export const DEFAULT_WIN_TARGET = 13;
+export const DEFAULT_HALF_AT_ROUND = 12;
+export const DEFAULT_OT_START_CREDITS = 5000;
+export const DEFAULT_WIN_CREDITS = 3000;
+export const DEFAULT_LOSS_CREDITS: readonly [number, number, number] = [1900, 2400, 2900];
+export const DEFAULT_PLANT_BONUS = 300;

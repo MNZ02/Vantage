@@ -1,4 +1,30 @@
-import { MAX_PLAYERS, SPAWN_HEALTH, START_CREDITS, WEAPON_NONE } from "./constants.js";
+import {
+  DEFAULT_BUY_TICKS,
+  DEFAULT_DEFUSE_CHECKPOINT_TICKS,
+  DEFAULT_DEFUSE_TICKS,
+  DEFAULT_FIRST_ROUND_BUY_TICKS,
+  DEFAULT_HALF_AT_ROUND,
+  DEFAULT_LOSS_CREDITS,
+  DEFAULT_OT_START_CREDITS,
+  DEFAULT_PLANT_BONUS,
+  DEFAULT_PLANT_TICKS,
+  DEFAULT_ROUND_END_TICKS,
+  DEFAULT_ROUND_TICKS,
+  DEFAULT_SPIKE_TICKS,
+  DEFAULT_WIN_CREDITS,
+  DEFAULT_WIN_TARGET,
+  MAX_CREDITS,
+  MAX_PLAYERS,
+  MODE_DM,
+  NO_PLAYER,
+  PHASE_WAITING,
+  ROUND_END_NONE,
+  SPAWN_HEALTH,
+  SPIKE_CARRIED,
+  START_CREDITS,
+  TEAM_NONE,
+  WEAPON_NONE,
+} from "./constants.js";
 import { createPrngState } from "./prng.js";
 import { WEAPON_VIPER, WEAPONS } from "./weapons/data.js";
 
@@ -27,6 +53,10 @@ export interface InputFrame {
   readonly reload: boolean; // level-triggered: starts a reload if eligible
   readonly slot1: boolean; // edge-triggered: switch to primary slot
   readonly slot2: boolean; // edge-triggered: switch to secondary slot
+  /** Level-triggered (held): channels plant/defuse in match mode. See match.ts. */
+  readonly interact: boolean;
+  /** Edge-triggered: cast a map ping (server-only concern — sim's tick() never reads this field). */
+  readonly ping: boolean;
 }
 
 export function defaultInput(yaw = 0, pitch = 0): InputFrame {
@@ -43,6 +73,8 @@ export function defaultInput(yaw = 0, pitch = 0): InputFrame {
     reload: false,
     slot1: false,
     slot2: false,
+    interact: false,
+    ping: false,
   };
 }
 
@@ -54,6 +86,49 @@ export interface ShotEvent {
   readonly sprayIndex: number;
   readonly weaponId: number;
 }
+
+/**
+ * Full match tuning table, stored INSIDE SimState (plain numbers only, no
+ * methods) so the sim stays a pure function of (state, inputs) and tests can
+ * shrink timers/win target deterministically. See createMatchState().
+ */
+export interface MatchConfig {
+  readonly buyTicks: number;
+  readonly firstRoundBuyTicks: number;
+  readonly roundTicks: number;
+  readonly spikeTicks: number;
+  readonly plantTicks: number;
+  readonly defuseTicks: number;
+  readonly defuseCheckpointTicks: number;
+  readonly roundEndTicks: number;
+  readonly winTarget: number;
+  readonly halfAtRound: number;
+  readonly otStartCredits: number;
+  readonly startCredits: number;
+  readonly winCredits: number;
+  readonly lossCredits: readonly [number, number, number];
+  readonly plantBonus: number;
+  readonly maxCredits: number;
+}
+
+export const DEFAULT_MATCH_CONFIG: MatchConfig = {
+  buyTicks: DEFAULT_BUY_TICKS,
+  firstRoundBuyTicks: DEFAULT_FIRST_ROUND_BUY_TICKS,
+  roundTicks: DEFAULT_ROUND_TICKS,
+  spikeTicks: DEFAULT_SPIKE_TICKS,
+  plantTicks: DEFAULT_PLANT_TICKS,
+  defuseTicks: DEFAULT_DEFUSE_TICKS,
+  defuseCheckpointTicks: DEFAULT_DEFUSE_CHECKPOINT_TICKS,
+  roundEndTicks: DEFAULT_ROUND_END_TICKS,
+  winTarget: DEFAULT_WIN_TARGET,
+  halfAtRound: DEFAULT_HALF_AT_ROUND,
+  otStartCredits: DEFAULT_OT_START_CREDITS,
+  startCredits: START_CREDITS,
+  winCredits: DEFAULT_WIN_CREDITS,
+  lossCredits: DEFAULT_LOSS_CREDITS,
+  plantBonus: DEFAULT_PLANT_BONUS,
+  maxCredits: MAX_CREDITS,
+};
 
 /**
  * Simulation state for up to MAX_PLAYERS players, stored as flat typed arrays
@@ -106,6 +181,59 @@ export interface SimState {
   readonly credits: Uint32Array;
   /** Bitmask of ads/reload/slot1/slot2 from the previous tick's input, for edge detection. */
   readonly prevButtons: Uint8Array;
+
+  // ---- M3 match/round state ----
+  /** MODE_DM (0) or MODE_MATCH (1). See constants.ts. */
+  mode: number;
+  /** Fixed tuning table for match mode; present (as DEFAULT_MATCH_CONFIG) even in DM, where it's unused. */
+  config: MatchConfig;
+  /** Per-player team: TEAM_ATTACKERS (0), TEAM_DEFENDERS (1), TEAM_NONE (255). */
+  readonly team: Uint8Array;
+  matchPhase: number;
+  /** Absolute tick at which the current phase's timer expires (buy/round/roundEnd only). */
+  phaseEndTick: number;
+  roundNumber: number;
+  /** Cumulative rounds won by the SQUAD that started the match assigned team 0 ("squad A"). See halvesSwapped. */
+  scoreTeam0: number;
+  /** Cumulative rounds won by squad B (started the match assigned team 1). */
+  scoreTeam1: number;
+  /** Current loss streak, indexed by CURRENT role (0 attackers, 1 defenders) — reset to 0 for both at half swap, so role-vs-squad indexing never matters across that boundary. */
+  lossStreakTeam0: number;
+  lossStreakTeam1: number;
+  /** 0 before halftime, 1 after. Used to translate a round-winning ROLE into the persistent squad score counter (scoreTeam0/1). */
+  halvesSwapped: number;
+  /** Winning ROLE (0/1) of the most recently finished round, or ROUND_END_NONE-sentineled via NO_PLAYER-style 255 when n/a. */
+  lastRoundWinnerTeam: number;
+  /** Reason code (see ROUND_END_* constants) for the most recently finished round. */
+  lastRoundEndReason: number;
+
+  // ---- Spike ----
+  spikeState: number; // SPIKE_CARRIED/DROPPED/PLANTED/DETONATED/DEFUSED
+  spikeCarrier: number; // player index, or NO_PLAYER (255)
+  spikeX: number;
+  spikeY: number;
+  spikeZ: number;
+  /** Absolute tick the spike was planted, or -1. */
+  spikePlantedTick: number;
+  /** Ticks accumulated toward plantTicks by the current planter (0 if none active). */
+  plantProgress: number;
+  planterIndex: number; // NO_PLAYER if no one is currently channeling a plant
+  /** Ticks accumulated toward defuseTicks by the current defuser (0 if none active or reset). */
+  defuseProgress: number;
+  defuserIndex: number; // NO_PLAYER if no one is currently channeling a defuse
+  /** 1 once defuseProgress has ever reached defuseCheckpointTicks THIS plant — an interruption after that resumes from the checkpoint instead of 0. */
+  defuseCheckpointHit: number;
+
+  // ---- Buy/sell bookkeeping (for refunds — see damage.ts applySell) ----
+  /** Loadout/armor snapshot taken at the start of the current buy phase — what a sell reverts to. */
+  readonly weaponPrimaryAtBuyStart: Uint8Array;
+  readonly weaponSecondaryAtBuyStart: Uint8Array;
+  readonly armorAtBuyStart: Uint8Array;
+  /** Item id purchased into that slot THIS buy phase (WEAPON_NONE if the slot's current item wasn't bought this buy phase — e.g. kept from a prior round, or never touched). Sellable only while this is set. */
+  readonly primaryPurchasedItemId: Uint8Array;
+  readonly secondaryPurchasedItemId: Uint8Array;
+  /** Armor item id purchased this buy phase (BUY_ITEM_LIGHT_ARMOR/BUY_ITEM_HEAVY_ARMOR), or 255 (NO_PLAYER-reused sentinel) if none. */
+  readonly armorPurchasedItemId: Uint8Array;
 }
 
 const ADS_BIT = 1 << 0;
@@ -123,6 +251,23 @@ export function wasButtonHeld(prevButtons: number, bit: number): boolean {
 export { ADS_BIT, SLOT1_BIT, SLOT2_BIT };
 
 export function createState(seed: number, numPlayers: number = MAX_PLAYERS): SimState {
+  return createStateInternal(seed, numPlayers, MODE_DM, DEFAULT_MATCH_CONFIG);
+}
+
+/**
+ * Match-mode state: same shape as createState() (DM), but mode = MODE_MATCH
+ * and `config` holds a full MatchConfig (defaults, or a partial override —
+ * tests shrink timers/winTarget so round-flow tests don't need to run real
+ * 30s/100s durations). Players start unassigned (TEAM_NONE) and in the
+ * waiting phase; call the pure startMatch() helper (see match.ts) once
+ * enough players have joined.
+ */
+export function createMatchState(seed: number, numPlayers: number = MAX_PLAYERS, config: Partial<MatchConfig> = {}): SimState {
+  const fullConfig: MatchConfig = { ...DEFAULT_MATCH_CONFIG, ...config };
+  return createStateInternal(seed, numPlayers, 1, fullConfig);
+}
+
+function createStateInternal(seed: number, numPlayers: number, mode: number, config: MatchConfig): SimState {
   if (numPlayers < 1 || numPlayers > MAX_PLAYERS) {
     throw new Error(`numPlayers must be in [1, ${MAX_PLAYERS}]`);
   }
@@ -137,7 +282,7 @@ export function createState(seed: number, numPlayers: number = MAX_PLAYERS): Sim
   const reserveSecondary = new Uint16Array(numPlayers).fill(viperDef.reserveAmmo);
   const reloadEndTick = new Int32Array(numPlayers).fill(-1);
   const equipEndTick = new Int32Array(numPlayers).fill(-1);
-  const credits = new Uint32Array(numPlayers).fill(START_CREDITS);
+  const credits = new Uint32Array(numPlayers).fill(mode === MODE_DM ? START_CREDITS : config.startCredits);
 
   return {
     tick: 0,
@@ -182,6 +327,39 @@ export function createState(seed: number, numPlayers: number = MAX_PLAYERS): Sim
     landPenaltyTicksLeft: new Uint16Array(numPlayers),
     credits,
     prevButtons: new Uint8Array(numPlayers),
+
+    mode,
+    config,
+    team: new Uint8Array(numPlayers).fill(TEAM_NONE),
+    matchPhase: PHASE_WAITING,
+    phaseEndTick: -1,
+    roundNumber: 0,
+    scoreTeam0: 0,
+    scoreTeam1: 0,
+    lossStreakTeam0: 0,
+    lossStreakTeam1: 0,
+    halvesSwapped: 0,
+    lastRoundWinnerTeam: NO_PLAYER,
+    lastRoundEndReason: ROUND_END_NONE,
+
+    spikeState: SPIKE_CARRIED,
+    spikeCarrier: NO_PLAYER,
+    spikeX: 0,
+    spikeY: 0,
+    spikeZ: 0,
+    spikePlantedTick: -1,
+    plantProgress: 0,
+    planterIndex: NO_PLAYER,
+    defuseProgress: 0,
+    defuserIndex: NO_PLAYER,
+    defuseCheckpointHit: 0,
+
+    weaponPrimaryAtBuyStart: new Uint8Array(numPlayers).fill(WEAPON_NONE),
+    weaponSecondaryAtBuyStart: new Uint8Array(numPlayers).fill(WEAPON_VIPER),
+    armorAtBuyStart: new Uint8Array(numPlayers),
+    primaryPurchasedItemId: new Uint8Array(numPlayers).fill(WEAPON_NONE),
+    secondaryPurchasedItemId: new Uint8Array(numPlayers).fill(WEAPON_NONE),
+    armorPurchasedItemId: new Uint8Array(numPlayers).fill(NO_PLAYER),
   };
 }
 
@@ -229,6 +407,39 @@ export function cloneState(state: SimState): SimState {
     landPenaltyTicksLeft: state.landPenaltyTicksLeft.slice(),
     credits: state.credits.slice(),
     prevButtons: state.prevButtons.slice(),
+
+    mode: state.mode,
+    config: state.config,
+    team: state.team.slice(),
+    matchPhase: state.matchPhase,
+    phaseEndTick: state.phaseEndTick,
+    roundNumber: state.roundNumber,
+    scoreTeam0: state.scoreTeam0,
+    scoreTeam1: state.scoreTeam1,
+    lossStreakTeam0: state.lossStreakTeam0,
+    lossStreakTeam1: state.lossStreakTeam1,
+    halvesSwapped: state.halvesSwapped,
+    lastRoundWinnerTeam: state.lastRoundWinnerTeam,
+    lastRoundEndReason: state.lastRoundEndReason,
+
+    spikeState: state.spikeState,
+    spikeCarrier: state.spikeCarrier,
+    spikeX: state.spikeX,
+    spikeY: state.spikeY,
+    spikeZ: state.spikeZ,
+    spikePlantedTick: state.spikePlantedTick,
+    plantProgress: state.plantProgress,
+    planterIndex: state.planterIndex,
+    defuseProgress: state.defuseProgress,
+    defuserIndex: state.defuserIndex,
+    defuseCheckpointHit: state.defuseCheckpointHit,
+
+    weaponPrimaryAtBuyStart: state.weaponPrimaryAtBuyStart.slice(),
+    weaponSecondaryAtBuyStart: state.weaponSecondaryAtBuyStart.slice(),
+    armorAtBuyStart: state.armorAtBuyStart.slice(),
+    primaryPurchasedItemId: state.primaryPurchasedItemId.slice(),
+    secondaryPurchasedItemId: state.secondaryPurchasedItemId.slice(),
+    armorPurchasedItemId: state.armorPurchasedItemId.slice(),
   };
 }
 
@@ -271,6 +482,35 @@ export function serializeState(state: SimState): string {
     `landPenaltyTicksLeft:${Array.from(state.landPenaltyTicksLeft).join(",")}`,
     `credits:${Array.from(state.credits).join(",")}`,
     `prevButtons:${Array.from(state.prevButtons).join(",")}`,
+    `mode:${state.mode}`,
+    `team:${Array.from(state.team).join(",")}`,
+    `matchPhase:${state.matchPhase}`,
+    `phaseEndTick:${state.phaseEndTick}`,
+    `roundNumber:${state.roundNumber}`,
+    `scoreTeam0:${state.scoreTeam0}`,
+    `scoreTeam1:${state.scoreTeam1}`,
+    `lossStreakTeam0:${state.lossStreakTeam0}`,
+    `lossStreakTeam1:${state.lossStreakTeam1}`,
+    `halvesSwapped:${state.halvesSwapped}`,
+    `lastRoundWinnerTeam:${state.lastRoundWinnerTeam}`,
+    `lastRoundEndReason:${state.lastRoundEndReason}`,
+    `spikeState:${state.spikeState}`,
+    `spikeCarrier:${state.spikeCarrier}`,
+    `spikeX:${state.spikeX}`,
+    `spikeY:${state.spikeY}`,
+    `spikeZ:${state.spikeZ}`,
+    `spikePlantedTick:${state.spikePlantedTick}`,
+    `plantProgress:${state.plantProgress}`,
+    `planterIndex:${state.planterIndex}`,
+    `defuseProgress:${state.defuseProgress}`,
+    `defuserIndex:${state.defuserIndex}`,
+    `defuseCheckpointHit:${state.defuseCheckpointHit}`,
+    `weaponPrimaryAtBuyStart:${Array.from(state.weaponPrimaryAtBuyStart).join(",")}`,
+    `weaponSecondaryAtBuyStart:${Array.from(state.weaponSecondaryAtBuyStart).join(",")}`,
+    `armorAtBuyStart:${Array.from(state.armorAtBuyStart).join(",")}`,
+    `primaryPurchasedItemId:${Array.from(state.primaryPurchasedItemId).join(",")}`,
+    `secondaryPurchasedItemId:${Array.from(state.secondaryPurchasedItemId).join(",")}`,
+    `armorPurchasedItemId:${Array.from(state.armorPurchasedItemId).join(",")}`,
   ];
   return parts.join("|");
 }
