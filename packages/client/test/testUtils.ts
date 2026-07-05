@@ -56,6 +56,21 @@ export function toAuthoritative(msg: SnapshotMessage): AuthoritativeSnapshot {
       credits: pl.credits,
       respawnTicksLeft: pl.respawnTicksLeft,
       team: pl.team,
+      agentId: pl.agentId,
+      ultPoints: pl.ultPoints,
+      flashedTicksLeft: pl.flashedTicksLeft,
+      flashIntensity: pl.flashIntensity,
+      abilityCharges: pl.abilityCharges,
+    })),
+    abilityEntities: msg.abilityEntities.map((e) => ({
+      entType: e.entType,
+      owner: e.owner,
+      abilityId: e.abilityId,
+      x: e.x,
+      y: e.y,
+      z: e.z,
+      endTicksLeft: e.endTicksLeft,
+      param: e.param,
     })),
     match:
       msg.mode === 1
@@ -98,5 +113,9 @@ export function idleInput(yaw = 0, pitch = 0): InputFrame {
     slot2: false,
     interact: false,
     ping: false,
+    ability1: false,
+    ability2: false,
+    signature: false,
+    ult: false,
   };
 }

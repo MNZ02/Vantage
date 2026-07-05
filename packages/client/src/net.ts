@@ -151,6 +151,8 @@ export interface NetClient {
   sell(itemId: number): void;
   /** M3: cast a map ping at a world (x, z) — rate-limited server-side. */
   sendPing(x: number, z: number): void;
+  /** M4a: pick an agent during the waiting phase. */
+  selectAgent(agentId: number): void;
   /** M3: phase/round/score/spike/minimap state, updated on every Snapshot. Zeroed-out in DM mode. */
   getMatchHud(): MatchHud;
   onPredictedHit(cb: (e: PredictedHitEvent) => void): void;
@@ -398,6 +400,21 @@ export function connectNetClient(): Promise<NetClient | null> {
             credits: p.credits,
             respawnTicksLeft: p.respawnTicksLeft,
             team: p.team,
+            agentId: p.agentId,
+            ultPoints: p.ultPoints,
+            flashedTicksLeft: p.flashedTicksLeft,
+            flashIntensity: p.flashIntensity,
+            abilityCharges: p.abilityCharges,
+          })),
+          abilityEntities: msg.abilityEntities.map((e) => ({
+            entType: e.entType,
+            owner: e.owner,
+            abilityId: e.abilityId,
+            x: e.x,
+            y: e.y,
+            z: e.z,
+            endTicksLeft: e.endTicksLeft,
+            param: e.param,
           })),
           match:
             msg.mode === MODE_MATCH
@@ -643,6 +660,9 @@ export function connectNetClient(): Promise<NetClient | null> {
       },
       sendPing(x: number, z: number) {
         currentTransport.send(encodeMessage({ type: MessageType.MapPing, x, z }));
+      },
+      selectAgent(agentId: number) {
+        currentTransport.send(encodeMessage({ type: MessageType.AgentSelectCmd, agentId }));
       },
       getMatchHud: () => matchHud,
       onPredictedHit(cb) {
