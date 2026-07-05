@@ -17,6 +17,7 @@ import {
   decodeMessageSafely,
   encodeMessage,
   withLatency,
+  type AbilityEventMessage,
   type DamageTakenMessage,
   type KillEventMessage,
   type HitConfirmMessage,
@@ -161,6 +162,8 @@ export interface NetClient {
   onKillEvent(cb: (e: KillFeedEvent) => void): void;
   onMatchEvent(cb: (e: MatchEventMessage) => void): void;
   onTeamPing(cb: (e: TeamPingEvent) => void): void;
+  /** M5: ability world-event VFX/sound cues (cast/detonate/pulse/expire) — see @vg/protocol AbilityEventMessage. Purely cosmetic, wired straight through from the server. */
+  onAbilityEvent(cb: (e: AbilityEventMessage) => void): void;
   getHud(): NetHud;
   getHitRegStats(): HitRegStats;
   close(): void;
@@ -319,6 +322,7 @@ export function connectNetClient(): Promise<NetClient | null> {
     const killEventCbs: Array<(e: KillFeedEvent) => void> = [];
     const matchEventCbs: Array<(e: MatchEventMessage) => void> = [];
     const teamPingCbs: Array<(e: TeamPingEvent) => void> = [];
+    const abilityEventCbs: Array<(e: AbilityEventMessage) => void> = [];
 
     function onSnapshot(msg: SnapshotMessage): void {
       lastSnapshotAt = performance.now();
@@ -469,6 +473,10 @@ export function connectNetClient(): Promise<NetClient | null> {
       for (const cb of teamPingCbs) cb({ playerIndex: msg.playerIndex, x: msg.x, z: msg.z });
     }
 
+    function onAbilityEvent(msg: AbilityEventMessage): void {
+      for (const cb of abilityEventCbs) cb(msg);
+    }
+
     function wireTransport(t: Transport): void {
       t.onMessage((data) => {
         // A malformed/truncated frame (corrupt packet, a stray non-protocol
@@ -513,6 +521,8 @@ export function connectNetClient(): Promise<NetClient | null> {
           onMatchEvent(msg);
         } else if (msg.type === MessageType.TeamPing) {
           onTeamPing(msg);
+        } else if (msg.type === MessageType.AbilityEvent) {
+          onAbilityEvent(msg);
         }
       });
 
@@ -682,6 +692,9 @@ export function connectNetClient(): Promise<NetClient | null> {
       },
       onTeamPing(cb) {
         teamPingCbs.push(cb);
+      },
+      onAbilityEvent(cb) {
+        abilityEventCbs.push(cb);
       },
       getHud(): NetHud {
         const now = performance.now();

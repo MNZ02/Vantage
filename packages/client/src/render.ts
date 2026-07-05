@@ -17,15 +17,18 @@ import {
   FLASH_FULL,
   MAX_ABILITY_ENTITIES,
   WALL_BOX_MAX_HP,
-  CROUCH_HEIGHT,
   LEVEL_BOXES,
-  STAND_HEIGHT,
+  RUN_SPEED,
   WEAPONS,
   type Box,
   type SimState,
 } from "@vg/sim";
 import type { RemotePose } from "./interpolation.js";
-import type { GrayboxSurface } from "./graybox.js";
+import { surfaceKindForIndex, type GrayboxSurface } from "./graybox.js";
+import type { MaterialSet } from "./materials.js";
+import { createPlayerModel } from "./playerModel.js";
+import { flashAfterimageCurve } from "./vfx.js";
+import type { Zone } from "./zones.js";
 
 /** Minimal shape render.ts's killfeed needs — kept decoupled from net.ts's full NetClient event type. */
 export interface KillFeedEntry {
@@ -47,8 +50,12 @@ export function createScene(canvas: HTMLCanvasElement): SceneHandle {
   renderer.setSize(window.innerWidth, window.innerHeight);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x1a1d21);
-  scene.fog = new THREE.Fog(0x1a1d21, 25, 55);
+  // M5: retuned to a dusk tone matching graybox.ts's inverted-gradient skybox
+  // (see buildLevelDressing()'s sky mesh) instead of the old flat dark-gray —
+  // fog now reads as atmospheric haze under a dusk sky rather than "runs out
+  // of level and hits a wall of gray".
+  scene.background = new THREE.Color(0x2a2438);
+  scene.fog = new THREE.Fog(0x3a3040, 25, 60);
 
   const camera = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.05, 200);
 
@@ -73,39 +80,38 @@ export function createScene(canvas: HTMLCanvasElement): SceneHandle {
   return { renderer, scene, camera };
 }
 
-/** Placeholder first-person viewmodel (real arms/weapon art is M5): a simple
- * barrel+body proxy parented to the camera, lower-right, so aiming has a
- * visual anchor. Returns a handle main.ts uses to hide it while dead/spectating. */
-export function createViewmodel(camera: THREE.PerspectiveCamera): { setVisible(v: boolean): void } {
-  const group = new THREE.Group();
-  const bodyMat = new THREE.MeshLambertMaterial({ color: 0x2f3540 });
-  const barrelMat = new THREE.MeshLambertMaterial({ color: 0x454e5e });
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.07, 0.22), bodyMat);
-  const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.22), barrelMat);
-  barrel.position.set(0, 0.025, -0.2);
-  group.add(body, barrel);
-  group.position.set(0.16, -0.13, -0.35);
-  group.rotation.y = 0.06;
-  camera.add(group);
-  return {
-    setVisible(v: boolean) {
-      group.visible = v;
-    },
-  };
-}
+// M5: the placeholder barrel+body viewmodel proxy that used to live here has
+// been replaced by viewmodel.ts's createViewmodel() (per-weapon-class
+// procedural models with recoil/reload/ADS motion) — see main.ts's import.
 
-/** Builds one mesh per graybox surface — the same box list drives sim collision (see graybox.ts). */
-export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSurface[]): void {
-  for (const b of boxes) {
+/**
+ * Builds one mesh per graybox surface — the same box list drives sim
+ * collision (see graybox.ts). M5: if a MaterialSet is supplied, each surface
+ * gets its zone-tinted textured material (floor/wall by zone, crates get the
+ * wood-crate texture, ramp gets the metal panel texture — see
+ * graybox.ts's surfaceKindForIndex()); otherwise falls back to the flat
+ * per-box color it always had (kept so tests / a materials-less boot path
+ * still render something sane).
+ */
+export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSurface[], materials?: MaterialSet): void {
+  boxes.forEach((b, index) => {
     const sizeX = b.maxX - b.minX;
     const sizeY = b.maxY - b.minY;
     const sizeZ = b.maxZ - b.minZ;
     const geometry = new THREE.BoxGeometry(sizeX, sizeY, sizeZ);
-    const material = new THREE.MeshStandardMaterial({ color: b.color, roughness: 0.9, metalness: 0.05 });
+    const material = materials ? materialForSurface(index, b.zone, materials) : new THREE.MeshStandardMaterial({ color: b.color, roughness: 0.9, metalness: 0.05 });
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, (b.minZ + b.maxZ) / 2);
     scene.add(mesh);
-  }
+  });
+}
+
+function materialForSurface(index: number, zone: Zone, materials: MaterialSet): THREE.Material {
+  const kind = surfaceKindForIndex(index);
+  if (kind === "floor") return materials.floorByZone[zone];
+  if (kind === "wall") return materials.wallByZone[zone];
+  if (kind === "crate") return materials.woodCrate;
+  return materials.metalPanel; // ramp
 }
 
 export interface FpsCounter {
@@ -144,39 +150,64 @@ export function createFpsCounter(): FpsCounter {
   };
 }
 
-/** Team-agnostic capsule-proxy mesh for one remote player (cylinder + sphere caps). */
+/**
+ * M5: replaces the old capsule-proxy mesh (cylinder + sphere caps) with an
+ * articulated procedural player model (see playerModel.ts) — walk cycle,
+ * crouch pose, death ragdoll-lite, team/ally-tinted, weapon-in-hand. This
+ * wrapper tracks the bookkeeping playerModel.ts's pose needs but isn't on
+ * the wire (horizontal speed and distance traveled — derived from
+ * consecutive interpolated positions, since RemotePose carries neither
+ * velocity nor an odometer).
+ */
 export interface RemotePlayerProxy {
   group: THREE.Group;
-  setPose(pose: RemotePose): void;
+  /** `localTeam` (255 = unassigned) decides the ally/enemy tint — see playerModel.ts's playerModelColors(). */
+  setPose(pose: RemotePose, localTeam: number): void;
   dispose(scene: THREE.Scene): void;
 }
 
 export function createRemotePlayerProxy(scene: THREE.Scene): RemotePlayerProxy {
-  const group = new THREE.Group();
-  const material = new THREE.MeshStandardMaterial({ color: 0x3fa7ff, roughness: 0.7, metalness: 0.1 });
-  const cylinder = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 1, 12), material);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.4, 12, 8), material);
-  group.add(cylinder, head);
-  scene.add(group);
+  const model = createPlayerModel(scene);
+  let lastX = 0;
+  let lastZ = 0;
+  let lastTimeMs = performance.now();
+  let distanceTraveled = 0;
+  let hasPrior = false;
 
   return {
-    group,
-    setPose(pose: RemotePose) {
-      const height = pose.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
-      const cylinderHeight = Math.max(0.01, height - 0.8); // total height minus the two 0.4-radius caps
-      cylinder.geometry.dispose();
-      cylinder.geometry = new THREE.CylinderGeometry(0.4, 0.4, cylinderHeight, 12);
-      cylinder.position.set(0, 0.4 + cylinderHeight / 2, 0);
-      head.position.set(0, height - 0.4, 0);
-      group.position.set(pose.posX, pose.posY, pose.posZ);
-      group.rotation.set(0, pose.yaw + Math.PI, 0);
-      group.visible = pose.connected;
+    group: model.group,
+    setPose(pose: RemotePose, localTeam: number) {
+      const nowMs = performance.now();
+      const dtSeconds = Math.max(0, Math.min(0.25, (nowMs - lastTimeMs) / 1000));
+      lastTimeMs = nowMs;
+      const dx = hasPrior ? pose.posX - lastX : 0;
+      const dz = hasPrior ? pose.posZ - lastZ : 0;
+      const stepDist = Math.hypot(dx, dz);
+      distanceTraveled += stepDist;
+      const horizontalSpeed = dtSeconds > 0 ? stepDist / dtSeconds : 0;
+      lastX = pose.posX;
+      lastZ = pose.posZ;
+      hasPrior = true;
+
+      model.setPose({
+        posX: pose.posX,
+        posY: pose.posY,
+        posZ: pose.posZ,
+        yaw: pose.yaw,
+        crouching: pose.crouching,
+        grounded: pose.grounded,
+        connected: pose.connected,
+        alive: pose.alive,
+        team: pose.team,
+        isAlly: localTeam !== 255 && pose.team === localTeam,
+        weaponId: pose.activeSlot === 0 ? pose.weaponPrimary : pose.weaponSecondary,
+        horizontalSpeed,
+        distanceTraveled,
+        nowSeconds: nowMs / 1000,
+      });
     },
     dispose(targetScene: THREE.Scene) {
-      targetScene.remove(group);
-      cylinder.geometry.dispose();
-      head.geometry.dispose();
-      material.dispose();
+      model.dispose(targetScene);
     },
   };
 }
@@ -1073,6 +1104,12 @@ export interface FlashOverlay {
 const FLASH_FULL_TICKS = 128; // 2s @ 64Hz — see @vg/sim abilities/effects.ts applyFlash
 const FLASH_HALF_TICKS = 51; // 0.8s
 
+/**
+ * M5: opacity now follows vfx.ts's flashAfterimageCurve() (an ease-out-cubic
+ * "afterimage" shape — stays bright longer, then falls away quickly at the
+ * very end) instead of a flat linear ramp, closer to how a real flashbang
+ * afterimage actually lingers before fading.
+ */
 export function createFlashOverlay(): FlashOverlay {
   const el = document.createElement("div");
   el.style.position = "fixed";
@@ -1090,7 +1127,8 @@ export function createFlashOverlay(): FlashOverlay {
       }
       const totalTicks = flashIntensity === FLASH_FULL ? FLASH_FULL_TICKS : FLASH_HALF_TICKS;
       const maxOpacity = flashIntensity === FLASH_FULL ? 1 : 0.55;
-      el.style.opacity = String(Math.max(0, Math.min(maxOpacity, (flashedTicksLeft / totalTicks) * maxOpacity)));
+      const fraction = flashAfterimageCurve(flashedTicksLeft / totalTicks);
+      el.style.opacity = String(Math.max(0, Math.min(maxOpacity, fraction * maxOpacity)));
     },
   };
 }
@@ -1110,6 +1148,30 @@ export interface AbilityEntityRenderer {
 
 export function createAbilityEntityRenderer(scene: THREE.Scene): AbilityEntityRenderer {
   const meshes = new Map<number, THREE.Mesh>();
+  // M5: smoke's "soft fresnel-ish edge" — a second, larger, more-transparent
+  // outer shell layered over the original opaque inner sphere. Shader-free
+  // (spec: "two-layer opacity trick") — no fresnel shader, just two spheres.
+  const smokeOuterShells = new Map<number, THREE.Mesh>();
+
+  function smokeOuterShellFor(slot: number): THREE.Mesh {
+    const existing = smokeOuterShells.get(slot);
+    if (existing) return existing;
+    const geometry = new THREE.SphereGeometry(1, 16, 12);
+    const material = new THREE.MeshBasicMaterial({ color: 0xeef2f6, transparent: true, opacity: 0.25, depthWrite: false });
+    const mesh = new THREE.Mesh(geometry, material);
+    scene.add(mesh);
+    smokeOuterShells.set(slot, mesh);
+    return mesh;
+  }
+
+  function removeSmokeOuterShell(slot: number): void {
+    const existing = smokeOuterShells.get(slot);
+    if (!existing) return;
+    scene.remove(existing);
+    existing.geometry.dispose();
+    (existing.material as THREE.Material).dispose();
+    smokeOuterShells.delete(slot);
+  }
 
   function meshFor(slot: number, entType: number): THREE.Mesh {
     const existing = meshes.get(slot);
@@ -1170,14 +1232,19 @@ export function createAbilityEntityRenderer(scene: THREE.Scene): AbilityEntityRe
             (existing.material as THREE.Material).dispose();
             meshes.delete(e);
           }
+          removeSmokeOuterShell(e);
           continue;
         }
         const mesh = meshFor(e, entType);
         mesh.position.set(state.entX[e]!, state.entY[e]!, state.entZ[e]!);
+        if (entType !== ENT_SMOKE) removeSmokeOuterShell(e);
         if (entType === ENT_SMOKE) {
           const abilityId = state.entAbilityId[e]!;
           const radius = ABILITIES.find((a) => a.id === abilityId)?.radius ?? 3;
           mesh.scale.setScalar(radius);
+          const outer = smokeOuterShellFor(e);
+          outer.position.copy(mesh.position);
+          outer.scale.setScalar(radius * 1.12);
         } else if (entType === ENT_WALL_BOX) {
           const alignX = state.entVelX[e]! !== 0;
           mesh.scale.set(alignX ? 2 : 0.4, 2, alignX ? 0.4 : 2);

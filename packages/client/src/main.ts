@@ -1,5 +1,19 @@
 import * as THREE from "three";
 import {
+  ABL_LUMEN_MEND,
+  ABL_LUMEN_RES,
+  ABL_LUMEN_SLOW,
+  ABL_LUMEN_WALL,
+  ABL_SONAR_PULSE,
+  ABL_SONAR_RECON,
+  ABL_SONAR_SHOCK,
+  ABL_UMBRA_BLIND,
+  ABL_UMBRA_SHROUD,
+  ABL_UMBRA_STEP,
+  ABL_UMBRA_VEIL,
+  ABL_ZEPHYR_DASH,
+  ABL_ZEPHYR_GUST,
+  ABL_ZEPHYR_UPDRAFT,
   AGENT_NONE,
   EYE_HEIGHT_CROUCH,
   EYE_HEIGHT_STAND,
@@ -9,6 +23,7 @@ import {
   NO_PLAYER,
   PHASE_BUY,
   PHASE_WAITING,
+  RUN_SPEED,
   SPIKE_CARRIED,
   SPIKE_PLANTED,
   WEAPON_NONE,
@@ -23,7 +38,7 @@ import {
   type SimState,
 } from "@vg/sim";
 import { buildInputFrame, getPitch, getYaw, onBuyKeyPressed, onBuyMenuToggle, setLookSensitivityMultiplier, setupInput } from "./input.js";
-import { GRAYBOX_BOXES, SPAWN_POSITION } from "./graybox.js";
+import { GRAYBOX_BOXES, SPAWN_POSITION, buildLevelDressing } from "./graybox.js";
 import {
   createAbilityEntityRenderer,
   createAbilityHud,
@@ -33,7 +48,6 @@ import {
   createDamageDirectionIndicator,
   createFlashOverlay,
   createFpsCounter,
-  createViewmodel,
   createHitFlashOverlay,
   createHitmarker,
   createKillFeed,
@@ -47,6 +61,15 @@ import {
   spawnTracer,
   type RemotePlayerProxy,
 } from "./render.js";
+import { createMaterialSet } from "./materials.js";
+import { createViewmodel, weaponClassFor } from "./viewmodel.js";
+import { createDeathMarkerPool, createImpactSparksPool, createMuzzleFlashPool, createSpikeBeacon } from "./vfx.js";
+import { createAudioEngine } from "./audio/engine.js";
+import type { AbilityCue } from "./audio/synth.js";
+import { ANNOUNCER_LINES, createAnnouncer } from "./audio/announcer.js";
+import { DEFAULT_VOLUME_SETTINGS, loadVolumeSettings, saveVolumeSettings } from "./audio/settings.js";
+import { FOOTSTEP_MAX_AUDIBLE_M, createFootstepTracker, isFootstepAudible, updateFootstepTracker } from "./audio/footsteps.js";
+import { createSettingsOverlay } from "./settingsOverlay.js";
 import { connectNetClient, type NetClient } from "./net.js";
 
 const canvas = document.getElementById("app") as HTMLCanvasElement;
@@ -54,7 +77,49 @@ setupInput(canvas);
 
 const { renderer, scene, camera } = createScene(canvas);
 const viewmodel = createViewmodel(camera);
-buildGrayboxMeshes(scene, GRAYBOX_BOXES);
+
+// M5: procedural materials + non-colliding level dressing, layered on top of
+// the unchanged LEVEL_BOXES collision geometry (see materials.ts/graybox.ts).
+const materials = createMaterialSet();
+buildGrayboxMeshes(scene, GRAYBOX_BOXES, materials);
+buildLevelDressing(scene, GRAYBOX_BOXES, materials);
+
+// M5: Web Audio engine (gracefully no-ops if Web Audio is unavailable) +
+// persisted volume settings + a minimal settings overlay (gear icon / N key).
+const audioEngine = createAudioEngine();
+audioEngine.resumeOnGesture(canvas);
+let volumeSettings = loadVolumeSettings(window.localStorage);
+function applyVolumeSettings(s: typeof volumeSettings): void {
+  audioEngine.setMasterVolume(s.master);
+  audioEngine.setSfxVolume(s.sfx);
+  audioEngine.setAnnouncerVolume(s.announcer);
+  audioEngine.setMuteWhenTabHidden(s.muteWhenTabHidden);
+}
+applyVolumeSettings(volumeSettings);
+createSettingsOverlay(volumeSettings, (next) => {
+  volumeSettings = next;
+  applyVolumeSettings(next);
+  saveVolumeSettings(window.localStorage, next);
+});
+
+// M5: announcer — SpeechSynthesis if available with voices loaded, else a
+// tone-stinger fallback (see audio/announcer.ts's feature-detect).
+const announcer = createAnnouncer({
+  speechSynthesis: typeof window !== "undefined" ? window.speechSynthesis : undefined,
+  createUtterance: typeof window !== "undefined" && typeof SpeechSynthesisUtterance !== "undefined" ? (text: string) => new SpeechSynthesisUtterance(text) : undefined,
+  playStinger: (line) => {
+    if (!audioEngine.sounds) return;
+    const isWinLine = line === ANNOUNCER_LINES.attackersWin || line === ANNOUNCER_LINES.defendersWin;
+    audioEngine.play2d(isWinLine ? audioEngine.sounds.roundWinStinger : audioEngine.sounds.uiClick, { bus: "announcer" });
+  },
+});
+
+// M5 VFX pools (pre-allocated, reused — see vfx.ts doc comment on the no-per-frame-allocation budget).
+const muzzleFlashPool = createMuzzleFlashPool(scene);
+const impactSparksPool = createImpactSparksPool(scene);
+const deathMarkerPool = createDeathMarkerPool(scene);
+const spikeBeacon = createSpikeBeacon(scene);
+
 const fpsCounter = createFpsCounter();
 const hitFlash = createHitFlashOverlay();
 const hitmarker = createHitmarker();
@@ -79,6 +144,42 @@ interface RemoteWeaponSnapshot {
   weaponSecondary: number;
 }
 const remoteLastWeapon = new Map<number, RemoteWeaponSnapshot>();
+
+/** M5: per-remote-player footstep stride trackers (see audio/footsteps.ts) — one persistent accumulator per player index. */
+const remoteFootstepTrackers = new Map<number, ReturnType<typeof createFootstepTracker>>();
+const localFootstepTracker = createFootstepTracker();
+
+/** M5: maps an ability world-event (id + kind: 0 cast/1 detonate/2 pulse/3 expire) to a synthesized cue — see audio/synth.ts's AbilityCue set. Ult-weapon abilities (Blades/Rail) return null: they reuse the ordinary gunplay pipeline, so their audio is just an ordinary gunshot. */
+function abilityCueFor(abilityId: number, kind: number): AbilityCue | null {
+  switch (abilityId) {
+    case ABL_ZEPHYR_UPDRAFT:
+    case ABL_ZEPHYR_DASH:
+    case ABL_UMBRA_STEP:
+    case ABL_LUMEN_WALL:
+      return "whoosh";
+    case ABL_ZEPHYR_GUST:
+      return kind === 1 ? "rumble" : "whoosh";
+    case ABL_UMBRA_BLIND:
+      return kind === 1 ? "shimmer" : "whoosh";
+    case ABL_UMBRA_SHROUD:
+      return kind === 1 ? "rumble" : "whoosh";
+    case ABL_UMBRA_VEIL:
+      return "rumble";
+    case ABL_SONAR_SHOCK:
+      return kind === 1 ? "crackle" : "whoosh";
+    case ABL_SONAR_PULSE:
+      return "alarm";
+    case ABL_SONAR_RECON:
+      return "alarm";
+    case ABL_LUMEN_SLOW:
+      return kind === 1 ? "rumble" : "whoosh";
+    case ABL_LUMEN_MEND:
+    case ABL_LUMEN_RES:
+      return "chime";
+    default:
+      return null;
+  }
+}
 
 /** M3: fading TeamPing markers for the minimap (see render.ts's Minimap). */
 const teamPings: Array<{ x: number; z: number; createdAtMs: number }> = [];
@@ -137,8 +238,9 @@ connectNetClient().then((client) => {
     client.onPredictedHit(() => {
       hitmarker.showPredicted();
     });
-    client.onConfirmedHit(({ damage }) => {
+    client.onConfirmedHit(({ damage, region }) => {
       hitmarker.showConfirmed(damage);
+      if (audioEngine.sounds) audioEngine.play2d(region === 0 ? audioEngine.sounds.headshotDing : audioEngine.sounds.hitConfirm, { bus: "sfx" });
     });
     client.onDamageTaken(({ attackerIndex }) => {
       hitFlash.flash();
@@ -155,19 +257,51 @@ connectNetClient().then((client) => {
     });
     client.onKillEvent((e) => {
       killFeed.push(e);
+      const localIndex = netClient?.getLocalIndex();
+      // Kill confirm (own kills): distinct from the per-shot hit-confirm sound above — this fires once, on the kill itself.
+      if (audioEngine.sounds && localIndex !== null && localIndex !== undefined && e.killerIndex === localIndex) {
+        audioEngine.play2d(e.headshot ? audioEngine.sounds.headshotDing : audioEngine.sounds.hitConfirm, { bus: "sfx", gain: 1.2 });
+      }
+      // Death marker at the victim's last known position — a small cross fading over time (spec item 6).
+      const poses = netClient?.getRemotePoses();
+      const victimPose = poses?.[e.victimIndex];
+      if (victimPose) {
+        deathMarkerPool.spawn(new THREE.Vector3(victimPose.posX, victimPose.posY, victimPose.posZ));
+      }
     });
     client.onMatchEvent((e) => {
       const localIndex = netClient?.getLocalIndex();
       const state = netClient?.getPredictedState();
       const myTeam = localIndex !== null && localIndex !== undefined && state ? state.team[localIndex]! : 255;
-      if (e.kind === 1) matchHud.showRoundEnd(e.winnerTeam, e.reason, myTeam);
-      else if (e.kind === 2) {
+      if (e.kind === 0) {
+        announcer.speak(ANNOUNCER_LINES.roundStart);
+      } else if (e.kind === 1) {
+        matchHud.showRoundEnd(e.winnerTeam, e.reason, myTeam);
+        audioEngine.stopSpikeBeepLoop();
+        if (audioEngine.sounds) audioEngine.play2d(e.winnerTeam === myTeam ? audioEngine.sounds.roundWinStinger : audioEngine.sounds.roundLoseStinger, { bus: "sfx" });
+        announcer.speak(e.winnerTeam === 0 ? ANNOUNCER_LINES.attackersWin : ANNOUNCER_LINES.defendersWin);
+      } else if (e.kind === 2) {
         const s = netClient?.getPredictedState();
         if (s) matchHud.showMatchEnd(s.scoreTeam0, s.scoreTeam1, myTeam);
+      } else if (e.kind === 3) {
+        announcer.speak(ANNOUNCER_LINES.spikePlanted);
+        audioEngine.startSpikeBeepLoop(() => {
+          const hud = netClient?.getMatchHud();
+          const s = netClient?.getPredictedState();
+          if (!hud || !s || hud.spikeState !== SPIKE_PLANTED) return null;
+          return { ticksLeft: hud.spikePlantedTicksLeft, totalTicks: s.config.spikeTicks, pos: { x: hud.spikeX, y: hud.spikeY, z: hud.spikeZ } };
+        });
+      } else if (e.kind === 4 || e.kind === 5) {
+        audioEngine.stopSpikeBeepLoop();
       }
     });
     client.onTeamPing((e) => {
       teamPings.push({ x: e.x, z: e.z, createdAtMs: performance.now() });
+    });
+    client.onAbilityEvent((e) => {
+      if (!audioEngine.sounds) return;
+      const cue = abilityCueFor(e.abilityId, e.kind);
+      if (cue) audioEngine.play3d(audioEngine.sounds.ability[cue], { x: e.x, y: e.y, z: e.z });
     });
     // eslint-disable-next-line no-console
     console.log("[net] connected, playing online");
@@ -202,6 +336,8 @@ function syncRemoteProxies(): void {
   const poses = netClient.getRemotePoses();
   if (!poses) return;
   const localIndex = netClient.getLocalIndex();
+  const netState = netClient.getPredictedState();
+  const localTeam = localIndex !== null && netState ? netState.team[localIndex]! : 255;
 
   for (let i = 0; i < poses.length; i++) {
     if (i === localIndex) continue;
@@ -219,7 +355,7 @@ function syncRemoteProxies(): void {
       proxy = createRemotePlayerProxy(scene);
       remoteProxies.set(i, proxy);
     }
-    proxy.setPose(pose);
+    proxy.setPose(pose, localTeam);
 
     // Remote shot tracer heuristic: active-slot ammo decreased since the
     // last check -> they fired (see interpolation.ts's RemotePose.magActive
