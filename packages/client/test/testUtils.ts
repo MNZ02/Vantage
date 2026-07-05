@@ -22,7 +22,12 @@ export function createScriptedInputSender(transport: Transport): (seq: number, i
   };
 }
 
-/** Maps a wire SnapshotMessage to PredictedClient.reconcile()'s AuthoritativeSnapshot shape. */
+/**
+ * Maps a wire SnapshotMessage to PredictedClient.reconcile()'s
+ * AuthoritativeSnapshot shape. Includes the M3 match section whenever the
+ * snapshot's mode says match (mode 1) — DM-mode snapshots (mode 0) omit it,
+ * matching net.ts's own real-client behavior.
+ */
 export function toAuthoritative(msg: SnapshotMessage): AuthoritativeSnapshot {
   return {
     serverTick: msg.serverTick,
@@ -50,7 +55,29 @@ export function toAuthoritative(msg: SnapshotMessage): AuthoritativeSnapshot {
       tagTicksLeft: pl.tagTicksLeft,
       credits: pl.credits,
       respawnTicksLeft: pl.respawnTicksLeft,
+      team: pl.team,
     })),
+    match:
+      msg.mode === 1
+        ? {
+            mode: msg.mode,
+            matchPhase: msg.matchPhase,
+            phaseTicksLeft: msg.phaseTicksLeft,
+            roundNumber: msg.roundNumber,
+            scoreTeam0: msg.scoreTeam0,
+            scoreTeam1: msg.scoreTeam1,
+            spikeState: msg.spikeState,
+            spikeCarrier: msg.spikeCarrier,
+            spikeX: msg.spikeX,
+            spikeY: msg.spikeY,
+            spikeZ: msg.spikeZ,
+            spikePlantedTicksLeft: msg.spikePlantedTicksLeft,
+            activePlantProgress: msg.activePlantProgress,
+            planterIndex: msg.planterIndex,
+            activeDefuseProgress: msg.activeDefuseProgress,
+            defuserIndex: msg.defuserIndex,
+          }
+        : undefined,
   };
 }
 
@@ -69,5 +96,7 @@ export function idleInput(yaw = 0, pitch = 0): InputFrame {
     reload: false,
     slot1: false,
     slot2: false,
+    interact: false,
+    ping: false,
   };
 }

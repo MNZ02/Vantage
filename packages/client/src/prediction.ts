@@ -1,7 +1,19 @@
 // Client-side prediction + reconciliation for the local player. Pure logic,
 // no DOM/rendering — net.ts wires this to the real WebSocket, tests wire it
 // to a loopback @vg/server ServerHost directly.
-import { WEAPON_NONE, cloneState, createState, tick, type Box, type InputFrame, type ShotEvent, type SimState } from "@vg/sim";
+import {
+  MODE_DM,
+  MODE_MATCH,
+  WEAPON_NONE,
+  cloneState,
+  createMatchState,
+  createState,
+  tick,
+  type Box,
+  type InputFrame,
+  type ShotEvent,
+  type SimState,
+} from "@vg/sim";
 import { quantizeInputSample } from "@vg/protocol";
 
 /** Per-tick decay applied to the render-only correction offset (see reconcile()). */
@@ -35,12 +47,40 @@ export interface AuthoritativePlayerState {
   tagTicksLeft: number;
   credits: number;
   respawnTicksLeft: number;
+  /** M3: 0 attackers, 1 defenders, 255 unassigned (TEAM_NONE). */
+  team: number;
+}
+
+/**
+ * M3 match section (mirrors @vg/protocol SnapshotMessage's match fields).
+ * Optional/undefined for a DM-mode server, in which case reconcile() leaves
+ * the predicted state's match fields untouched (PredictedClient was
+ * constructed with mode MODE_DM to begin with, so they're inert anyway).
+ */
+export interface AuthoritativeMatchSection {
+  mode: number;
+  matchPhase: number;
+  phaseTicksLeft: number;
+  roundNumber: number;
+  scoreTeam0: number;
+  scoreTeam1: number;
+  spikeState: number;
+  spikeCarrier: number;
+  spikeX: number;
+  spikeY: number;
+  spikeZ: number;
+  spikePlantedTicksLeft: number;
+  activePlantProgress: number;
+  planterIndex: number;
+  activeDefuseProgress: number;
+  defuserIndex: number;
 }
 
 export interface AuthoritativeSnapshot {
   serverTick: number;
   lastProcessedSeq: number;
   players: readonly AuthoritativePlayerState[];
+  match?: AuthoritativeMatchSection;
 }
 
 export interface Vec3 {
@@ -88,8 +128,20 @@ export class PredictedClient {
   /** Count of corrections whose diff exceeded the epsilon (for HUD "corrections/s"). */
   correctionsApplied = 0;
 
-  constructor(seed: number, numPlayers: number, localIndex: number, boxes: readonly Box[]) {
-    this.state = createState(seed, numPlayers);
+  /**
+   * `mode` (default MODE_DM) picks createState() vs createMatchState() —
+   * match mode requires the full MatchConfig-shaped state for phase/spike
+   * fields to exist at all. Known limitation, stated plainly: MatchConfig
+   * itself isn't transmitted over the wire (only its effects are, via the
+   * Snapshot match section), so this always uses the compiled-in
+   * DEFAULT_MATCH_CONFIG — exact prediction of phase timers is only
+   * guaranteed when the server ALSO runs the defaults (true in production;
+   * tests that shrink timers server-side will see extra reconciliation
+   * corrections on phase-boundary ticks, which is fine — reconcile() still
+   * converges, just via a visible correction instead of an invisible one).
+   */
+  constructor(seed: number, numPlayers: number, localIndex: number, boxes: readonly Box[], mode: number = MODE_DM) {
+    this.state = mode === MODE_MATCH ? createMatchState(seed, numPlayers) : createState(seed, numPlayers);
     this.localIndex = localIndex;
     this.boxes = boxes;
   }
@@ -239,6 +291,7 @@ export class PredictedClient {
       base.tagTicksLeft[i] = p.tagTicksLeft;
       base.credits[i] = p.credits;
       base.respawnTick[i] = p.alive ? -1 : snapshot.serverTick + p.respawnTicksLeft;
+      base.team[i] = p.team;
 
       // Only the confirmed *active* slot's ammo is authoritative; the other
       // slot keeps whatever this client already predicted (see doc comment).
@@ -253,6 +306,33 @@ export class PredictedClient {
         base.magSecondary[i] = p.magActive;
         base.reserveSecondary[i] = p.reserveActive;
       }
+    }
+
+    // M3 match section: global (not per-player) fields, all directly
+    // authoritative — unlike weapon-timer fields there's no "unconfirmed"
+    // subset here, so this is a straight overwrite. See AuthoritativeMatchSection's
+    // doc comment for the one caveat (MatchConfig itself isn't on the wire).
+    const match = snapshot.match;
+    if (match) {
+      base.mode = match.mode;
+      base.matchPhase = match.matchPhase;
+      base.phaseEndTick = match.phaseTicksLeft > 0 ? snapshot.serverTick + match.phaseTicksLeft : -1;
+      base.roundNumber = match.roundNumber;
+      base.scoreTeam0 = match.scoreTeam0;
+      base.scoreTeam1 = match.scoreTeam1;
+      base.spikeState = match.spikeState;
+      base.spikeCarrier = match.spikeCarrier;
+      base.spikeX = match.spikeX;
+      base.spikeY = match.spikeY;
+      base.spikeZ = match.spikeZ;
+      base.spikePlantedTick = match.spikePlantedTicksLeft > 0 ? snapshot.serverTick + match.spikePlantedTicksLeft - base.config.spikeTicks : -1;
+      base.plantProgress = match.activePlantProgress;
+      base.planterIndex = match.planterIndex;
+      base.defuseProgress = match.activeDefuseProgress;
+      base.defuserIndex = match.defuserIndex;
+      // Not transmitted; approximated from progress vs. the compiled-in
+      // checkpoint threshold (see the constructor's MatchConfig caveat).
+      base.defuseCheckpointHit = match.activeDefuseProgress >= base.config.defuseCheckpointTicks ? 1 : 0;
     }
 
     const remaining = Array.from(this.inputBuffer.entries()).sort((a, b) => a[0] - b[0]);

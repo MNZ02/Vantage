@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { CROUCH_HEIGHT, STAND_HEIGHT, WEAPONS } from "@vg/sim";
+import { CROUCH_HEIGHT, LEVEL_BOXES, STAND_HEIGHT, WEAPONS, type Box } from "@vg/sim";
 import type { RemotePose } from "./interpolation.js";
 import type { GrayboxSurface } from "./graybox.js";
 
@@ -357,9 +357,16 @@ export function createDamageDirectionIndicator(): DamageDirectionIndicator {
 export interface BuyMenu {
   setOpen(open: boolean): void;
   setState(credits: number, alive: boolean): void;
+  /**
+   * M3 match mode: shows a "Sell" button next to each row whose itemId is in
+   * `purchasedItemIds` (items bought THIS buy phase — see @vg/sim's
+   * purchasedThisBuy tracking), and whether the buy phase itself is even
+   * open right now (buy/sell are only valid during it in match mode).
+   */
+  setMatchState(purchasedItemIds: ReadonlySet<number>, isBuyPhase: boolean): void;
 }
 
-export function createBuyMenu(onBuy: (itemId: number) => void): BuyMenu {
+export function createBuyMenu(onBuy: (itemId: number) => void, onSell?: (itemId: number) => void): BuyMenu {
   const overlay = document.createElement("div");
   overlay.style.position = "fixed";
   overlay.style.inset = "0";
@@ -397,15 +404,36 @@ export function createBuyMenu(onBuy: (itemId: number) => void): BuyMenu {
 
   let credits = 0;
   const rows: HTMLDivElement[] = [];
+  const sellButtons: HTMLButtonElement[] = [];
   items.forEach((item, i) => {
     const row = document.createElement("div");
     row.style.padding = "4px 8px";
-    row.style.cursor = "pointer";
     row.style.borderRadius = "3px";
-    row.textContent = `${i + 1}. ${item.label} — ${item.price}cr`;
+    row.style.display = "flex";
+    row.style.alignItems = "center";
+    row.style.justifyContent = "space-between";
+    row.style.gap = "10px";
+
+    const label = document.createElement("span");
+    label.style.cursor = "pointer";
+    label.textContent = `${i + 1}. ${item.label} — ${item.price}cr`;
+    label.addEventListener("click", () => onBuy(item.itemId));
+    row.appendChild(label);
+
+    const sellBtn = document.createElement("button");
+    sellBtn.textContent = "Sell";
+    sellBtn.style.display = "none";
+    sellBtn.style.font = "12px monospace";
+    sellBtn.style.cursor = "pointer";
+    sellBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onSell?.(item.itemId);
+    });
+    row.appendChild(sellBtn);
+    sellButtons.push(sellBtn);
+
     row.addEventListener("mouseenter", () => (row.style.background = "rgba(255,255,255,0.1)"));
     row.addEventListener("mouseleave", () => (row.style.background = "transparent"));
-    row.addEventListener("click", () => onBuy(item.itemId));
     panel.appendChild(row);
     rows.push(row);
   });
@@ -422,6 +450,11 @@ export function createBuyMenu(onBuy: (itemId: number) => void): BuyMenu {
       rows.forEach((row, i) => {
         const affordable = alive && items[i]!.price <= credits;
         row.style.opacity = affordable ? "1" : "0.4";
+      });
+    },
+    setMatchState(purchasedItemIds: ReadonlySet<number>, isBuyPhase: boolean) {
+      items.forEach((item, i) => {
+        sellButtons[i]!.style.display = onSell && isBuyPhase && purchasedItemIds.has(item.itemId) ? "inline-block" : "none";
       });
     },
   };
@@ -475,6 +508,340 @@ export function createCombatHud(): CombatHud {
         respawnEl.textContent = `respawning in ${Math.ceil(respawnSecondsLeft)}s`;
       } else {
         respawnEl.style.display = "none";
+      }
+    },
+  };
+}
+
+// ---- M3: match phase/round/spike HUD, minimap, spectate, reconnect banner ----
+
+const PHASE_NAMES = ["Waiting for players…", "BUY PHASE", "", "Round over", "MATCH OVER"];
+
+function formatClock(seconds: number): string {
+  const s = Math.max(0, Math.ceil(seconds));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, "0")}`;
+}
+
+export interface MatchHudView {
+  /** Called every frame with the settled snapshot state — phase name/timer, score, and spike countdown/progress. */
+  update(info: {
+    mode: number;
+    matchPhase: number;
+    phaseSecondsLeft: number;
+    roundNumber: number;
+    scoreTeam0: number;
+    scoreTeam1: number;
+    myTeam: number;
+    spikeState: number;
+    isCarrier: boolean;
+    detonateSecondsLeft: number;
+    /** 0..1, or null if this client isn't the one currently channeling. */
+    ownChannelProgress01: number | null;
+    ownChannelKind: "plant" | "defuse" | null;
+  }): void;
+  /** Event-driven: shown for a few seconds on a roundEnd MatchEvent. */
+  showRoundEnd(winnerTeam: number, reason: number, myTeam: number): void;
+  /** Event-driven: shown (and stays) on a matchEnd MatchEvent. */
+  showMatchEnd(scoreTeam0: number, scoreTeam1: number, myTeam: number): void;
+}
+
+const REASON_NAMES = ["Eliminated", "Spike detonated", "Spike defused", "Time expired"];
+
+export function createMatchHud(): MatchHudView {
+  const top = document.createElement("div");
+  top.style.position = "fixed";
+  top.style.top = "8px";
+  top.style.left = "50%";
+  top.style.transform = "translateX(-50%)";
+  top.style.zIndex = "10";
+  top.style.font = "15px monospace";
+  top.style.color = "#fff";
+  top.style.textShadow = "0 0 3px rgba(0,0,0,0.9)";
+  top.style.textAlign = "center";
+  top.style.whiteSpace = "pre";
+  document.body.appendChild(top);
+
+  const spikeHud = document.createElement("div");
+  spikeHud.style.position = "fixed";
+  spikeHud.style.top = "70px";
+  spikeHud.style.left = "50%";
+  spikeHud.style.transform = "translateX(-50%)";
+  spikeHud.style.zIndex = "10";
+  spikeHud.style.font = "bold 16px monospace";
+  spikeHud.style.color = "#ff4d4d";
+  spikeHud.style.textShadow = "0 0 4px rgba(0,0,0,0.9)";
+  spikeHud.style.textAlign = "center";
+  document.body.appendChild(spikeHud);
+
+  const progressBar = document.createElement("div");
+  progressBar.style.position = "fixed";
+  progressBar.style.top = "95px";
+  progressBar.style.left = "50%";
+  progressBar.style.transform = "translateX(-50%)";
+  progressBar.style.width = "160px";
+  progressBar.style.height = "8px";
+  progressBar.style.border = "1px solid #fff";
+  progressBar.style.zIndex = "10";
+  progressBar.style.display = "none";
+  const progressFill = document.createElement("div");
+  progressFill.style.height = "100%";
+  progressFill.style.background = "#ffd54a";
+  progressFill.style.width = "0%";
+  progressBar.appendChild(progressFill);
+  document.body.appendChild(progressBar);
+
+  const banner = document.createElement("div");
+  banner.style.position = "fixed";
+  banner.style.top = "35%";
+  banner.style.left = "50%";
+  banner.style.transform = "translate(-50%, -50%)";
+  banner.style.zIndex = "15";
+  banner.style.font = "bold 26px monospace";
+  banner.style.color = "#fff";
+  banner.style.textShadow = "0 0 6px rgba(0,0,0,0.9)";
+  banner.style.textAlign = "center";
+  banner.style.display = "none";
+  document.body.appendChild(banner);
+
+  let bannerTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  return {
+    update(info) {
+      if (info.mode !== 1) {
+        top.textContent = "";
+        spikeHud.textContent = "";
+        progressBar.style.display = "none";
+        return;
+      }
+      const phaseName = info.matchPhase === 2 ? "ROUND" : (PHASE_NAMES[info.matchPhase] ?? "");
+      const teamName = info.myTeam === 0 ? "ATTACK" : info.myTeam === 1 ? "DEFENSE" : "—";
+      top.textContent = `${phaseName}  ${formatClock(info.phaseSecondsLeft)}   Round ${info.roundNumber}   ${info.scoreTeam0} - ${info.scoreTeam1}   [${teamName}]`;
+
+      if (info.spikeState === 2) {
+        spikeHud.textContent = `SPIKE PLANTED  ${formatClock(info.detonateSecondsLeft)}`;
+      } else if (info.isCarrier) {
+        spikeHud.textContent = "CARRYING THE SPIKE";
+      } else {
+        spikeHud.textContent = "";
+      }
+
+      if (info.ownChannelProgress01 !== null) {
+        progressBar.style.display = "block";
+        progressFill.style.width = `${Math.round(info.ownChannelProgress01 * 100)}%`;
+        progressFill.style.background = info.ownChannelKind === "defuse" ? "#4dafff" : "#ffd54a";
+      } else {
+        progressBar.style.display = "none";
+      }
+    },
+    showRoundEnd(winnerTeam, reason, myTeam) {
+      const won = winnerTeam === myTeam;
+      const winnerName = winnerTeam === 0 ? "ATTACKERS" : "DEFENDERS";
+      banner.textContent = `${winnerName} WIN — ${REASON_NAMES[reason] ?? ""}${myTeam !== 255 ? (won ? "  (you won)" : "  (you lost)") : ""}`;
+      banner.style.display = "block";
+      if (bannerTimeout) clearTimeout(bannerTimeout);
+      bannerTimeout = setTimeout(() => {
+        banner.style.display = "none";
+      }, 4500);
+    },
+    showMatchEnd(scoreTeam0, scoreTeam1, myTeam) {
+      if (bannerTimeout) clearTimeout(bannerTimeout);
+      const leader = scoreTeam0 > scoreTeam1 ? 0 : 1;
+      const won = leader === myTeam;
+      banner.textContent = `MATCH OVER — ${scoreTeam0} : ${scoreTeam1}${myTeam !== 255 ? (won ? "  YOU WIN" : "  YOU LOSE") : ""}`;
+      banner.style.display = "block";
+    },
+  };
+}
+
+/** Team-only spectate label — camera attachment itself lives in main.ts. */
+export interface SpectateOverlay {
+  update(spectatingIndex: number | null, overheadFallback: boolean): void;
+}
+
+export function createSpectateOverlay(): SpectateOverlay {
+  const el = document.createElement("div");
+  el.style.position = "fixed";
+  el.style.bottom = "60px";
+  el.style.left = "50%";
+  el.style.transform = "translateX(-50%)";
+  el.style.zIndex = "10";
+  el.style.font = "14px monospace";
+  el.style.color = "#fff";
+  el.style.textShadow = "0 0 3px rgba(0,0,0,0.9)";
+  el.style.display = "none";
+  document.body.appendChild(el);
+  return {
+    update(spectatingIndex, overheadFallback) {
+      if (spectatingIndex === null && !overheadFallback) {
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "block";
+      el.textContent = overheadFallback ? "Spectating — overhead view (no living teammates)" : `Spectating P${spectatingIndex} (click to cycle)`;
+    },
+  };
+}
+
+/** Reconnect banner ("reconnecting…"), shown while net.ts's auto-retry loop is active. */
+export function createReconnectBanner(): { setVisible(visible: boolean): void } {
+  const el = document.createElement("div");
+  el.style.position = "fixed";
+  el.style.top = "50%";
+  el.style.left = "50%";
+  el.style.transform = "translate(-50%, -50%)";
+  el.style.zIndex = "20";
+  el.style.font = "bold 20px monospace";
+  el.style.color = "#fff";
+  el.style.background = "rgba(0,0,0,0.7)";
+  el.style.padding = "16px 24px";
+  el.style.borderRadius = "6px";
+  el.style.display = "none";
+  el.textContent = "Connection lost — reconnecting…";
+  document.body.appendChild(el);
+  return {
+    setVisible(visible: boolean) {
+      el.style.display = visible ? "block" : "none";
+    },
+  };
+}
+
+/** One player marker fed into Minimap.update() per living/relevant player. */
+export interface MinimapPlayerMarker {
+  x: number;
+  z: number;
+  yaw?: number;
+}
+
+export interface MinimapPing {
+  x: number;
+  z: number;
+  ageMs: number;
+}
+
+export interface Minimap {
+  update(state: {
+    self: MinimapPlayerMarker | null;
+    teammates: readonly MinimapPlayerMarker[];
+    visibleEnemies: readonly MinimapPlayerMarker[];
+    spike: { state: number; x: number; z: number } | null;
+    pings: readonly MinimapPing[];
+  }): void;
+}
+
+const MINIMAP_SIZE_PX = 220;
+const MINIMAP_PING_LIFETIME_MS = 5000;
+
+/**
+ * ~220px top-down minimap, top-left: a prerendered outline of `boxes` (drawn
+ * once), then per-frame overlay of self (arrow), living teammates (dots),
+ * visible enemies (red dots, per the server's team-shared visibility mask —
+ * see @vg/server ServerHost.updateVisibility()), the spike marker, and
+ * fading TeamPing markers. World (x, z) maps to canvas space by centering
+ * on the level's bounding box — LEVEL_BOXES span roughly [-20, 20] on both
+ * axes (see @vg/sim levels.ts), so a fixed world-half-extent works for our
+ * single graybox map without needing per-map calibration.
+ */
+export function createMinimap(boxes: readonly Box[] = LEVEL_BOXES): Minimap {
+  const WORLD_HALF_EXTENT = 22;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = MINIMAP_SIZE_PX;
+  canvas.height = MINIMAP_SIZE_PX;
+  canvas.style.position = "fixed";
+  canvas.style.top = "8px";
+  canvas.style.left = "8px";
+  canvas.style.zIndex = "10";
+  canvas.style.background = "rgba(0,0,0,0.5)";
+  canvas.style.border = "1px solid rgba(255,255,255,0.4)";
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext("2d")!;
+
+  function worldToCanvas(x: number, z: number): { cx: number; cz: number } {
+    return {
+      cx: ((x + WORLD_HALF_EXTENT) / (WORLD_HALF_EXTENT * 2)) * MINIMAP_SIZE_PX,
+      cz: ((z + WORLD_HALF_EXTENT) / (WORLD_HALF_EXTENT * 2)) * MINIMAP_SIZE_PX,
+    };
+  }
+
+  // Prerendered outline layer (drawn once — the level's static footprint never changes).
+  const outline = document.createElement("canvas");
+  outline.width = MINIMAP_SIZE_PX;
+  outline.height = MINIMAP_SIZE_PX;
+  const octx = outline.getContext("2d")!;
+  octx.fillStyle = "rgba(255,255,255,0.08)";
+  octx.strokeStyle = "rgba(255,255,255,0.35)";
+  for (const box of boxes) {
+    const a = worldToCanvas(box.minX, box.minZ);
+    const b = worldToCanvas(box.maxX, box.maxZ);
+    const w = b.cx - a.cx;
+    const h = b.cz - a.cz;
+    octx.fillRect(a.cx, a.cz, w, h);
+    octx.strokeRect(a.cx, a.cz, w, h);
+  }
+
+  return {
+    update({ self, teammates, visibleEnemies, spike, pings }) {
+      ctx.clearRect(0, 0, MINIMAP_SIZE_PX, MINIMAP_SIZE_PX);
+      ctx.drawImage(outline, 0, 0);
+
+      for (const ping of pings) {
+        if (ping.ageMs > MINIMAP_PING_LIFETIME_MS) continue;
+        const { cx, cz } = worldToCanvas(ping.x, ping.z);
+        const alpha = 1 - ping.ageMs / MINIMAP_PING_LIFETIME_MS;
+        ctx.strokeStyle = `rgba(255,220,80,${alpha})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(cx, cz, 6 + (1 - alpha) * 6, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      if (spike) {
+        const { cx, cz } = worldToCanvas(spike.x, spike.z);
+        ctx.fillStyle = spike.state === 2 ? "#ff3b3b" : "#ffd54a";
+        ctx.beginPath();
+        ctx.arc(cx, cz, spike.state === 2 ? 5 : 4, 0, Math.PI * 2);
+        ctx.fill();
+        if (spike.state === 2) {
+          ctx.strokeStyle = "rgba(255,59,59,0.6)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(cx, cz, 9, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+      }
+
+      ctx.fillStyle = "#3fa7ff";
+      for (const t of teammates) {
+        const { cx, cz } = worldToCanvas(t.x, t.z);
+        ctx.beginPath();
+        ctx.arc(cx, cz, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.fillStyle = "#ff3b3b";
+      for (const e of visibleEnemies) {
+        const { cx, cz } = worldToCanvas(e.x, e.z);
+        ctx.beginPath();
+        ctx.arc(cx, cz, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      if (self) {
+        const { cx, cz } = worldToCanvas(self.x, self.z);
+        const yaw = self.yaw ?? 0;
+        ctx.save();
+        ctx.translate(cx, cz);
+        ctx.rotate(yaw);
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.moveTo(0, -6);
+        ctx.lineTo(4, 5);
+        ctx.lineTo(-4, 5);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
       }
     },
   };

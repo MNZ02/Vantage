@@ -46,6 +46,8 @@ export interface RemotePose {
    * of a shot that doesn't consume ammo (there is none, currently).
    */
   magActive: number;
+  /** M3: 0 attackers, 1 defenders, 255 unassigned (TEAM_NONE) — used by the minimap to color dots. */
+  team: number;
 }
 
 export interface RemoteInterpolatorOptions {
@@ -78,6 +80,7 @@ function lerpPose(a: RemotePose, b: RemotePose, t: number): RemotePose {
     weaponSecondary: t < 1 ? a.weaponSecondary : b.weaponSecondary,
     activeSlot: t < 1 ? a.activeSlot : b.activeSlot,
     magActive: t < 1 ? a.magActive : b.magActive,
+    team: t < 1 ? a.team : b.team,
   };
 }
 

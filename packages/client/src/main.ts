@@ -3,10 +3,18 @@ import {
   EYE_HEIGHT_CROUCH,
   EYE_HEIGHT_STAND,
   FIXED_DT,
+  LEVEL_BOXES,
+  MODE_MATCH,
+  NO_PLAYER,
+  PHASE_BUY,
+  SPIKE_CARRIED,
+  SPIKE_PLANTED,
   WEAPON_NONE,
   createState,
   eyePosition,
   getWeaponDef,
+  livingTeammates,
+  raycastBoxes,
   shotDirection,
   tick,
   viewDirection,
@@ -22,8 +30,12 @@ import {
   createHitFlashOverlay,
   createHitmarker,
   createKillFeed,
+  createMatchHud,
+  createMinimap,
+  createReconnectBanner,
   createRemotePlayerProxy,
   createScene,
+  createSpectateOverlay,
   buildGrayboxMeshes,
   spawnTracer,
   type RemotePlayerProxy,
@@ -41,6 +53,10 @@ const hitmarker = createHitmarker();
 const killFeed = createKillFeed((i) => `P${i}`);
 const damageIndicator = createDamageDirectionIndicator();
 const combatHud = createCombatHud();
+const matchHud = createMatchHud();
+const minimap = createMinimap();
+const spectateOverlay = createSpectateOverlay();
+const reconnectBanner = createReconnectBanner();
 
 let netClient: NetClient | null = null;
 const remoteProxies = new Map<number, RemotePlayerProxy>();
@@ -52,15 +68,41 @@ interface RemoteWeaponSnapshot {
 }
 const remoteLastWeapon = new Map<number, RemoteWeaponSnapshot>();
 
-const buyMenu = createBuyMenu((itemId) => {
-  netClient?.buy(itemId);
-});
+/** M3: fading TeamPing markers for the minimap (see render.ts's Minimap). */
+const teamPings: Array<{ x: number; z: number; createdAtMs: number }> = [];
+const TEAM_PING_RETENTION_MS = 5200;
+
+const buyMenu = createBuyMenu(
+  (itemId) => {
+    netClient?.buy(itemId);
+  },
+  (itemId) => {
+    netClient?.sell(itemId);
+  },
+);
 onBuyMenuToggle((open) => buyMenu.setOpen(open));
 onBuyKeyPressed((digit) => {
   // Rows are numbered 1..8 in createBuyMenu's item order (6 weapons + 2 armors).
   const itemIds = [0, 1, 2, 3, 4, 5, 200, 201];
   const itemId = itemIds[digit - 1];
   if (itemId !== undefined) netClient?.buy(itemId);
+});
+
+// ---- M3 spectate: while dead in match mode, camera follows a living
+// teammate's interpolated pose instead of the (frozen, dead) local player. ----
+let spectateIndex: number | null = null;
+canvas.addEventListener("click", () => {
+  if (!netClient) return;
+  const localIndex = netClient.getLocalIndex();
+  const state = netClient.getPredictedState();
+  if (localIndex === null || !state || state.alive[localIndex] === 1) return; // only cycles while actually dead
+  const mates = livingTeammates(state, localIndex);
+  if (mates.length === 0) {
+    spectateIndex = null;
+    return;
+  }
+  const currentPos = spectateIndex === null ? -1 : mates.indexOf(spectateIndex);
+  spectateIndex = mates[(currentPos + 1) % mates.length]!;
 });
 
 // ---- Offline (M0) fallback state — used only if connecting fails/times out. ----
@@ -101,6 +143,19 @@ connectNetClient().then((client) => {
     });
     client.onKillEvent((e) => {
       killFeed.push(e);
+    });
+    client.onMatchEvent((e) => {
+      const localIndex = netClient?.getLocalIndex();
+      const state = netClient?.getPredictedState();
+      const myTeam = localIndex !== null && localIndex !== undefined && state ? state.team[localIndex]! : 255;
+      if (e.kind === 1) matchHud.showRoundEnd(e.winnerTeam, e.reason, myTeam);
+      else if (e.kind === 2) {
+        const s = netClient?.getPredictedState();
+        if (s) matchHud.showMatchEnd(s.scoreTeam0, s.scoreTeam1, myTeam);
+      }
+    });
+    client.onTeamPing((e) => {
+      teamPings.push({ x: e.x, z: e.z, createdAtMs: performance.now() });
     });
     // eslint-disable-next-line no-console
     console.log("[net] connected, playing online");
@@ -230,6 +285,19 @@ function fireLocalTracersAndHitmarkers(): void {
   }
 }
 
+/** M3: casts a map ping — raycasts from the local player's eye/view through the world and pings the hit (x, z). */
+function sendMapPingAtLookTarget(): void {
+  if (!netClient) return;
+  const localIndex = netClient.getLocalIndex();
+  const state = netClient.getPredictedState();
+  if (localIndex === null || !state) return;
+  const origin = eyePosition(state, localIndex);
+  const dir = viewDirection(getYaw(), getPitch());
+  const dist = raycastBoxes(LEVEL_BOXES, origin, dir, 200);
+  if (dist === null) return;
+  netClient.sendPing(origin.x + dir.x * dist, origin.z + dir.z * dist);
+}
+
 function updateHud(): void {
   if (!netClient) return;
   const localIndex = netClient.getLocalIndex();
@@ -254,6 +322,110 @@ function updateHud(): void {
     respawnSecondsLeft: respawnTicksLeft * FIXED_DT,
   });
   buyMenu.setState(state.credits[localIndex]!, alive);
+
+  if (state.mode !== MODE_MATCH) {
+    matchHud.update({
+      mode: 0,
+      matchPhase: 0,
+      phaseSecondsLeft: 0,
+      roundNumber: 0,
+      scoreTeam0: 0,
+      scoreTeam1: 0,
+      myTeam: 255,
+      spikeState: 0,
+      isCarrier: false,
+      detonateSecondsLeft: 0,
+      ownChannelProgress01: null,
+      ownChannelKind: null,
+    });
+    return;
+  }
+
+  const myTeam = state.team[localIndex]!;
+  const isCarrier = state.spikeCarrier === localIndex && state.spikeState === SPIKE_CARRIED;
+  const isPlanting = state.planterIndex === localIndex;
+  const isDefusing = state.defuserIndex === localIndex;
+  const ownChannelKind = isPlanting ? "plant" : isDefusing ? "defuse" : null;
+  const ownChannelProgress01 = isPlanting
+    ? state.plantProgress / state.config.plantTicks
+    : isDefusing
+      ? state.defuseProgress / state.config.defuseTicks
+      : null;
+  const detonateSecondsLeft =
+    state.spikeState === SPIKE_PLANTED ? Math.max(0, state.spikePlantedTick + state.config.spikeTicks - state.tick) * FIXED_DT : 0;
+  const phaseSecondsLeft = state.phaseEndTick >= 0 ? Math.max(0, state.phaseEndTick - state.tick) * FIXED_DT : 0;
+
+  matchHud.update({
+    mode: state.mode,
+    matchPhase: state.matchPhase,
+    phaseSecondsLeft,
+    roundNumber: state.roundNumber,
+    scoreTeam0: state.scoreTeam0,
+    scoreTeam1: state.scoreTeam1,
+    myTeam,
+    spikeState: state.spikeState,
+    isCarrier,
+    detonateSecondsLeft,
+    ownChannelProgress01,
+    ownChannelKind,
+  });
+
+  buyMenu.setMatchState(purchasedItemIds(state, localIndex), state.matchPhase === PHASE_BUY);
+
+  // ---- Minimap ----
+  const nowMs = performance.now();
+  const poses = netClient.getRemotePoses();
+  const teammates: Array<{ x: number; z: number }> = [];
+  const visibleEnemies: Array<{ x: number; z: number }> = [];
+  // The team-shared visibility mask is server-computed and travels on the
+  // wire as a single per-recipient field (Snapshot.visibleEnemyMask) — it's
+  // not part of SimState (see @vg/server ServerHost.updateVisibility()), so
+  // it's read from the net layer's match HUD snapshot, not the sim state.
+  const visibleEnemyMask = netClient.getMatchHud().visibleEnemyMask;
+  if (poses) {
+    for (let i = 0; i < poses.length; i++) {
+      const p = poses[i]!;
+      if (!p.connected) continue;
+      if (i === localIndex) continue;
+      if (p.team === myTeam) {
+        if (p.alive) teammates.push({ x: p.posX, z: p.posZ });
+      } else if (p.alive && (visibleEnemyMask & (1 << i)) !== 0) {
+        visibleEnemies.push({ x: p.posX, z: p.posZ });
+      }
+    }
+  }
+  minimap.update({
+    self: alive ? { x: state.posX[localIndex]!, z: state.posZ[localIndex]!, yaw: state.yaw[localIndex]! } : null,
+    teammates,
+    visibleEnemies,
+    spike:
+      state.spikeState === SPIKE_CARRIED || state.spikeState === 1 || state.spikeState === SPIKE_PLANTED
+        ? { state: state.spikeState, x: state.spikeX, z: state.spikeZ }
+        : null,
+    pings: teamPings.map((p) => ({ x: p.x, z: p.z, ageMs: nowMs - p.createdAtMs })),
+  });
+  for (let i = teamPings.length - 1; i >= 0; i--) {
+    if (nowMs - teamPings[i]!.createdAtMs > TEAM_PING_RETENTION_MS) teamPings.splice(i, 1);
+  }
+
+  // ---- Spectate overlay ----
+  if (!alive) {
+    const mates = livingTeammates(state, localIndex);
+    if (spectateIndex === null || !mates.includes(spectateIndex)) spectateIndex = mates[0] ?? null;
+    spectateOverlay.update(spectateIndex, mates.length === 0);
+  } else {
+    spectateIndex = null;
+    spectateOverlay.update(null, false);
+  }
+}
+
+/** Item ids purchased THIS buy phase (see @vg/sim's per-buy-phase purchase tracking) — drives sell-button visibility. */
+function purchasedItemIds(state: SimState, localIndex: number): Set<number> {
+  const out = new Set<number>();
+  if (state.primaryPurchasedItemId[localIndex] !== WEAPON_NONE) out.add(state.primaryPurchasedItemId[localIndex]!);
+  if (state.secondaryPurchasedItemId[localIndex] !== WEAPON_NONE) out.add(state.secondaryPurchasedItemId[localIndex]!);
+  if (state.armorPurchasedItemId[localIndex] !== NO_PLAYER) out.add(state.armorPurchasedItemId[localIndex]!);
+  return out;
 }
 
 function frame(now: number): void {
@@ -271,11 +443,14 @@ function frame(now: number): void {
   let renderZ = 0;
   let eyeHeight = EYE_HEIGHT_STAND;
 
+  let spectateCameraOverride: { x: number; y: number; z: number; yaw: number; pitch: number } | null = null;
+
   if (netClient && netClient.isOnline()) {
     while (accumulator >= FIXED_DT) {
       const input = buildInputFrame();
       netClient.sendInput(input);
       fireLocalTracersAndHitmarkers();
+      if (input.ping) sendMapPingAtLookTarget();
       accumulator -= FIXED_DT;
     }
     const pos = netClient.getLocalRenderPosition();
@@ -288,6 +463,26 @@ function frame(now: number): void {
     syncRemoteProxies();
     updateAds(frameSeconds);
     updateHud();
+    reconnectBanner.setVisible(netClient.getHud().reconnecting);
+
+    // M3 spectate: while dead, replace the local (frozen) camera with a
+    // living teammate's interpolated pose. Never spectates enemies (see
+    // livingTeammates()'s team filter, used to populate spectateIndex).
+    const localIndex = netClient.getLocalIndex();
+    const state = netClient.getPredictedState();
+    if (localIndex !== null && state && state.alive[localIndex] === 0 && spectateIndex !== null) {
+      const poses = netClient.getRemotePoses();
+      const target = poses?.[spectateIndex];
+      if (target && target.connected && target.alive) {
+        spectateCameraOverride = {
+          x: target.posX,
+          y: target.posY,
+          z: target.posZ,
+          yaw: target.yaw,
+          pitch: target.pitch,
+        };
+      }
+    }
   } else if (offlineState && offlinePreviousState) {
     while (accumulator >= FIXED_DT) {
       offlinePreviousState = offlineState;
@@ -302,14 +497,20 @@ function frame(now: number): void {
     eyeHeight = offlineState.crouching[0] === 1 ? EYE_HEIGHT_CROUCH : EYE_HEIGHT_STAND;
   }
 
-  camera.position.set(renderX, renderY + eyeHeight, renderZ);
-  // Mouse look is applied every rendered frame (not gated to the fixed tick)
-  // for the smoothest possible feel; only movement is fixed-timestep.
-  // rotation.y = yaw + PI because Three's default camera forward is -Z while
-  // the sim's yaw=0 forward direction is +Z (see input.ts / movement.ts).
   camera.rotation.order = "YXZ";
-  camera.rotation.y = getYaw() + Math.PI;
-  camera.rotation.x = getPitch();
+  if (spectateCameraOverride) {
+    camera.position.set(spectateCameraOverride.x, spectateCameraOverride.y + EYE_HEIGHT_STAND, spectateCameraOverride.z);
+    camera.rotation.y = spectateCameraOverride.yaw + Math.PI;
+    camera.rotation.x = spectateCameraOverride.pitch;
+  } else {
+    camera.position.set(renderX, renderY + eyeHeight, renderZ);
+    // Mouse look is applied every rendered frame (not gated to the fixed tick)
+    // for the smoothest possible feel; only movement is fixed-timestep.
+    // rotation.y = yaw + PI because Three's default camera forward is -Z while
+    // the sim's yaw=0 forward direction is +Z (see input.ts / movement.ts).
+    camera.rotation.y = getYaw() + Math.PI;
+    camera.rotation.x = getPitch();
+  }
 
   renderer.render(scene, camera);
 

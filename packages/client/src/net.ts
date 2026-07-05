@@ -1,8 +1,18 @@
 // Client netcode glue: connects over WebSocket, drives PredictedClient +
 // RemoteInterpolator, and falls back to the M0 offline single-player mode if
 // the connection fails or doesn't complete within 2s of load.
+//
+// M3: also owns mid-match reconnect — the session token + server URL are
+// stashed in sessionStorage on every Welcome (match mode only), so a tab
+// refresh's fresh connectNetClient() call picks the token back up and sends
+// it in Hello; an unexpected close (not a user-initiated close()) triggers
+// an auto-retry loop (every 2s, up to 90s, matching the server's hold
+// window) rather than falling back to offline mode outright.
 import {
   MessageType,
+  NO_TOKEN,
+  PROTOCOL_VERSION,
+  TOKEN_LENGTH,
   WebSocketTransport,
   decodeMessageSafely,
   encodeMessage,
@@ -10,10 +20,23 @@ import {
   type DamageTakenMessage,
   type KillEventMessage,
   type HitConfirmMessage,
+  type MatchEventMessage,
   type SnapshotMessage,
+  type TeamPingMessage,
   type Transport,
 } from "@vg/protocol";
-import { LEVEL_BOXES, createState, eyePosition, getWeaponDef, raycastPlayers, shotDirection, type InputFrame, type ShotEvent, type SimState } from "@vg/sim";
+import {
+  LEVEL_BOXES,
+  MODE_MATCH,
+  createState,
+  eyePosition,
+  getWeaponDef,
+  raycastPlayers,
+  shotDirection,
+  type InputFrame,
+  type ShotEvent,
+  type SimState,
+} from "@vg/sim";
 import { HitRegTracker, type HitRegStats } from "./hitreg.js";
 import { RemoteInterpolator, type RemotePose } from "./interpolation.js";
 import { PredictedClient, type AuthoritativeSnapshot } from "./prediction.js";
@@ -21,6 +44,9 @@ import { PredictedClient, type AuthoritativeSnapshot } from "./prediction.js";
 const CONNECT_TIMEOUT_MS = 2000;
 const INPUT_REDUNDANCY = 3; // newest + previous 2, see @vg/protocol InputBatch docs
 const FIRE_MAX_RANGE = 100; // mirrors the server's default (see ServerHostOptions.fireMaxRange)
+const RECONNECT_RETRY_INTERVAL_MS = 2000;
+const RECONNECT_TOTAL_WINDOW_MS = 90_000; // matches the server's reconnectHoldMs default
+const SESSION_STORAGE_KEY = "vg_reconnect_session";
 
 export interface NetHud {
   connected: boolean;
@@ -28,6 +54,8 @@ export interface NetHud {
   snapshotAgeMs: number;
   correctionsPerSecond: number;
   starvedFrames: number;
+  /** True while an unexpected disconnect is being retried (see the module doc comment). */
+  reconnecting: boolean;
 }
 
 export interface PredictedHitEvent {
@@ -54,6 +82,55 @@ export interface KillFeedEvent {
   assistIndex: number;
 }
 
+/** M3 match HUD snapshot — everything the phase/round/spike/minimap UI needs, read once per frame. */
+export interface MatchHud {
+  mode: number;
+  myTeam: number;
+  matchPhase: number;
+  phaseTicksLeft: number;
+  roundNumber: number;
+  scoreTeam0: number;
+  scoreTeam1: number;
+  spikeState: number;
+  spikeCarrier: number;
+  spikeX: number;
+  spikeY: number;
+  spikeZ: number;
+  spikePlantedTicksLeft: number;
+  activePlantProgress: number;
+  planterIndex: number;
+  activeDefuseProgress: number;
+  defuserIndex: number;
+  visibleEnemyMask: number;
+}
+
+export interface TeamPingEvent {
+  playerIndex: number;
+  x: number;
+  z: number;
+}
+
+const NULL_MATCH_HUD: MatchHud = {
+  mode: 0,
+  myTeam: 255,
+  matchPhase: 0,
+  phaseTicksLeft: 0,
+  roundNumber: 0,
+  scoreTeam0: 0,
+  scoreTeam1: 0,
+  spikeState: 0,
+  spikeCarrier: 255,
+  spikeX: 0,
+  spikeY: 0,
+  spikeZ: 0,
+  spikePlantedTicksLeft: 0,
+  activePlantProgress: 0,
+  planterIndex: 255,
+  activeDefuseProgress: 0,
+  defuserIndex: 255,
+  visibleEnemyMask: 0,
+};
+
 export interface NetClient {
   isOnline(): boolean;
   /** Call once per fixed tick with this tick's built input. No-ops if offline. */
@@ -70,10 +147,18 @@ export interface NetClient {
   /** Shots the local player fired on the most recent sendInput() call (for tracer/hitmarker rendering). */
   getLastLocalShots(): readonly ShotEvent[];
   buy(itemId: number): void;
+  /** M3: sell back an item bought this buy phase, for a full refund. */
+  sell(itemId: number): void;
+  /** M3: cast a map ping at a world (x, z) — rate-limited server-side. */
+  sendPing(x: number, z: number): void;
+  /** M3: phase/round/score/spike/minimap state, updated on every Snapshot. Zeroed-out in DM mode. */
+  getMatchHud(): MatchHud;
   onPredictedHit(cb: (e: PredictedHitEvent) => void): void;
   onConfirmedHit(cb: (e: ConfirmedHitEvent) => void): void;
   onDamageTaken(cb: (e: DamageTakenEvent) => void): void;
   onKillEvent(cb: (e: KillFeedEvent) => void): void;
+  onMatchEvent(cb: (e: MatchEventMessage) => void): void;
+  onTeamPing(cb: (e: TeamPingEvent) => void): void;
   getHud(): NetHud;
   getHitRegStats(): HitRegStats;
   close(): void;
@@ -95,6 +180,40 @@ function maybeWrapWithFakeLag(transport: Transport): Transport {
   const jitterMs = Number(params.get("jitter") ?? 0) || 0;
   const lossRate = Number(params.get("loss") ?? 0) || 0;
   return withLatency(transport, { delayMs, jitterMs, lossRate, seed: Date.now() >>> 0 });
+}
+
+interface SavedSession {
+  token: number[];
+  url: string;
+}
+
+/** Reads the saved reconnect token/url from sessionStorage, or null if absent/corrupt/wrong-length. */
+function loadSavedSession(): { token: Uint8Array; url: string } | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SavedSession;
+    if (!Array.isArray(parsed.token) || parsed.token.length !== TOKEN_LENGTH || typeof parsed.url !== "string") return null;
+    return { token: Uint8Array.from(parsed.token), url: parsed.url };
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(token: Uint8Array, url: string): void {
+  try {
+    sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ token: Array.from(token), url } satisfies SavedSession));
+  } catch {
+    /* sessionStorage unavailable (private mode, etc.) — reconnect degrades to "treated as a fresh join", not fatal */
+  }
+}
+
+function clearSavedSession(): void {
+  try {
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -126,11 +245,16 @@ function buildCosmeticState(poses: readonly RemotePose[], numPlayers: number): S
  * Attempts to connect within CONNECT_TIMEOUT_MS. Resolves with a live
  * NetClient on success, or null if the connection failed/timed out (caller
  * should fall back to offline single-player mode, preserving M0 behavior).
+ * If a saved reconnect session exists (see the module doc comment), the
+ * saved URL is used and its token is presented in Hello.
  */
 export function connectNetClient(): Promise<NetClient | null> {
   return new Promise((resolve) => {
     let settled = false;
-    const url = parseServerUrl();
+    const saved = loadSavedSession();
+    const url = saved?.url ?? parseServerUrl();
+    const initialToken = saved?.token ?? NO_TOKEN;
+
     let socket: WebSocket;
     try {
       socket = new WebSocket(url);
@@ -150,12 +274,28 @@ export function connectNetClient(): Promise<NetClient | null> {
       resolve(null);
     }, CONNECT_TIMEOUT_MS);
 
+    socket.addEventListener("open", () => {
+      // Send Hello first — carries the reconnect token, if any (all-zero
+      // otherwise). The server's Welcome is sent unconditionally at
+      // connect()-time regardless (see ServerHost), so ordering with this
+      // Hello doesn't matter for a fresh join; it matters only for reconnect,
+      // where the server is specifically waiting on this message.
+      try {
+        socket.send(encodeMessage({ type: MessageType.Hello, protocolVersion: PROTOCOL_VERSION, reconnectToken: initialToken }));
+      } catch {
+        /* socket not actually open yet in some edge case — ignore, Welcome will just arrive late or not at all and the connect timeout handles it */
+      }
+    });
+
     const rawTransport = new WebSocketTransport(socket);
     const transport = maybeWrapWithFakeLag(rawTransport);
 
     let predicted: PredictedClient | null = null;
     let localIndex: number | null = null;
     let numPlayers = 0;
+    let currentUrl = url;
+    let currentToken: Uint8Array = initialToken;
+    let mode = 0;
     const interpolator = new RemoteInterpolator();
     const hitreg = new HitRegTracker();
 
@@ -166,11 +306,17 @@ export function connectNetClient(): Promise<NetClient | null> {
     let correctionsWindowStart = performance.now();
     let correctionsAtWindowStart = 0;
     let correctionsPerSecond = 0;
+    let matchHud: MatchHud = NULL_MATCH_HUD;
+    let reconnecting = false;
+    let userClosed = false;
+    let currentTransport = transport;
 
     const predictedHitCbs: Array<(e: PredictedHitEvent) => void> = [];
     const confirmedHitCbs: Array<(e: ConfirmedHitEvent) => void> = [];
     const damageTakenCbs: Array<(e: DamageTakenEvent) => void> = [];
     const killEventCbs: Array<(e: KillFeedEvent) => void> = [];
+    const matchEventCbs: Array<(e: MatchEventMessage) => void> = [];
+    const teamPingCbs: Array<(e: TeamPingEvent) => void> = [];
 
     function onSnapshot(msg: SnapshotMessage): void {
       lastSnapshotAt = performance.now();
@@ -199,9 +345,31 @@ export function connectNetClient(): Promise<NetClient | null> {
             weaponSecondary: p.weaponSecondary,
             activeSlot: p.activeSlot,
             magActive: p.magActive,
+            team: p.team,
           }),
         ),
       );
+      mode = msg.mode;
+      matchHud = {
+        mode: msg.mode,
+        myTeam: localIndex !== null ? (msg.players[localIndex]?.team ?? 255) : 255,
+        matchPhase: msg.matchPhase,
+        phaseTicksLeft: msg.phaseTicksLeft,
+        roundNumber: msg.roundNumber,
+        scoreTeam0: msg.scoreTeam0,
+        scoreTeam1: msg.scoreTeam1,
+        spikeState: msg.spikeState,
+        spikeCarrier: msg.spikeCarrier,
+        spikeX: msg.spikeX,
+        spikeY: msg.spikeY,
+        spikeZ: msg.spikeZ,
+        spikePlantedTicksLeft: msg.spikePlantedTicksLeft,
+        activePlantProgress: msg.activePlantProgress,
+        planterIndex: msg.planterIndex,
+        activeDefuseProgress: msg.activeDefuseProgress,
+        defuserIndex: msg.defuserIndex,
+        visibleEnemyMask: msg.visibleEnemyMask,
+      };
       if (predicted) {
         const authoritative: AuthoritativeSnapshot = {
           serverTick: msg.serverTick,
@@ -229,7 +397,29 @@ export function connectNetClient(): Promise<NetClient | null> {
             tagTicksLeft: p.tagTicksLeft,
             credits: p.credits,
             respawnTicksLeft: p.respawnTicksLeft,
+            team: p.team,
           })),
+          match:
+            msg.mode === MODE_MATCH
+              ? {
+                  mode: msg.mode,
+                  matchPhase: msg.matchPhase,
+                  phaseTicksLeft: msg.phaseTicksLeft,
+                  roundNumber: msg.roundNumber,
+                  scoreTeam0: msg.scoreTeam0,
+                  scoreTeam1: msg.scoreTeam1,
+                  spikeState: msg.spikeState,
+                  spikeCarrier: msg.spikeCarrier,
+                  spikeX: msg.spikeX,
+                  spikeY: msg.spikeY,
+                  spikeZ: msg.spikeZ,
+                  spikePlantedTicksLeft: msg.spikePlantedTicksLeft,
+                  activePlantProgress: msg.activePlantProgress,
+                  planterIndex: msg.planterIndex,
+                  activeDefuseProgress: msg.activeDefuseProgress,
+                  defuserIndex: msg.defuserIndex,
+                }
+              : undefined,
         };
         predicted.reconcile(authoritative);
       }
@@ -254,124 +444,254 @@ export function connectNetClient(): Promise<NetClient | null> {
       }
     }
 
-    transport.onMessage((data) => {
-      // A malformed/truncated frame (corrupt packet, a stray non-protocol
-      // byte, etc.) must be dropped, not thrown from inside a WebSocket
-      // message handler — decodeMessageSafely() never throws.
-      const msg = decodeMessageSafely(data);
-      if (msg === null) return;
-      if (msg.type === MessageType.Welcome) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeoutHandle);
-        localIndex = msg.playerIndex;
-        numPlayers = msg.numPlayers;
-        predicted = new PredictedClient(msg.seed, msg.numPlayers, msg.playerIndex, LEVEL_BOXES);
+    function onMatchEvent(msg: MatchEventMessage): void {
+      for (const cb of matchEventCbs) cb(msg);
+    }
 
-        const client: NetClient = {
-          isOnline: () => true,
-          sendInput(input: InputFrame) {
-            if (!predicted || localIndex === null) return;
-            // Send exactly the quantized input PredictedClient predicted
-            // with (F4 fix) — not the raw one — so the wire bytes agree
-            // bit-for-bit with what local prediction/replay assumed.
-            const { seq: thisSeq, quantizedInput } = predicted.queueAndPredict(input);
-            inputHistory.push(quantizedInput);
-            if (inputHistory.length > INPUT_REDUNDANCY) inputHistory.shift();
-            const firstSeq = thisSeq - inputHistory.length + 1;
-            const viewTick = Math.max(0, Math.round(interpolator.getCurrentTargetTick()));
-            transport.send(encodeMessage({ type: MessageType.InputBatch, firstSeq, viewTick, frames: inputHistory.slice() }));
-            lastSendAt = performance.now();
+    function onTeamPing(msg: TeamPingMessage): void {
+      for (const cb of teamPingCbs) cb({ playerIndex: msg.playerIndex, x: msg.x, z: msg.z });
+    }
 
-            // Cosmetic predicted-hit feedback + hit-reg telemetry for any
-            // shots the local player just fired (never applies damage — see
-            // PLAN.md §3.2). Uses the same shotDirection() helper the server
-            // uses, so the *direction* is byte-identical; the *hit test*
-            // itself is intentionally approximate (against interpolated
-            // remote poses, not the server's lag-comp-rewound truth).
-            const shots = predicted.getLastShots();
-            if (shots.length > 0) {
-              const state = predicted.getPredictedState();
-              const poses = interpolator.sample() ?? [];
-              const cosmeticState = buildCosmeticState(poses, numPlayers);
-              const origin = eyePosition(state, localIndex);
-              for (const shot of shots) {
-                const weapon = getWeaponDef(shot.weaponId);
-                if (!weapon) continue;
-                const dir = shotDirection(state, localIndex, weapon, shot.shotIndex, shot.sprayIndex);
-                const hit = raycastPlayers(cosmeticState, localIndex, origin, dir, FIRE_MAX_RANGE);
-                hitreg.recordPredictedShot(hit !== null);
-                if (hit) {
-                  for (const cb of predictedHitCbs) cb({ targetIndex: hit.playerIndex });
-                }
-              }
-            }
-          },
-          getLocalRenderPosition() {
-            return predicted ? predicted.getRenderPosition() : null;
-          },
-          isLocalCrouching() {
-            if (!predicted || localIndex === null) return false;
-            return predicted.getPredictedState().crouching[localIndex] === 1;
-          },
-          getLocalIndex: () => localIndex,
-          getPredictedState: () => (predicted ? predicted.getPredictedState() : null),
-          getRemotePoses: () => interpolator.sample(),
-          getViewTick: () => Math.round(interpolator.getCurrentTargetTick()),
-          getLastLocalShots: () => (predicted ? predicted.getLastShots() : []),
-          buy(itemId: number) {
-            transport.send(encodeMessage({ type: MessageType.BuyCmd, itemId }));
-          },
-          onPredictedHit(cb) {
-            predictedHitCbs.push(cb);
-          },
-          onConfirmedHit(cb) {
-            confirmedHitCbs.push(cb);
-          },
-          onDamageTaken(cb) {
-            damageTakenCbs.push(cb);
-          },
-          onKillEvent(cb) {
-            killEventCbs.push(cb);
-          },
-          getHud(): NetHud {
-            const now = performance.now();
-            if (now - correctionsWindowStart > 1000) {
-              const correctionsNow = predicted ? predicted.correctionsApplied : 0;
-              correctionsPerSecond = ((correctionsNow - correctionsAtWindowStart) * 1000) / (now - correctionsWindowStart);
-              correctionsAtWindowStart = correctionsNow;
-              correctionsWindowStart = now;
-            }
-            return {
-              connected: true,
-              rttMs: rttEstimateMs,
-              snapshotAgeMs: now - lastSnapshotAt,
-              correctionsPerSecond,
-              starvedFrames: interpolator.getStarvedFrameCount(),
-            };
-          },
-          getHitRegStats: () => hitreg.getStats(),
-          close() {
-            transport.close();
-          },
-        };
-        resolve(client);
-      } else if (msg.type === MessageType.Snapshot) {
-        onSnapshot(msg);
-      } else if (msg.type === MessageType.HitConfirm) {
-        onHitConfirm(msg);
-      } else if (msg.type === MessageType.DamageTaken) {
-        onDamageTaken(msg);
-      } else if (msg.type === MessageType.KillEvent) {
-        onKillEvent(msg);
+    function wireTransport(t: Transport): void {
+      t.onMessage((data) => {
+        // A malformed/truncated frame (corrupt packet, a stray non-protocol
+        // byte, etc.) must be dropped, not thrown from inside a WebSocket
+        // message handler — decodeMessageSafely() never throws.
+        const msg = decodeMessageSafely(data);
+        if (msg === null) return;
+        if (msg.type === MessageType.Welcome) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeoutHandle);
+            localIndex = msg.playerIndex;
+            numPlayers = msg.numPlayers;
+            predicted = new PredictedClient(msg.seed, msg.numPlayers, msg.playerIndex, LEVEL_BOXES, msg.mode);
+            resolve(client);
+          } else {
+            // A second Welcome (reconnect reattach, possibly a different
+            // playerIndex than a provisional/original one): local prediction
+            // state (position/loadout/etc.) is refreshed from the very next
+            // Snapshot's reconcile() call regardless, so nothing needs to be
+            // rebuilt here beyond bookkeeping — the sim tick gap between
+            // disconnect and reattach is exactly what reconcile()'s existing
+            // tick-offset rebase handles (see prediction.ts).
+            localIndex = msg.playerIndex;
+            numPlayers = msg.numPlayers;
+            reconnecting = false;
+          }
+          mode = msg.mode;
+          if (msg.mode === MODE_MATCH && msg.token.some((b) => b !== 0)) {
+            currentToken = msg.token;
+            saveSession(msg.token, currentUrl);
+          }
+        } else if (msg.type === MessageType.Snapshot) {
+          onSnapshot(msg);
+        } else if (msg.type === MessageType.HitConfirm) {
+          onHitConfirm(msg);
+        } else if (msg.type === MessageType.DamageTaken) {
+          onDamageTaken(msg);
+        } else if (msg.type === MessageType.KillEvent) {
+          onKillEvent(msg);
+        } else if (msg.type === MessageType.MatchEvent) {
+          onMatchEvent(msg);
+        } else if (msg.type === MessageType.TeamPing) {
+          onTeamPing(msg);
+        }
+      });
+
+      t.onClose(() => {
+        if (!settled) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutHandle);
+          resolve(null);
+          return;
+        }
+        if (userClosed) return;
+        // Mid-match unexpected disconnect: auto-retry rather than falling
+        // back to offline mode (that would silently strand the player out
+        // of a live match). Only meaningful in match mode (mode carries the
+        // last-known value from Welcome/Snapshot).
+        if (mode === MODE_MATCH) {
+          startReconnectLoop();
+        }
+      });
+    }
+
+    let reconnectTimer: ReturnType<typeof setInterval> | null = null;
+    let reconnectDeadline = 0;
+
+    function startReconnectLoop(): void {
+      if (reconnectTimer) return;
+      reconnecting = true;
+      reconnectDeadline = performance.now() + RECONNECT_TOTAL_WINDOW_MS;
+      attemptReconnect();
+      reconnectTimer = setInterval(() => {
+        if (performance.now() > reconnectDeadline) {
+          if (reconnectTimer) clearInterval(reconnectTimer);
+          reconnectTimer = null;
+          reconnecting = false;
+          clearSavedSession();
+          return;
+        }
+        attemptReconnect();
+      }, RECONNECT_RETRY_INTERVAL_MS);
+    }
+
+    function attemptReconnect(): void {
+      let retrySocket: WebSocket;
+      try {
+        retrySocket = new WebSocket(currentUrl);
+      } catch {
+        return; // will retry again on the next tick of reconnectTimer
       }
-    });
+      retrySocket.addEventListener("open", () => {
+        try {
+          retrySocket.send(encodeMessage({ type: MessageType.Hello, protocolVersion: PROTOCOL_VERSION, reconnectToken: currentToken }));
+        } catch {
+          /* ignore */
+        }
+      });
+      const retryRaw = new WebSocketTransport(retrySocket);
+      const retryTransport = maybeWrapWithFakeLag(retryRaw);
+      let attached = false;
+      retryTransport.onMessage((data) => {
+        const msg = decodeMessageSafely(data);
+        if (msg === null) return;
+        if (msg.type === MessageType.Welcome && !attached) {
+          attached = true;
+          if (reconnectTimer) {
+            clearInterval(reconnectTimer);
+            reconnectTimer = null;
+          }
+          currentTransport = retryTransport;
+          wireTransport(retryTransport);
+          // Re-deliver this very Welcome to the freshly-wired handler (it
+          // was consumed by this bootstrap listener, not wireTransport's).
+          localIndex = msg.playerIndex;
+          numPlayers = msg.numPlayers;
+          mode = msg.mode;
+          reconnecting = false;
+          if (msg.mode === MODE_MATCH && msg.token.some((b) => b !== 0)) {
+            currentToken = msg.token;
+            saveSession(msg.token, currentUrl);
+          }
+        }
+      });
+      retryTransport.onClose(() => {
+        // A rejected/failed retry attempt: just let the interval try again
+        // (or give up once reconnectDeadline passes).
+      });
+    }
 
-    transport.onClose(() => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutHandle);
-      resolve(null);
-    });
+    const client: NetClient = {
+      isOnline: () => true,
+      sendInput(input: InputFrame) {
+        if (!predicted || localIndex === null) return;
+        // Send exactly the quantized input PredictedClient predicted
+        // with (F4 fix) — not the raw one — so the wire bytes agree
+        // bit-for-bit with what local prediction/replay assumed.
+        const { seq: thisSeq, quantizedInput } = predicted.queueAndPredict(input);
+        inputHistory.push(quantizedInput);
+        if (inputHistory.length > INPUT_REDUNDANCY) inputHistory.shift();
+        const firstSeq = thisSeq - inputHistory.length + 1;
+        const viewTick = Math.max(0, Math.round(interpolator.getCurrentTargetTick()));
+        currentTransport.send(encodeMessage({ type: MessageType.InputBatch, firstSeq, viewTick, frames: inputHistory.slice() }));
+        lastSendAt = performance.now();
+
+        // Cosmetic predicted-hit feedback + hit-reg telemetry for any
+        // shots the local player just fired (never applies damage — see
+        // PLAN.md §3.2). Uses the same shotDirection() helper the server
+        // uses, so the *direction* is byte-identical; the *hit test*
+        // itself is intentionally approximate (against interpolated
+        // remote poses, not the server's lag-comp-rewound truth).
+        const shots = predicted.getLastShots();
+        if (shots.length > 0) {
+          const state = predicted.getPredictedState();
+          const poses = interpolator.sample() ?? [];
+          const cosmeticState = buildCosmeticState(poses, numPlayers);
+          const origin = eyePosition(state, localIndex);
+          for (const shot of shots) {
+            const weapon = getWeaponDef(shot.weaponId);
+            if (!weapon) continue;
+            const dir = shotDirection(state, localIndex, weapon, shot.shotIndex, shot.sprayIndex);
+            const hit = raycastPlayers(cosmeticState, localIndex, origin, dir, FIRE_MAX_RANGE, mode === MODE_MATCH);
+            hitreg.recordPredictedShot(hit !== null);
+            if (hit) {
+              for (const cb of predictedHitCbs) cb({ targetIndex: hit.playerIndex });
+            }
+          }
+        }
+      },
+      getLocalRenderPosition() {
+        return predicted ? predicted.getRenderPosition() : null;
+      },
+      isLocalCrouching() {
+        if (!predicted || localIndex === null) return false;
+        return predicted.getPredictedState().crouching[localIndex] === 1;
+      },
+      getLocalIndex: () => localIndex,
+      getPredictedState: () => (predicted ? predicted.getPredictedState() : null),
+      getRemotePoses: () => interpolator.sample(),
+      getViewTick: () => Math.round(interpolator.getCurrentTargetTick()),
+      getLastLocalShots: () => (predicted ? predicted.getLastShots() : []),
+      buy(itemId: number) {
+        currentTransport.send(encodeMessage({ type: MessageType.BuyCmd, itemId }));
+      },
+      sell(itemId: number) {
+        currentTransport.send(encodeMessage({ type: MessageType.SellCmd, itemId }));
+      },
+      sendPing(x: number, z: number) {
+        currentTransport.send(encodeMessage({ type: MessageType.MapPing, x, z }));
+      },
+      getMatchHud: () => matchHud,
+      onPredictedHit(cb) {
+        predictedHitCbs.push(cb);
+      },
+      onConfirmedHit(cb) {
+        confirmedHitCbs.push(cb);
+      },
+      onDamageTaken(cb) {
+        damageTakenCbs.push(cb);
+      },
+      onKillEvent(cb) {
+        killEventCbs.push(cb);
+      },
+      onMatchEvent(cb) {
+        matchEventCbs.push(cb);
+      },
+      onTeamPing(cb) {
+        teamPingCbs.push(cb);
+      },
+      getHud(): NetHud {
+        const now = performance.now();
+        if (now - correctionsWindowStart > 1000) {
+          const correctionsNow = predicted ? predicted.correctionsApplied : 0;
+          correctionsPerSecond = ((correctionsNow - correctionsAtWindowStart) * 1000) / (now - correctionsWindowStart);
+          correctionsAtWindowStart = correctionsNow;
+          correctionsWindowStart = now;
+        }
+        return {
+          connected: true,
+          rttMs: rttEstimateMs,
+          snapshotAgeMs: now - lastSnapshotAt,
+          correctionsPerSecond,
+          starvedFrames: interpolator.getStarvedFrameCount(),
+          reconnecting,
+        };
+      },
+      getHitRegStats: () => hitreg.getStats(),
+      close() {
+        userClosed = true;
+        if (reconnectTimer) {
+          clearInterval(reconnectTimer);
+          reconnectTimer = null;
+        }
+        currentTransport.close();
+        clearSavedSession();
+      },
+    };
+
+    wireTransport(transport);
   });
 }

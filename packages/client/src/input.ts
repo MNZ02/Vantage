@@ -9,6 +9,8 @@ let pitch = 0;
 let fireHeld = false;
 let adsHeld = false;
 let buyMenuOpen = false;
+/** M3: MMB casts a map ping (edge-triggered — see buildInputFrame()'s one-shot consume). */
+let pingRequested = false;
 const buyKeyCallbacks: Array<(digit: number) => void> = [];
 const buyMenuListeners: Array<(open: boolean) => void> = [];
 
@@ -16,6 +18,7 @@ function onMouseDown(e: MouseEvent): void {
   if (buyMenuOpen) return;
   if (e.button === 0) fireHeld = true;
   if (e.button === 2) adsHeld = true;
+  if (e.button === 1) pingRequested = true; // middle mouse button: cast a map ping
 }
 
 function onMouseUp(e: MouseEvent): void {
@@ -29,6 +32,8 @@ function onKeyDown(e: KeyboardEvent): void {
     setBuyMenuOpen(!buyMenuOpen);
   } else if (e.code === "Escape" && buyMenuOpen) {
     setBuyMenuOpen(false);
+  } else if (e.code === "KeyZ" && !buyMenuOpen) {
+    pingRequested = true; // Z: alternate map-ping key (see MMB in onMouseDown)
   }
   if (buyMenuOpen) {
     const digitMatch = /^Digit([1-8])$/.exec(e.code);
@@ -132,6 +137,14 @@ export function buildInputFrame(): InputFrame {
   const forward = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
   const right = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0);
   const inBuyMenu = buyMenuOpen;
+  // Edge-triggered: consumed once per call so a single click/tap sends
+  // exactly one ping input frame with ping=true, not one per rendered frame
+  // for as long as the mouse button happens to still be "down" in some
+  // stale sense — there's no held state to accidentally re-read here since
+  // onMouseUp never clears pingRequested; this call site is the only place
+  // it's ever reset.
+  const ping = !inBuyMenu && pingRequested;
+  pingRequested = false;
   return {
     forward: inBuyMenu ? 0 : forward,
     right: inBuyMenu ? 0 : right,
@@ -145,5 +158,7 @@ export function buildInputFrame(): InputFrame {
     reload: !inBuyMenu && keys.has("KeyR"),
     slot1: !inBuyMenu && keys.has("Digit1"),
     slot2: !inBuyMenu && keys.has("Digit2"),
+    interact: !inBuyMenu && keys.has("KeyE"),
+    ping,
   };
 }
