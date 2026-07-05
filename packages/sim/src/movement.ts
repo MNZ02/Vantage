@@ -33,9 +33,10 @@ function wishSpeedFor(input: InputFrame): number {
 function wishDirection(input: InputFrame): { x: number; z: number } {
   const fx = sinApprox(input.yaw);
   const fz = cosApprox(input.yaw);
-  // right-hand: right = forward rotated -90 deg about Y
-  const rx = cosApprox(input.yaw);
-  const rz = -sinApprox(input.yaw);
+  // right = forward x up in this right-handed Y-up world; matches the camera
+  // convention (rotation.y = yaw + PI), so input.right=+1 moves screen-right.
+  const rx = -cosApprox(input.yaw);
+  const rz = sinApprox(input.yaw);
 
   let x = fx * input.forward + rx * input.right;
   let z = fz * input.forward + rz * input.right;

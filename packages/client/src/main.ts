@@ -27,6 +27,7 @@ import {
   createCombatHud,
   createDamageDirectionIndicator,
   createFpsCounter,
+  createViewmodel,
   createHitFlashOverlay,
   createHitmarker,
   createKillFeed,
@@ -46,6 +47,7 @@ const canvas = document.getElementById("app") as HTMLCanvasElement;
 setupInput(canvas);
 
 const { renderer, scene, camera } = createScene(canvas);
+const viewmodel = createViewmodel(camera);
 buildGrayboxMeshes(scene, GRAYBOX_BOXES);
 const fpsCounter = createFpsCounter();
 const hitFlash = createHitFlashOverlay();
@@ -498,6 +500,7 @@ function frame(now: number): void {
   }
 
   camera.rotation.order = "YXZ";
+  viewmodel.setVisible(!spectateCameraOverride);
   if (spectateCameraOverride) {
     camera.position.set(spectateCameraOverride.x, spectateCameraOverride.y + EYE_HEIGHT_STAND, spectateCameraOverride.z);
     camera.rotation.y = spectateCameraOverride.yaw + Math.PI;
