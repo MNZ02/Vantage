@@ -234,6 +234,59 @@ describe("half swap and overtime", () => {
     expect(s.scoreTeam1).toBe(0);
   });
 
+  it("OT: reaching winTarget-1 for both squads grants otStartCredits + a full loadout reset every OT round, and win-by-2 ends it", () => {
+    let s = startMatch(createMatchState(1, 2, { ...TINY_CONFIG, winTarget: 2, halfAtRound: 99 }));
+
+    // Round 1: attacker (0) wins by elimination -> 1-0.
+    s = advanceToRound(s);
+    s = applyDamage(s, 1, 1000);
+    s = tick(s, allIdle(s), LEVEL_BOXES).state;
+    expect(s.scoreTeam0).toBe(1);
+    s = runTicks(s, s.phaseEndTick - s.tick, allIdle); // -> buy 2 (not yet OT: only team0 is at winTarget-1)
+
+    // Round 2: defender (1) wins by elimination -> 1-1. Both squads are now
+    // at winTarget-1(=1) -> the NEXT buy phase must be a full OT reset.
+    s = advanceToRound(s);
+    s.credits[0] = 1234; // give both players a non-default credit total first,
+    s.credits[1] = 1234; // so the OT reset is unambiguous, not a coincidence.
+    s.weaponPrimary[0] = WEAPON_FALCON;
+    s = applyDamage(s, 0, 1000);
+    s = tick(s, allIdle(s), LEVEL_BOXES).state;
+    expect(s.scoreTeam0).toBe(1);
+    expect(s.scoreTeam1).toBe(1);
+    s = runTicks(s, s.phaseEndTick - s.tick, allIdle); // -> buy 3 (OT round 1)
+
+    expect(s.matchPhase).toBe(PHASE_BUY);
+    expect(s.credits[0]).toBe(s.config.otStartCredits);
+    expect(s.credits[1]).toBe(s.config.otStartCredits);
+    expect(s.config.otStartCredits).toBe(5000);
+    // Loadout reset applies to BOTH players regardless of survivor/dead status.
+    expect(s.weaponPrimary[0]).toBe(255); // WEAPON_NONE
+    expect(s.weaponSecondary[0]).toBe(WEAPON_VIPER);
+    expect(s.armor[0]).toBe(0);
+
+    // OT round 1: attacker wins again -> 2-1, diff=1 < 2, match continues
+    // (win-by-2 not yet satisfied) — and the NEXT buy (OT round 2) must
+    // grant otStartCredits again ("every round", not just the first).
+    s = advanceToRound(s);
+    s = applyDamage(s, 1, 1000);
+    s = tick(s, allIdle(s), LEVEL_BOXES).state;
+    expect(s.matchPhase).toBe(PHASE_ROUND_END); // not matchEnd yet
+    s.credits[0] = 999; // spend it down so the next OT buy's reset is unambiguous
+    s = runTicks(s, s.phaseEndTick - s.tick, allIdle); // -> buy (OT round 2)
+    expect(s.matchPhase).toBe(PHASE_BUY);
+    expect(s.credits[0]).toBe(s.config.otStartCredits);
+    expect(s.credits[1]).toBe(s.config.otStartCredits);
+
+    // OT round 2: attacker wins again -> 3-1, diff=2 >= 2 -> match ends.
+    s = advanceToRound(s);
+    s = applyDamage(s, 1, 1000);
+    s = tick(s, allIdle(s), LEVEL_BOXES).state;
+    expect(s.matchPhase).toBe(PHASE_MATCH_END);
+    expect(s.scoreTeam0).toBe(3);
+    expect(s.scoreTeam1).toBe(1);
+  });
+
   it("matchEnd freezes phase forever (no further ticks change matchPhase)", () => {
     let s = startMatch(createMatchState(1, 2, { ...TINY_CONFIG, winTarget: 2, halfAtRound: 99 }));
     s = advanceToRound(s);
@@ -457,6 +510,109 @@ describe("no respawn in match mode", () => {
   });
 });
 
+describe("combat/movement phase gating (reviewer fix)", () => {
+  it("holding fire during the buy phase produces zero ShotEvents", () => {
+    // Long enough buy window that the whole 20-tick loop below stays inside
+    // PHASE_BUY (TINY_CONFIG's 5-tick buy would cross into PHASE_ROUND partway
+    // through, where firing is legitimately allowed — not what this test means to probe).
+    let s = startMatch(createMatchState(1, 2, { ...TINY_CONFIG, buyTicks: 30, firstRoundBuyTicks: 30 }));
+    expect(s.matchPhase).toBe(PHASE_BUY);
+    s.weaponPrimary[0] = WEAPON_FALCON;
+    s.activeSlot[0] = 0;
+    s.magPrimary[0] = 25;
+    s.reservePrimary[0] = 100;
+    for (let t = 0; t < 20; t++) {
+      const inputs: InputFrame[] = [{ ...idle(0), fire: true }, idle()];
+      const result = tick(s, inputs, LEVEL_BOXES);
+      expect(result.shots.length).toBe(0);
+      s = result.state;
+      expect(s.matchPhase).toBe(PHASE_BUY); // sanity: still inside the window this test is actually probing
+    }
+    // Ammo is untouched too — a gated shot must not even consume a round.
+    expect(s.magPrimary[0]).toBe(25);
+  });
+
+  it("holding fire during the roundEnd freeze produces zero ShotEvents (no kill is possible)", () => {
+    let s = startMatch(createMatchState(1, 2, { ...TINY_CONFIG, roundEndTicks: 30 }));
+    s = advanceToRound(s);
+    s.weaponPrimary[0] = WEAPON_FALCON;
+    s.activeSlot[0] = 0;
+    s.magPrimary[0] = 25;
+    s.reservePrimary[0] = 100;
+    s.posX[0] = 0;
+    s.posY[0] = 0;
+    s.posZ[0] = 0;
+    s.posX[1] = 0;
+    s.posY[1] = 0;
+    s.posZ[1] = 5; // directly in front, well within range — would be a guaranteed hit if fire were live
+    s = applyDamage(s, 1, 1000); // end the round by elimination (defender dies)
+    s = tick(s, allIdle(s), LEVEL_BOXES).state;
+    expect(s.matchPhase).toBe(PHASE_ROUND_END);
+    // Revive the "dead" defender manually to prove a shot during the freeze
+    // still can't kill them, isolating the phase gate from "no target alive".
+    s.alive[1] = 1;
+    s.health[1] = 100;
+    for (let t = 0; t < 10; t++) {
+      const inputs: InputFrame[] = [{ ...idle(0), fire: true }, idle()];
+      const result = tick(s, inputs, LEVEL_BOXES);
+      expect(result.shots.length).toBe(0);
+      s = result.state;
+    }
+    expect(s.health[1]).toBe(100); // unreachable by combat: no ShotEvent ever existed to resolve
+  });
+
+  it("movement is frozen (position, not look) during the roundEnd freeze; buy-phase movement stays allowed", () => {
+    let s = startMatch(createMatchState(1, 2, { ...TINY_CONFIG, roundEndTicks: 20 }));
+    // Buy phase: forward movement is NOT blocked by phase (only by barriers — see the "barriers" describe block).
+    s.posX[0] = 0;
+    s.posZ[0] = -12; // south of the attacker barrier at z=-8, so unobstructed movement is possible
+    s.velX[0] = 0;
+    s.velZ[0] = 0;
+    const beforeBuyZ = s.posZ[0];
+    s = tick(s, [{ ...idle(0), right: 1 }, idle()], LEVEL_BOXES).state; // strafe, not toward the barrier
+    expect(s.posX[0]).not.toBe(0); // moved
+
+    s = advanceToRound(s);
+    s = applyDamage(s, 1, 1000); // elimination ends the round
+    s = tick(s, allIdle(s), LEVEL_BOXES).state;
+    expect(s.matchPhase).toBe(PHASE_ROUND_END);
+
+    // Zero any residual velocity right at freeze entry: this test isolates
+    // "does HELD INPUT move a frozen player" (the actual exploit the
+    // reviewer flagged) from "does pre-existing momentum coast to a natural
+    // stop via friction", which the fix deliberately still allows (only the
+    // wish-direction is zeroed — see tick.ts's movementFrozenByPhase — not
+    // velocity itself, matching Valorant's own round-end feel).
+    s.velX[0] = 0;
+    s.velZ[0] = 0;
+
+    const frozenX = s.posX[0]!;
+    const frozenY = s.posY[0]!;
+    const frozenZ = s.posZ[0]!;
+    for (let t = 0; t < 5; t++) {
+      s = tick(s, [{ ...idle(1.23), forward: 1, right: 1, jump: true }, idle()], LEVEL_BOXES).state;
+      expect(s.posX[0]).toBe(frozenX);
+      expect(s.posY[0]).toBe(frozenY);
+      expect(s.posZ[0]).toBe(frozenZ);
+      expect(s.yaw[0]).toBeCloseTo(1.23, 10); // look/camera is NOT frozen, only position
+    }
+    void beforeBuyZ;
+  });
+
+  it("safety invariant: entering PHASE_ROUND revives any player left dead from a (now-impossible) buy-phase damage path", () => {
+    let s = startMatch(createMatchState(1, 2, TINY_CONFIG));
+    expect(s.matchPhase).toBe(PHASE_BUY);
+    // Simulate a hypothetical future bug: damage applied directly during the
+    // buy phase (bypassing the normal fire-gated path entirely).
+    s = applyDamage(s, 1, 1000);
+    expect(s.alive[1]).toBe(0);
+    s = runTicks(s, s.phaseEndTick - s.tick, allIdle); // -> PHASE_ROUND
+    expect(s.matchPhase).toBe(PHASE_ROUND);
+    expect(s.alive[1]).toBe(1); // repaired by the round-start safety invariant
+    expect(s.health[1]).toBeGreaterThan(0);
+  });
+});
+
 describe("spectate target selection", () => {
   it("lists only living teammates, excluding self and enemies", () => {
     const s = startMatch(createMatchState(1, 4, TINY_CONFIG)); // teams: [0]=atk,[1]=def,[2]=atk,[3]=def
@@ -518,7 +674,7 @@ describe("barriers", () => {
 });
 
 describe("match determinism", () => {
-  it("two identical scripted 2v2 runs through buy/round/kill/round-end are byte-identical every 100 ticks", () => {
+  it("two identical scripted 2v2 runs through >=3 full rounds (including the half-swap) are byte-identical every 500 ticks", () => {
     function scriptedInput(t: number, i: number): InputFrame {
       return {
         ...idle((t * 0.01 + i) % 6.28),
@@ -527,21 +683,29 @@ describe("match determinism", () => {
       };
     }
 
-    function run(): string[] {
-      let s = startMatch(createMatchState(777, 4, TINY_CONFIG));
+    const TOTAL_TICKS = 2000;
+
+    function run(): { snapshots: string[]; finalRoundNumber: number; finalHalvesSwapped: number } {
+      let s = startMatch(createMatchState(777, 4, TINY_CONFIG)); // TINY_CONFIG's halfAtRound: 1 guarantees a swap by round 2
       const snapshots: string[] = [];
-      for (let t = 0; t < 400; t++) {
+      for (let t = 0; t < TOTAL_TICKS; t++) {
         const inputs = Array.from({ length: 4 }, (_, i) => scriptedInput(t, i));
         s = tick(s, inputs, LEVEL_BOXES).state;
         if (t === 50) s = applyDamage(s, 1, 30); // deterministic scripted damage event
-        if ((t + 1) % 100 === 0) snapshots.push(serializeState(s));
+        if (t === 900) s = applyDamage(s, 2, 45); // a second, later damage event across a later round
+        if ((t + 1) % 500 === 0) snapshots.push(serializeState(s));
       }
-      return snapshots;
+      return { snapshots, finalRoundNumber: s.roundNumber, finalHalvesSwapped: s.halvesSwapped };
     }
 
     const a = run();
     const b = run();
-    expect(a.length).toBe(4);
-    expect(a).toEqual(b);
+    expect(a.snapshots.length).toBe(4);
+    expect(a.snapshots).toEqual(b.snapshots);
+    // Confirms the run actually exercised >=3 full rounds (roundNumber
+    // increments at buy-phase entry, so round 4 having started means rounds
+    // 1-3 all fully completed) and passed through the half swap.
+    expect(a.finalRoundNumber).toBeGreaterThanOrEqual(4);
+    expect(a.finalHalvesSwapped).toBe(1);
   });
 });

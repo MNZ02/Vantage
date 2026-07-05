@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
   ASSIST_WINDOW_TICKS,
   DROP_DESPAWN_TICKS,
@@ -153,10 +153,10 @@ function isZeroToken(token: Uint8Array): boolean {
   return true;
 }
 
+/** Constant-time compare (optional hardening — session tokens shouldn't leak match-length via response timing). */
 function tokensEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
+  return timingSafeEqual(a, b);
 }
 
 function generateToken(): Uint8Array {
@@ -812,6 +812,13 @@ export class ServerHost {
   }
 
   private resolveShot(shot: ShotEvent): void {
+    // Belt-and-braces (reviewer fix, M3 follow-up): sim's stepWeaponLogic
+    // already refuses to emit a ShotEvent at all outside PHASE_ROUND in
+    // match mode (see @vg/sim weapons/logic.ts canFireThisPhase), so this
+    // should never actually trigger — kept as a cheap, redundant guard so a
+    // future sim regression can't reintroduce buy/roundEnd kills here too.
+    if (this.mode === "match" && this.state.matchPhase !== PHASE_ROUND) return;
+
     const weapon = getWeaponDef(shot.weaponId);
     if (!weapon) return;
 

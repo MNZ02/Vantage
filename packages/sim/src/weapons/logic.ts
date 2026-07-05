@@ -5,7 +5,17 @@
 // `prev` (last tick's state) and writes into `next` (this tick's state,
 // already cloned by tick()), never touching wall-clock/random ambient state.
 
-import { COUNTER_STRAFE_DEADZONE, FIXED_DT, MODE_MATCH, RESPAWN_TICKS, RUN_SPEED, SPAWN_HEALTH, SPRAY_RESET_TICKS, WEAPON_NONE } from "../constants.js";
+import {
+  COUNTER_STRAFE_DEADZONE,
+  FIXED_DT,
+  MODE_MATCH,
+  PHASE_ROUND,
+  RESPAWN_TICKS,
+  RUN_SPEED,
+  SPAWN_HEALTH,
+  SPRAY_RESET_TICKS,
+  WEAPON_NONE,
+} from "../constants.js";
 import { DM_SPAWNS } from "../levels.js";
 import { PI, clamp, cosApprox, length2D, sinApprox } from "../math.js";
 import { hashRandom2, hashSeed3, nextRandom } from "../prng.js";
@@ -178,7 +188,13 @@ export function stepWeaponLogic(prev: SimState, next: SimState, playerIndex: num
   if (equipEndBefore !== -1 && currentTick >= equipEndBefore) next.equipEndTick[playerIndex] = -1;
 
   const mag = weapon ? getActiveMag(next, playerIndex) : 0;
-  const canFire = weapon !== null && input.fire && !reloading && !equipping && mag > 0 && currentTick >= next.nextFireTick[playerIndex]!;
+  // Reviewer fix (M3 follow-up): match mode only ever fires during
+  // PHASE_ROUND — no ShotEvent (and therefore no server-side hit
+  // resolution, no kill, no weapon drop) can be produced during buy,
+  // roundEnd, waiting, or matchEnd, even if `input.fire` is held the whole
+  // time. DM mode (mode !== MODE_MATCH) is unaffected.
+  const canFireThisPhase = prev.mode !== MODE_MATCH || prev.matchPhase === PHASE_ROUND;
+  const canFire = weapon !== null && input.fire && !reloading && !equipping && mag > 0 && currentTick >= next.nextFireTick[playerIndex]! && canFireThisPhase;
 
   if (canFire && weapon) {
     setActiveMag(next, playerIndex, mag - 1);

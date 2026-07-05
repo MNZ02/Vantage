@@ -440,6 +440,21 @@ export function advanceMatchState(prev: SimState, next: SimState, decisions: Cha
   if (next.matchPhase === PHASE_BUY && currentTick + 1 >= next.phaseEndTick) {
     next.matchPhase = PHASE_ROUND;
     next.phaseEndTick = currentTick + 1 + next.config.roundTicks;
+    // Safety invariant (reviewer fix, M3 follow-up): every connected player
+    // should already be alive here — enterBuyPhase() revives everyone at
+    // buy-phase start, and fire is now phase-gated so no damage can occur
+    // during the buy phase to begin with (see weapons/logic.ts
+    // stepWeaponLogic's canFireThisPhase). This is a cheap defensive repair,
+    // not the primary mechanism: entering PHASE_ROUND must never seat a
+    // team with a dead player, even if some future code path slips a kill
+    // in during the buy phase.
+    for (let i = 0; i < next.numPlayers; i++) {
+      if ((next.team[i] === TEAM_ATTACKERS || next.team[i] === TEAM_DEFENDERS) && next.alive[i] === 0) {
+        next.alive[i] = 1;
+        next.health[i] = SPAWN_HEALTH;
+        next.respawnTick[i] = -1;
+      }
+    }
     return;
   }
 

@@ -1,4 +1,4 @@
-import { FIXED_DT, LAND_PENALTY_TICKS, MODE_MATCH, TAG_MULT } from "./constants.js";
+import { FIXED_DT, LAND_PENALTY_TICKS, MODE_MATCH, PHASE_MATCH_END, PHASE_ROUND_END, TAG_MULT } from "./constants.js";
 import { advanceMatchState, computeChannelDecisions, effectiveBoxesForPlayer, isChanneling } from "./match.js";
 import { movePlayer } from "./movement.js";
 import { nextRandom } from "./prng.js";
@@ -29,12 +29,26 @@ export interface TickResult {
  * state machine progress and phase transitions are then advanced by
  * advanceMatchState() AFTER the per-player loop, so it sees this tick's
  * resulting positions/alive flags. DM mode (mode 0) takes neither path.
+ *
+ * Reviewer fix (M3 follow-up): combat/movement must be phase-gated, not just
+ * the spike channel. Movement wish-direction is frozen (position frozen,
+ * look/camera NOT — yaw/pitch below are always taken from the raw `input`,
+ * never from the zeroed `movementInput`) during PHASE_ROUND_END and
+ * PHASE_MATCH_END — there is no "round" happening then, and letting players
+ * reposition during the round-end freeze was a real bug. PHASE_BUY
+ * deliberately still allows movement (barriers gate it instead — see
+ * effectiveBoxesForPlayer), matching Valorant. Fire gating for ALL non-round
+ * phases (buy/roundEnd/waiting/matchEnd) lives in weapons/logic.ts's
+ * stepWeaponLogic, which reads `prev.matchPhase` directly — no ShotEvent is
+ * ever emitted for a shot fired outside PHASE_ROUND in match mode.
  */
 export function tick(state: SimState, inputs: readonly InputFrame[], boxes: readonly Box[]): TickResult {
   const next = cloneState(state);
   const shots: ShotEvent[] = [];
   const currentTick = state.tick;
   const channelDecisions = computeChannelDecisions(state, inputs);
+  const movementFrozenByPhase =
+    state.mode === MODE_MATCH && (state.matchPhase === PHASE_ROUND_END || state.matchPhase === PHASE_MATCH_END);
 
   for (let i = 0; i < next.numPlayers; i++) {
     const input = inputs[i];
@@ -71,7 +85,8 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
 
     const effectiveBoxes = effectiveBoxesForPlayer(state, boxes, i);
     const channeling = isChanneling(channelDecisions, i);
-    const movementInput: InputFrame = channeling ? { ...input, forward: 0, right: 0, jump: false } : input;
+    const movementInput: InputFrame =
+      channeling || movementFrozenByPhase ? { ...input, forward: 0, right: 0, jump: false } : input;
 
     const result = movePlayer(state, i, movementInput, effectiveBoxes, FIXED_DT, speedMultiplier);
 
