@@ -74,7 +74,7 @@ describe("malformed input handling (blocker fix F1)", () => {
     for (let i = 0; i < 100; i++) {
       const malformed = malformedFrames[i % malformedFrames.length]!;
       expect(() => attacker.send(malformed)).not.toThrow();
-      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
+      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false, ads: false, reload: false, slot1: false, slot2: false });
       expect(() => host.step()).not.toThrow();
     }
 

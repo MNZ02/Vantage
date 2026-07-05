@@ -55,7 +55,7 @@ describe("ServerHost step()", () => {
     // (spawn is open floor for a good ~15m in every direction) — this test is
     // about jitter-buffer-fed input reaching movement, not level traversal.
     for (let i = 0; i < 100; i++) {
-      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
+      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false, ads: false, reload: false, slot1: false, slot2: false });
       host.step();
     }
 
@@ -78,7 +78,7 @@ describe("ServerHost step()", () => {
     });
 
     for (let i = 0; i < 20; i++) {
-      send({ forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
+      send({ forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false, ads: false, reload: false, slot1: false, slot2: false });
       host.step();
     }
 
@@ -99,14 +99,14 @@ describe("ServerHost step()", () => {
     const send = createScriptedInputSender(client0);
 
     for (let i = 0; i < 50; i++) {
-      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
+      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false, ads: false, reload: false, slot1: false, slot2: false });
       host.step();
     }
     server1.close();
     const frozenX = host.getState().posX[1]!;
     const frozenZ = host.getState().posZ[1]!;
     for (let i = 0; i < 50; i++) {
-      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
+      send({ forward: 1, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false, ads: false, reload: false, slot1: false, slot2: false });
       host.step();
     }
     expect(host.getState().posX[1]!).toBe(frozenX);

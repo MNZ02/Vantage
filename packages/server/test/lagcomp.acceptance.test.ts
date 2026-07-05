@@ -1,10 +1,11 @@
-import { createLoopbackPair, MessageType, encodeMessage } from "@vg/protocol";
-import { FIXED_DT, STAND_HEIGHT, eyePosition } from "@vg/sim";
+import { createLoopbackPair } from "@vg/protocol";
+import { FIXED_DT, STAND_HEIGHT, WEAPONS, eyePosition } from "@vg/sim";
 import { describe, expect, it } from "vitest";
 import { ServerHost } from "../src/serverHost.js";
 import { createScriptedInputSender, idleInput } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
+const FALCON = WEAPONS.find((w) => w.name === "Falcon")!;
 
 function ticksForRttMs(rttMs: number): number {
   return Math.round(rttMs / FIXED_DT_MS);
@@ -19,10 +20,11 @@ function ticksForRttMs(rttMs: number): number {
  *
  * `viewTick` is computed directly from a recorded position history rather
  * than by round-tripping delayed messages: the mechanism under test is the
- * server's ring-buffer rewind (StateRingBuffer + handleFire), which only
- * cares about the numeric viewTick and the ring buffer's recorded past
- * state — transport-level delay is already covered by the protocol
- * latencysim tests and the client interpolation/reconciliation tests.
+ * server's ring-buffer rewind (StateRingBuffer + resolveShot), which only
+ * cares about the numeric viewTick (now carried in the InputBatch header,
+ * see @vg/protocol messages.ts) and the ring buffer's recorded past state —
+ * transport-level delay is already covered by the protocol latencysim tests
+ * and the client interpolation/reconciliation tests.
  */
 function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
   const host = new ServerHost({ numPlayers: 2, lagComp });
@@ -40,7 +42,7 @@ function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
   // area well clear of the graybox's ramp (z >= 10, see levels.ts) and
   // interior wall (x in [5.75, 6.25]); the target then strafes along +X —
   // perpendicular to the shooter's line of sight — for a few meters, still
-  // nowhere near that wall.
+  // nowhere near that wall. Give the shooter a hitscan weapon with ammo.
   const state = host.getState();
   state.posX[shooterIndex] = 0;
   state.posY[shooterIndex] = 0;
@@ -48,6 +50,10 @@ function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
   state.posX[targetIndex] = 0;
   state.posY[targetIndex] = 0;
   state.posZ[targetIndex] = 5;
+  state.weaponPrimary[shooterIndex] = FALCON.id;
+  state.activeSlot[shooterIndex] = 0;
+  state.magPrimary[shooterIndex] = FALCON.magSize;
+  state.reservePrimary[shooterIndex] = FALCON.reserveAmmo;
 
   const positionHistory: Array<{ x: number; y: number; z: number }> = [];
 
@@ -64,12 +70,13 @@ function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
   }
 
   // Target strafes at full run speed (yaw=0, right=1 -> +X, see movement.ts wishDirection).
-  const strafeInput = { forward: 0, right: 1, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false };
+  const strafeInput = { ...idleInput(), forward: 0, right: 1 };
 
   const delayTicks = ticksForRttMs(rttMs);
   const FIRE_AT_TICK = 60; // past settle+warm-up, short enough to stay far from any wall
 
-  let firedTick = -1;
+  const hitsBefore = host.getHits().length;
+  let anyHit = false;
   for (let i = 0; i < FIRE_AT_TICK + 5; i++) {
     sendTarget(strafeInput);
 
@@ -88,12 +95,13 @@ function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
       const yaw = Math.atan2(dx, dz);
       const pitch = Math.atan2(dy, horizontalDist);
 
-      sendShooter({ ...idleInput(), yaw, pitch });
-      host.step();
       // Give the jitter buffer a couple of ticks to actually apply the aim
-      // before firing (its own ~2-tick warm-up/consume delay).
+      // before firing (its own ~2-tick warm-up/consume delay), then hold
+      // fire for a short window at a constant viewTick — exactly what a
+      // real client sends while its InputBatch header carries one steady
+      // interpolation-target tick across a short burst.
       for (let w = 0; w < 3; w++) {
-        sendShooter({ ...idleInput(), yaw, pitch });
+        sendShooter({ ...idleInput(), yaw, pitch }, viewTick);
         sendTarget(strafeInput);
         host.step();
         positionHistory[host.getState().tick] = {
@@ -103,11 +111,12 @@ function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
         };
       }
 
-      shooterClient.send(encodeMessage({ type: MessageType.FireCmd, seq: 999, viewTick }));
-      sendShooter({ ...idleInput(), yaw, pitch });
-      sendTarget(strafeInput);
-      host.step();
-      firedTick = host.getState().tick;
+      for (let f = 0; f < 5 && !anyHit; f++) {
+        sendShooter({ ...idleInput(), yaw, pitch, fire: true }, viewTick);
+        sendTarget(strafeInput);
+        host.step();
+        anyHit = host.getHits().length > hitsBefore;
+      }
       break;
     }
 
@@ -119,8 +128,8 @@ function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
     };
   }
 
-  const hit = host.getHits().some((h) => h.shooterIndex === shooterIndex && h.targetIndex === targetIndex && h.serverTick === firedTick);
-  return { hit };
+  const hit = host.getHits().some((h) => h.shooterIndex === shooterIndex && h.targetIndex === targetIndex);
+  return { hit: hit && anyHit };
 }
 
 describe("lag compensation proof (acceptance criterion 7)", () => {

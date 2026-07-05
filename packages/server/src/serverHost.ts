@@ -1,25 +1,44 @@
 import {
+  ASSIST_WINDOW_TICKS,
+  DROP_DESPAWN_TICKS,
   FIXED_DT,
+  KILL_REWARD,
   LEVEL_BOXES,
+  MAX_CREDITS,
+  MAX_DROPPED_WEAPONS,
   MAX_PLAYERS,
+  PICKUP_RADIUS_M,
+  WEAPON_NONE,
+  applyBuy,
+  applyDamage,
+  applyTag,
   clamp,
+  clearPrimaryWeapon,
   createState,
+  damageForHit,
   eyePosition,
+  getWeaponDef,
+  pickupWeapon,
   raycastBoxes,
   raycastPlayers,
+  shotDirection,
   spawnForIndex,
   tick,
-  viewDirection,
   type Box,
   type InputFrame,
+  type ShotEvent,
   type SimState,
 } from "@vg/sim";
 import {
   MessageType,
   decodeMessageSafely,
   encodeMessage,
-  type FireCmdMessage,
+  type BuyCmdMessage,
+  type DamageTakenMessage,
+  type HitConfirmMessage,
   type InputSample,
+  type KillEventMessage,
+  type SnapshotDroppedWeapon,
   type SnapshotMessage,
   type SnapshotPlayer,
   type Transport,
@@ -48,7 +67,8 @@ interface ClientRecord {
   transport: Transport;
   playerIndex: number;
   jitter: JitterBuffer<InputSample>;
-  pendingFireCmds: FireCmdMessage[];
+  /** The client's most recently received InputBatch.viewTick, used to lag-comp rewind that client's own shots. */
+  lastViewTick: number;
 }
 
 /** A hit registered this step, exposed for tests/telemetry in addition to the wire broadcast. */
@@ -56,6 +76,28 @@ export interface HitRecord {
   shooterIndex: number;
   targetIndex: number;
   serverTick: number;
+  damage: number;
+  region: number;
+  weaponId: number;
+}
+
+export interface KillRecord {
+  killerIndex: number;
+  victimIndex: number;
+  weaponId: number;
+  headshot: boolean;
+  assistIndex: number;
+  serverTick: number;
+}
+
+interface DroppedWeaponEntity {
+  id: number;
+  weaponId: number;
+  x: number;
+  y: number;
+  z: number;
+  mag: number;
+  spawnTick: number;
 }
 
 const FIRE_VIEW_TICK_MAX_AGE = 13; // ~200 ms at 64 Hz, per spec
@@ -63,9 +105,17 @@ const RING_BUFFER_CAPACITY = 64; // 1 s at 64 Hz
 
 /**
  * The authoritative 64 Hz server: owns the shared SimState, per-client jitter
- * buffers, a lag-comp ring buffer, and snapshot broadcast. Constructible
- * in-process against any `Transport` pair (no real socket required), so it
- * can be driven directly by tests and by in-process bots.
+ * buffers, a lag-comp ring buffer, dropped-weapon world entities, and
+ * snapshot broadcast. Constructible in-process against any `Transport` pair
+ * (no real socket required), so it can be driven directly by tests and by
+ * in-process bots.
+ *
+ * Combat mutation boundary (documented, see @vg/sim damage.ts): tick()
+ * itself only decides WHETHER a shot happens (pure sim); this class resolves
+ * each returned ShotEvent with lag-compensated raycasting and applies
+ * damage/tag/buy/pickup between ticks via sim's pure applyDamage/applyTag/
+ * applyBuy/clearPrimaryWeapon/pickupWeapon helpers. The client never applies
+ * damage locally.
  */
 export class ServerHost {
   private state: SimState;
@@ -78,6 +128,11 @@ export class ServerHost {
   private readonly snapshotEvery: number;
   private readonly fireMaxRange: number;
   private readonly hits: HitRecord[] = [];
+  private readonly kills: KillRecord[] = [];
+  private readonly allShots: ShotEvent[] = [];
+  private readonly lastDamager = new Map<number, { attackerIndex: number; tick: number }>();
+  private readonly drops: DroppedWeaponEntity[] = [];
+  private nextDropId = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
 
   /** p95-friendly per-tick timing samples (wall-clock ms spent inside step()), for the soak test. */
@@ -130,14 +185,29 @@ export class ServerHost {
     return this.clients.size;
   }
 
-  /** Hits registered so far (for tests/telemetry); also broadcast on the wire as HitEvent. */
+  /** Hits registered so far (for tests/telemetry); also broadcast on the wire as HitConfirm/DamageTaken. */
   getHits(): readonly HitRecord[] {
     return this.hits;
+  }
+
+  /** Kills registered so far (for tests/telemetry); also broadcast on the wire as KillEvent. */
+  getKills(): readonly KillRecord[] {
+    return this.kills;
+  }
+
+  /** Live dropped-weapon world entities (for tests/telemetry); also mirrored into every Snapshot. */
+  getDrops(): readonly DroppedWeaponEntity[] {
+    return this.drops;
   }
 
   /** Count of frames dropped for failing to decode (unknown tag, truncated, empty, ...). */
   getMalformedFrameCount(): number {
     return this.malformedFrameCount;
+  }
+
+  /** All ShotEvents ever returned by tick() (for tests: matching a client-predicted shot to its authoritative counterpart by shotIndex). */
+  getAllShots(): readonly ShotEvent[] {
+    return this.allShots;
   }
 
   private findFreeSlot(): number {
@@ -164,7 +234,7 @@ export class ServerHost {
       transport,
       playerIndex: index,
       jitter: new JitterBuffer<InputSample>(1, 3, 2),
-      pendingFireCmds: [],
+      lastViewTick: 0,
     };
     this.clients.set(index, record);
 
@@ -209,10 +279,18 @@ export class ServerHost {
       for (let i = 0; i < msg.frames.length; i++) {
         record.jitter.arrive(msg.firstSeq + i, msg.frames[i]!);
       }
-    } else if (msg.type === MessageType.FireCmd) {
-      record.pendingFireCmds.push(msg);
+      record.lastViewTick = msg.viewTick;
+    } else if (msg.type === MessageType.BuyCmd) {
+      this.handleBuy(record.playerIndex, msg);
     }
     // Hello / other message types: no-op server-side (Welcome already sent on connect).
+  }
+
+  private handleBuy(playerIndex: number, msg: BuyCmdMessage): void {
+    // applyBuy() itself no-ops (returns state unchanged) for a dead player,
+    // insufficient credits, or an unknown itemId — this call is always safe.
+    if (this.state.alive[playerIndex] === 0) return;
+    this.state = applyBuy(this.state, playerIndex, msg.itemId);
   }
 
   /** Advances the authoritative sim by exactly one 15.625 ms tick. */
@@ -232,6 +310,10 @@ export class ServerHost {
           crouch: value.crouch,
           walk: value.walk,
           fire: value.fire,
+          ads: value.ads,
+          reload: value.reload,
+          slot1: value.slot1,
+          slot2: value.slot2,
         };
       }
     }
@@ -239,16 +321,17 @@ export class ServerHost {
     // tick() tolerates missing entries for unconnected slots (see tick.ts's
     // `if (!input) continue`); the declared parameter type doesn't spell
     // that out, hence the cast.
-    this.state = tick(this.state, inputs as readonly InputFrame[], this.boxes);
+    const result = tick(this.state, inputs as readonly InputFrame[], this.boxes);
+    this.state = result.state;
     this.ring.push(this.state);
 
-    for (const [index, record] of this.clients) {
-      if (record.pendingFireCmds.length === 0) continue;
-      const fireCmds = record.pendingFireCmds.splice(0, record.pendingFireCmds.length);
-      for (const cmd of fireCmds) {
-        this.handleFire(index, cmd);
-      }
+    for (const shot of result.shots) {
+      this.allShots.push(shot);
+      this.resolveShot(shot);
     }
+
+    this.updatePickups();
+    this.despawnOldDrops();
 
     if (this.state.tick % this.snapshotEvery === 0) {
       this.broadcastSnapshot();
@@ -257,12 +340,21 @@ export class ServerHost {
     this.stepDurationsMs.push(nowMs() - startedAt);
   }
 
-  private handleFire(shooterIndex: number, cmd: FireCmdMessage): void {
-    const currentTick = this.state.tick;
-    const clampedViewTick = clamp(cmd.viewTick, Math.max(0, currentTick - FIRE_VIEW_TICK_MAX_AGE), currentTick);
+  private resolveShot(shot: ShotEvent): void {
+    const weapon = getWeaponDef(shot.weaponId);
+    if (!weapon) return;
 
+    const shooterIndex = shot.playerIndex;
+    const currentTick = this.state.tick;
+    const record = this.clients.get(shooterIndex);
+    const rawViewTick = record?.lastViewTick ?? currentTick;
+    const clampedViewTick = clamp(rawViewTick, Math.max(0, currentTick - FIRE_VIEW_TICK_MAX_AGE), currentTick);
+
+    // Current-state shooter eye/view (spec): the shooter's own position is
+    // never rewound, only the targets are (lag comp rewinds what the
+    // *shooter* would have seen of *everyone else* at their view tick).
     const origin = eyePosition(this.state, shooterIndex);
-    const dir = viewDirection(this.state.yaw[shooterIndex]!, this.state.pitch[shooterIndex]!);
+    const dir = shotDirection(this.state, shooterIndex, weapon, shot.shotIndex, shot.sprayIndex);
 
     const targetState = this.lagComp ? (this.ring.get(clampedViewTick) ?? this.state) : this.state;
 
@@ -272,23 +364,124 @@ export class ServerHost {
     const wallDist = raycastBoxes(this.boxes, origin, dir, hit.dist);
     if (wallDist !== null) return; // a wall blocks the shot before it reaches the target
 
-    const record: HitRecord = { shooterIndex, targetIndex: hit.playerIndex, serverTick: currentTick };
-    this.hits.push(record);
+    const damage = damageForHit(weapon, hit.dist, hit.region);
+    const targetIndex = hit.playerIndex;
+    const wasAlive = this.state.alive[targetIndex] === 1;
 
-    const msg = encodeMessage({
-      type: MessageType.HitEvent,
+    this.state = applyDamage(this.state, targetIndex, damage);
+    this.state = applyTag(this.state, targetIndex);
+
+    const healthAfter = this.state.health[targetIndex]!;
+    const regionCode = hit.region === "head" ? 0 : hit.region === "body" ? 1 : 2;
+
+    this.hits.push({ shooterIndex, targetIndex, serverTick: currentTick, damage, region: regionCode, weaponId: shot.weaponId });
+
+    const hitConfirm: HitConfirmMessage = {
+      type: MessageType.HitConfirm,
       shooterIndex,
-      targetIndex: hit.playerIndex,
-      serverTick: currentTick,
-    });
-    for (const [, client] of this.clients) {
-      client.transport.send(msg);
+      targetIndex,
+      damage,
+      region: regionCode,
+      targetHealthAfter: healthAfter,
+    };
+    this.clients.get(shooterIndex)?.transport.send(encodeMessage(hitConfirm));
+
+    const damageTaken: DamageTakenMessage = { type: MessageType.DamageTaken, victimIndex: targetIndex, attackerIndex: shooterIndex, damage };
+    this.clients.get(targetIndex)?.transport.send(encodeMessage(damageTaken));
+
+    const nowDead = wasAlive && this.state.alive[targetIndex] === 0;
+    const priorDamager = this.lastDamager.get(targetIndex);
+    let assistIndex = 255;
+    if (priorDamager && priorDamager.attackerIndex !== shooterIndex && currentTick - priorDamager.tick <= ASSIST_WINDOW_TICKS) {
+      assistIndex = priorDamager.attackerIndex;
+    }
+    this.lastDamager.set(targetIndex, { attackerIndex: shooterIndex, tick: currentTick });
+
+    if (nowDead) {
+      this.handleKill(shooterIndex, targetIndex, shot.weaponId, hit.region === "head", assistIndex, currentTick);
+    }
+  }
+
+  private handleKill(killerIndex: number, victimIndex: number, weaponId: number, headshot: boolean, assistIndex: number, currentTick: number): void {
+    // Kill reward, capped.
+    this.state.credits[killerIndex] = Math.min(MAX_CREDITS, this.state.credits[killerIndex]! + KILL_REWARD);
+
+    // Drop the victim's primary weapon (if any) at the death spot, then clear it from their loadout.
+    const primaryId = this.state.weaponPrimary[victimIndex]!;
+    if (primaryId !== WEAPON_NONE) {
+      this.spawnDrop(
+        primaryId,
+        this.state.posX[victimIndex]!,
+        this.state.posY[victimIndex]!,
+        this.state.posZ[victimIndex]!,
+        this.state.magPrimary[victimIndex]!,
+        currentTick,
+      );
+      this.state = clearPrimaryWeapon(this.state, victimIndex);
+    }
+
+    const record: KillRecord = { killerIndex, victimIndex, weaponId, headshot, assistIndex, serverTick: currentTick };
+    this.kills.push(record);
+
+    const msg: KillEventMessage = { type: MessageType.KillEvent, killerIndex, victimIndex, weaponId, headshot, assistIndex };
+    const encoded = encodeMessage(msg);
+    for (const [, client] of this.clients) client.transport.send(encoded);
+  }
+
+  private spawnDrop(weaponId: number, x: number, y: number, z: number, mag: number, currentTick: number): void {
+    if (this.drops.length >= MAX_DROPPED_WEAPONS) {
+      // Oldest despawns to make room.
+      this.drops.sort((a, b) => a.spawnTick - b.spawnTick);
+      this.drops.shift();
+    }
+    this.drops.push({ id: this.nextDropId, weaponId, x, y, z, mag, spawnTick: currentTick });
+    this.nextDropId = (this.nextDropId + 1) & 0xff;
+  }
+
+  private despawnOldDrops(): void {
+    const currentTick = this.state.tick;
+    for (let i = this.drops.length - 1; i >= 0; i--) {
+      if (currentTick - this.drops[i]!.spawnTick >= DROP_DESPAWN_TICKS) {
+        this.drops.splice(i, 1);
+      }
+    }
+  }
+
+  /** Walk-over pickup: alive players within PICKUP_RADIUS_M of a drop swap it for their current primary (if any). */
+  private updatePickups(): void {
+    for (let i = 0; i < this.numPlayers; i++) {
+      if (this.state.alive[i] === 0) continue;
+      for (let d = 0; d < this.drops.length; d++) {
+        const drop = this.drops[d]!;
+        const dx = this.state.posX[i]! - drop.x;
+        const dz = this.state.posZ[i]! - drop.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist > PICKUP_RADIUS_M) continue;
+
+        const currentPrimary = this.state.weaponPrimary[i]!;
+        const currentMag = this.state.magPrimary[i]!;
+        this.state = pickupWeapon(this.state, i, drop.weaponId, drop.mag);
+
+        if (currentPrimary !== WEAPON_NONE) {
+          // The drop entity now holds the player's previously-equipped weapon.
+          drop.weaponId = currentPrimary;
+          drop.mag = currentMag;
+          drop.spawnTick = this.state.tick;
+        } else {
+          this.drops.splice(d, 1);
+        }
+        break; // one pickup per player per tick is plenty
+      }
     }
   }
 
   private broadcastSnapshot(): void {
     const players: SnapshotPlayer[] = [];
     for (let i = 0; i < this.numPlayers; i++) {
+      const activeSlot = this.state.activeSlot[i]!;
+      const magActive = activeSlot === 0 ? this.state.magPrimary[i]! : this.state.magSecondary[i]!;
+      const reserveActive = activeSlot === 0 ? this.state.reservePrimary[i]! : this.state.reserveSecondary[i]!;
+      const respawnTicksLeft = this.state.alive[i] === 1 ? 0 : Math.max(0, this.state.respawnTick[i]! - this.state.tick);
       players.push({
         posX: this.state.posX[i]!,
         posY: this.state.posY[i]!,
@@ -301,8 +494,22 @@ export class ServerHost {
         crouching: this.state.crouching[i] === 1,
         grounded: this.state.grounded[i] === 1,
         connected: this.clients.has(i),
+        alive: this.state.alive[i] === 1,
+        activeSlot,
+        adsStage: this.state.adsStage[i]!,
+        health: this.state.health[i]!,
+        armor: this.state.armor[i]!,
+        weaponPrimary: this.state.weaponPrimary[i]!,
+        weaponSecondary: this.state.weaponSecondary[i]!,
+        magActive,
+        reserveActive,
+        tagTicksLeft: this.state.tagTicksLeft[i]!,
+        credits: this.state.credits[i]!,
+        respawnTicksLeft,
       });
     }
+
+    const droppedWeapons: SnapshotDroppedWeapon[] = this.drops.map((d) => ({ id: d.id, weaponId: d.weaponId, x: d.x, y: d.y, z: d.z, mag: d.mag }));
 
     for (const [, record] of this.clients) {
       const msg: SnapshotMessage = {
@@ -310,6 +517,7 @@ export class ServerHost {
         serverTick: this.state.tick,
         lastProcessedSeq: Math.max(0, record.jitter.lastConsumedSeq),
         players,
+        droppedWeapons,
       };
       record.transport.send(encodeMessage(msg));
     }
