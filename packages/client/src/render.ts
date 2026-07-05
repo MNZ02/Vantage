@@ -68,7 +68,30 @@ export function createScene(canvas: HTMLCanvasElement): SceneHandle {
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
+  scene.add(camera); // so camera-attached children (viewmodel) render
+
   return { renderer, scene, camera };
+}
+
+/** Placeholder first-person viewmodel (real arms/weapon art is M5): a simple
+ * barrel+body proxy parented to the camera, lower-right, so aiming has a
+ * visual anchor. Returns a handle main.ts uses to hide it while dead/spectating. */
+export function createViewmodel(camera: THREE.PerspectiveCamera): { setVisible(v: boolean): void } {
+  const group = new THREE.Group();
+  const bodyMat = new THREE.MeshLambertMaterial({ color: 0x2f3540 });
+  const barrelMat = new THREE.MeshLambertMaterial({ color: 0x454e5e });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.07, 0.22), bodyMat);
+  const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.22), barrelMat);
+  barrel.position.set(0, 0.025, -0.2);
+  group.add(body, barrel);
+  group.position.set(0.16, -0.13, -0.35);
+  group.rotation.y = 0.06;
+  camera.add(group);
+  return {
+    setVisible(v: boolean) {
+      group.visible = v;
+    },
+  };
 }
 
 /** Builds one mesh per graybox surface — the same box list drives sim collision (see graybox.ts). */

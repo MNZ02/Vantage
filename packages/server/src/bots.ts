@@ -355,11 +355,11 @@ export class Bot {
     if (!shouldInteract && !arrived && dist > 1e-6) {
       // Decompose the world-space wish direction (toward `target`) into
       // forward/right components relative to `yaw` (see movement.ts's
-      // wishDirection(): forward = (sin(yaw), cos(yaw)), right = (cos(yaw), -sin(yaw))).
+      // wishDirection(): forward = (sin(yaw), cos(yaw)), right = (-cos(yaw), sin(yaw))).
       const wishX = dx / dist;
       const wishZ = dz / dist;
       forward = wishX * Math.sin(yaw) + wishZ * Math.cos(yaw);
-      right = wishX * Math.cos(yaw) - wishZ * Math.sin(yaw);
+      right = -wishX * Math.cos(yaw) + wishZ * Math.sin(yaw);
     }
 
     this.evaluateAbilityHeuristics(pos, enemy);

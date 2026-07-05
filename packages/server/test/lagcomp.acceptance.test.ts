@@ -69,8 +69,8 @@ function runScenario(rttMs: number, lagComp: boolean): { hit: boolean } {
     };
   }
 
-  // Target strafes at full run speed (yaw=0, right=1 -> +X, see movement.ts wishDirection).
-  const strafeInput = { ...idleInput(), forward: 0, right: 1 };
+  // Target strafes at full run speed (yaw=0, right=-1 -> +X, see movement.ts wishDirection).
+  const strafeInput = { ...idleInput(), forward: 0, right: -1 };
 
   const delayTicks = ticksForRttMs(rttMs);
   const FIRE_AT_TICK = 60; // past settle+warm-up, short enough to stay far from any wall
