@@ -127,6 +127,12 @@ services/
   visibility *and* flash LoS tests — you can't be flashed through a smoke), molotov
   DoT zones, flashes = view-angle + LoS raycast with partial-flash falloff, walls =
   temp collision + HP, recon = server sight query → minimap pings.
+  **M4a status (recorded gap):** walls DO occlude visibility/flash/reveal LoS checks
+  (added to the shared occluder list alongside static level geometry — a solid 0.4 m
+  barrier blocks a sightline same as a real wall). Smokes do NOT yet occlude anything
+  server-side, despite rendering as opaque spheres client-side: `@vg/sim`'s raycast
+  module is AABB-only (no ray-vs-sphere primitive wired into the occlusion path), so
+  "you can't be flashed through a smoke" isn't true yet. Deferred to a follow-up pass.
 
 ### 3.2 Netcode
 - Inputs at 64 Hz upstream; snapshots down; predict self, interpolate others ~100 ms.

@@ -132,6 +132,16 @@ export function getPitch(): number {
   return pitch;
 }
 
+/**
+ * M4a ability key layout (documented deviation from the spec's literal
+ * "C/Q/E/X" suggestion): E is already bound to interact/plant/defuse (see
+ * `interact` below), so abilities use C (basic1), Q (basic2), F (signature),
+ * X (ult) — E stays interact everywhere, never double-bound.
+ */
+function abilityHeld(code: string): boolean {
+  return !buyMenuOpen && keys.has(code);
+}
+
 /** Builds this instant's InputFrame for player 0 from held keys + current look yaw/pitch. */
 export function buildInputFrame(): InputFrame {
   const forward = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
@@ -160,5 +170,9 @@ export function buildInputFrame(): InputFrame {
     slot2: !inBuyMenu && keys.has("Digit2"),
     interact: !inBuyMenu && keys.has("KeyE"),
     ping,
+    ability1: abilityHeld("KeyC"),
+    ability2: abilityHeld("KeyQ"),
+    signature: abilityHeld("KeyF"),
+    ult: abilityHeld("KeyX"),
   };
 }

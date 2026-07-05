@@ -1,5 +1,29 @@
 import * as THREE from "three";
-import { CROUCH_HEIGHT, LEVEL_BOXES, STAND_HEIGHT, WEAPONS, type Box } from "@vg/sim";
+import {
+  ABILITIES,
+  ABILITY_WEAPON_ID_BASE,
+  AGENT_LUMEN,
+  AGENT_NONE,
+  AGENT_SONAR,
+  AGENT_UMBRA,
+  AGENT_ZEPHYR,
+  ENT_NONE,
+  ENT_PROJECTILE,
+  ENT_RECON_DART,
+  ENT_SLOW_ZONE,
+  ENT_SMOKE,
+  ENT_ULT_ORB,
+  ENT_WALL_BOX,
+  FLASH_FULL,
+  MAX_ABILITY_ENTITIES,
+  WALL_BOX_MAX_HP,
+  CROUCH_HEIGHT,
+  LEVEL_BOXES,
+  STAND_HEIGHT,
+  WEAPONS,
+  type Box,
+  type SimState,
+} from "@vg/sim";
 import type { RemotePose } from "./interpolation.js";
 import type { GrayboxSurface } from "./graybox.js";
 
@@ -318,6 +342,13 @@ export function createKillFeed(playerLabel: (index: number) => string): KillFeed
   document.body.appendChild(container);
 
   function weaponName(weaponId: number): string {
+    // M4a: ability kills ride the 100+abilityId id space (see @vg/sim
+    // abilities/data.ts abilityWeaponId) — resolve those to the ability's
+    // name instead of falling through to "?".
+    if (weaponId >= ABILITY_WEAPON_ID_BASE) {
+      const abilityId = weaponId - ABILITY_WEAPON_ID_BASE;
+      return ABILITIES.find((a) => a.id === abilityId)?.name ?? "ability";
+    }
     return WEAPONS.find((w) => w.id === weaponId)?.name ?? "?";
   }
 
@@ -865,6 +896,298 @@ export function createMinimap(boxes: readonly Box[] = LEVEL_BOXES): Minimap {
         ctx.closePath();
         ctx.fill();
         ctx.restore();
+      }
+    },
+  };
+}
+
+// ---- M4a: agent select, ability HUD, flash overlay, ability world-entity rendering ----
+
+const AGENT_INFO: ReadonlyArray<{ id: number; name: string; role: string; blurb: string }> = [
+  { id: AGENT_ZEPHYR, name: "Zephyr", role: "Duelist", blurb: "Updraft, Gust, Dash, Blades (ult knives)." },
+  { id: AGENT_UMBRA, name: "Umbra", role: "Controller", blurb: "Blind Orb, Step, Shroud, Veil (ult smoke wall)." },
+  { id: AGENT_SONAR, name: "Sonar", role: "Initiator", blurb: "Shock Dart, Pulse, Recon Dart, Rail (ult through-wall shots)." },
+  { id: AGENT_LUMEN, name: "Lumen", role: "Sentinel", blurb: "Slow Zone, Wall, Mend, Resurrect (ult)." },
+];
+
+/** DOM overlay: agent select, shown only during the waiting phase (spec). Click sends an AgentSelectCmd via `onPick`; teammates' current picks are shown from the latest Snapshot via `setPicks()`. */
+export interface AgentSelectOverlay {
+  setOpen(open: boolean): void;
+  /** `picks[i]` = agentId picked by player i (AGENT_NONE/255 if unpicked), `myTeam[i]` = that player's team, `localIndex`/`localTeam` identify self for the "taken by teammate" grey-out. */
+  setPicks(picks: readonly number[], teams: readonly number[], localIndex: number, myAgentId: number): void;
+}
+
+export function createAgentSelectOverlay(onPick: (agentId: number) => void): AgentSelectOverlay {
+  const overlay = document.createElement("div");
+  overlay.style.position = "fixed";
+  overlay.style.inset = "0";
+  overlay.style.zIndex = "25";
+  overlay.style.display = "none";
+  overlay.style.alignItems = "center";
+  overlay.style.justifyContent = "center";
+  overlay.style.background = "rgba(0,0,0,0.7)";
+  overlay.style.font = "14px monospace";
+  overlay.style.color = "#fff";
+
+  const panel = document.createElement("div");
+  panel.style.background = "#1c1f24";
+  panel.style.border = "1px solid #444";
+  panel.style.borderRadius = "6px";
+  panel.style.padding = "20px 24px";
+  panel.style.display = "flex";
+  panel.style.flexDirection = "column";
+  panel.style.gap = "8px";
+  overlay.appendChild(panel);
+
+  const title = document.createElement("div");
+  title.textContent = "SELECT AGENT (waiting for match start)";
+  title.style.marginBottom = "6px";
+  title.style.opacity = "0.85";
+  panel.appendChild(title);
+
+  const rows = AGENT_INFO.map((agent) => {
+    const row = document.createElement("div");
+    row.style.padding = "8px 10px";
+    row.style.borderRadius = "4px";
+    row.style.cursor = "pointer";
+    row.style.border = "1px solid transparent";
+    row.style.minWidth = "360px";
+    const heading = document.createElement("div");
+    heading.textContent = `${agent.name} — ${agent.role}`;
+    heading.style.fontWeight = "bold";
+    const blurb = document.createElement("div");
+    blurb.textContent = agent.blurb;
+    blurb.style.opacity = "0.75";
+    blurb.style.fontSize = "12px";
+    const takenLabel = document.createElement("div");
+    takenLabel.style.fontSize = "11px";
+    takenLabel.style.color = "#ffd54a";
+    row.append(heading, blurb, takenLabel);
+    row.addEventListener("click", () => onPick(agent.id));
+    row.addEventListener("mouseenter", () => (row.style.background = "rgba(255,255,255,0.08)"));
+    row.addEventListener("mouseleave", () => (row.style.background = "transparent"));
+    panel.appendChild(row);
+    return { row, takenLabel, agentId: agent.id };
+  });
+
+  document.body.appendChild(overlay);
+
+  return {
+    setOpen(open: boolean) {
+      overlay.style.display = open ? "flex" : "none";
+    },
+    setPicks(picks, teams, localIndex, myAgentId) {
+      const localTeam = teams[localIndex] ?? 255;
+      for (const { row, takenLabel, agentId } of rows) {
+        let takenByTeammate = false;
+        let pickerIndex = -1;
+        for (let i = 0; i < picks.length; i++) {
+          if (i === localIndex) continue;
+          if (picks[i] === agentId && teams[i] === localTeam && localTeam !== 255) {
+            takenByTeammate = true;
+            pickerIndex = i;
+            break;
+          }
+        }
+        const isMine = myAgentId === agentId;
+        row.style.opacity = takenByTeammate && !isMine ? "0.35" : "1";
+        row.style.borderColor = isMine ? "#4dafff" : "transparent";
+        takenLabel.textContent = isMine ? "— your pick" : takenByTeammate ? `— taken by teammate P${pickerIndex}` : "";
+      }
+    },
+  };
+}
+
+const ABILITY_SLOT_KEYS = ["C", "Q", "F", "X"] as const;
+
+/** Bottom ability bar: 4 slots (basic1/basic2/signature/ult) with charge counts and ult N/cost dots. */
+export interface AbilityHud {
+  update(info: { agentId: number; charges: readonly [number, number, number, number]; ultPoints: number }): void;
+}
+
+export function createAbilityHud(): AbilityHud {
+  const container = document.createElement("div");
+  container.style.position = "fixed";
+  container.style.bottom = "50px";
+  container.style.left = "50%";
+  container.style.transform = "translateX(-50%)";
+  container.style.zIndex = "10";
+  container.style.display = "flex";
+  container.style.gap = "8px";
+  container.style.font = "12px monospace";
+  container.style.color = "#fff";
+  container.style.textShadow = "0 0 3px rgba(0,0,0,0.9)";
+  document.body.appendChild(container);
+
+  const slots = ABILITY_SLOT_KEYS.map((key) => {
+    const box = document.createElement("div");
+    box.style.background = "rgba(0,0,0,0.4)";
+    box.style.border = "1px solid rgba(255,255,255,0.35)";
+    box.style.borderRadius = "4px";
+    box.style.padding = "4px 8px";
+    box.style.minWidth = "44px";
+    box.style.textAlign = "center";
+    const keyLabel = document.createElement("div");
+    keyLabel.textContent = key;
+    keyLabel.style.opacity = "0.6";
+    const valueLabel = document.createElement("div");
+    valueLabel.style.fontWeight = "bold";
+    box.append(keyLabel, valueLabel);
+    container.appendChild(box);
+    return { box, valueLabel };
+  });
+
+  return {
+    update({ agentId, charges, ultPoints }) {
+      if (agentId === AGENT_NONE) {
+        container.style.display = "none";
+        return;
+      }
+      container.style.display = "flex";
+      const def = AGENT_INFO.find((a) => a.id === agentId);
+      const abilities = ABILITIES.filter((a) => a.agentId === agentId).sort((a, b) => a.slot - b.slot);
+      for (let slot = 0; slot < 4; slot++) {
+        const ability = abilities[slot];
+        const { valueLabel } = slots[slot]!;
+        if (!ability) {
+          valueLabel.textContent = "--";
+          continue;
+        }
+        if (slot === 3) {
+          valueLabel.textContent = `${ultPoints}/${ability.ultCost}`;
+          slots[slot]!.box.style.opacity = ultPoints >= ability.ultCost ? "1" : "0.6";
+        } else {
+          valueLabel.textContent = ability.maxCharges > 0 ? String(charges[slot]) : "•";
+        }
+      }
+      void def;
+    },
+  };
+}
+
+/** Fullscreen white flash overlay (Umbra's Blind Orb / Zephyr's-not-this-one — any FLASH_HALF/FULL debuff), opacity driven by flashedTicksLeft. */
+export interface FlashOverlay {
+  update(flashedTicksLeft: number, flashIntensity: number): void;
+}
+
+const FLASH_FULL_TICKS = 128; // 2s @ 64Hz — see @vg/sim abilities/effects.ts applyFlash
+const FLASH_HALF_TICKS = 51; // 0.8s
+
+export function createFlashOverlay(): FlashOverlay {
+  const el = document.createElement("div");
+  el.style.position = "fixed";
+  el.style.inset = "0";
+  el.style.pointerEvents = "none";
+  el.style.background = "#ffffff";
+  el.style.opacity = "0";
+  el.style.zIndex = "18";
+  document.body.appendChild(el);
+  return {
+    update(flashedTicksLeft, flashIntensity) {
+      if (flashedTicksLeft <= 0) {
+        el.style.opacity = "0";
+        return;
+      }
+      const totalTicks = flashIntensity === FLASH_FULL ? FLASH_FULL_TICKS : FLASH_HALF_TICKS;
+      const maxOpacity = flashIntensity === FLASH_FULL ? 1 : 0.55;
+      el.style.opacity = String(Math.max(0, Math.min(maxOpacity, (flashedTicksLeft / totalTicks) * maxOpacity)));
+    },
+  };
+}
+
+/**
+ * Syncs one Three.js mesh per live ability world-entity to `state`'s
+ * entType/entX../entParam arrays each frame: smoke = opaque lambert sphere
+ * (no transparency games, per spec), walls = HP-tinted boxes, slow zones =
+ * flat discs, projectiles = small spheres, recon darts = expanding wire
+ * rings (approximated here as a static wire torus, re-created per pulse
+ * would need pulse timing data this renderer doesn't track — a reasonable
+ * simplification left for a follow-up pass), orbs = floating icosahedra.
+ */
+export interface AbilityEntityRenderer {
+  sync(state: SimState): void;
+}
+
+export function createAbilityEntityRenderer(scene: THREE.Scene): AbilityEntityRenderer {
+  const meshes = new Map<number, THREE.Mesh>();
+
+  function meshFor(slot: number, entType: number): THREE.Mesh {
+    const existing = meshes.get(slot);
+    if (existing && existing.userData["entType"] === entType) return existing;
+    if (existing) {
+      scene.remove(existing);
+      existing.geometry.dispose();
+      (existing.material as THREE.Material).dispose();
+      meshes.delete(slot);
+    }
+    let geometry: THREE.BufferGeometry;
+    let material: THREE.Material;
+    switch (entType) {
+      case ENT_SMOKE:
+        geometry = new THREE.SphereGeometry(1, 16, 12);
+        material = new THREE.MeshLambertMaterial({ color: 0xd8dee6 });
+        break;
+      case ENT_WALL_BOX:
+        geometry = new THREE.BoxGeometry(1, 1, 1);
+        material = new THREE.MeshStandardMaterial({ color: 0x4dafff });
+        break;
+      case ENT_SLOW_ZONE:
+        geometry = new THREE.CylinderGeometry(1, 1, 0.05, 24);
+        material = new THREE.MeshBasicMaterial({ color: 0x8855ff, transparent: true, opacity: 0.4 });
+        break;
+      case ENT_PROJECTILE:
+        geometry = new THREE.SphereGeometry(0.15, 8, 6);
+        material = new THREE.MeshStandardMaterial({ color: 0xffaa33 });
+        break;
+      case ENT_RECON_DART:
+        geometry = new THREE.TorusGeometry(0.6, 0.03, 6, 16);
+        material = new THREE.MeshBasicMaterial({ color: 0xff5555, wireframe: true });
+        break;
+      case ENT_ULT_ORB:
+        geometry = new THREE.IcosahedronGeometry(0.35, 0);
+        material = new THREE.MeshStandardMaterial({ color: 0xffd54a, emissive: 0x554400 });
+        break;
+      default:
+        geometry = new THREE.SphereGeometry(0.1, 4, 4);
+        material = new THREE.MeshBasicMaterial({ color: 0xff00ff });
+    }
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.userData["entType"] = entType;
+    scene.add(mesh);
+    meshes.set(slot, mesh);
+    return mesh;
+  }
+
+  return {
+    sync(state: SimState) {
+      for (let e = 0; e < MAX_ABILITY_ENTITIES; e++) {
+        const entType = state.entType[e]!;
+        if (entType === ENT_NONE) {
+          const existing = meshes.get(e);
+          if (existing) {
+            scene.remove(existing);
+            existing.geometry.dispose();
+            (existing.material as THREE.Material).dispose();
+            meshes.delete(e);
+          }
+          continue;
+        }
+        const mesh = meshFor(e, entType);
+        mesh.position.set(state.entX[e]!, state.entY[e]!, state.entZ[e]!);
+        if (entType === ENT_SMOKE) {
+          const abilityId = state.entAbilityId[e]!;
+          const radius = ABILITIES.find((a) => a.id === abilityId)?.radius ?? 3;
+          mesh.scale.setScalar(radius);
+        } else if (entType === ENT_WALL_BOX) {
+          const alignX = state.entVelX[e]! !== 0;
+          mesh.scale.set(alignX ? 2 : 0.4, 2, alignX ? 0.4 : 2);
+          const hpFrac = Math.max(0, Math.min(1, state.entParam[e]! / WALL_BOX_MAX_HP));
+          (mesh.material as THREE.MeshStandardMaterial).color.setRGB(1 - hpFrac, hpFrac, 0.3);
+        } else if (entType === ENT_SLOW_ZONE) {
+          const abilityId = state.entAbilityId[e]!;
+          const radius = ABILITIES.find((a) => a.id === abilityId)?.radius ?? 4;
+          mesh.scale.set(radius, 1, radius);
+        }
       }
     },
   };

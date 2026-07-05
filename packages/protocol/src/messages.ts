@@ -30,6 +30,22 @@
 // flags gain a team bit" doesn't fit team's THREE-valued domain (attackers/
 // defenders/unassigned-255) into one bit — team is instead its own u8 field
 // per player, exact rather than lossy.
+//
+// M4a changes (protocolVersion bumped 3 -> 4): buttons grow from u16 (10
+// bits used) to carry 4 more edge-triggered ability bits (ability1/ability2/
+// signature/ult) — still fits in u16 (14 bits used). SnapshotPlayer gains
+// agentId, ultPoints, flashedTicksLeft, flashIntensity (packed into flags'
+// remaining bits), and abilityCharges (4 bytes, one per ABILITY_SLOT_* —
+// spec's "own player only? simpler: all players" resolved to ALL players,
+// same as every other combat field here, so teammates' HUD/ally-charge
+// display and spectate both work without a special case). Snapshot gains an
+// entity section (ability world-entities: projectiles/smokes/walls/zones/
+// recon darts/orbs) with its own u8 count prefix, consistent with the
+// droppedWeapons list. New messages: AgentSelectCmd (C->S), AbilityEvent
+// (S->C, cast/detonate/pulse/expire cues for VFX/sound). BuyCmd's itemId
+// space is extended (100 = ability1 charge, 101 = ability2 charge — see
+// @vg/sim constants.ts BUY_ITEM_ABILITY1/2) but the wire shape is unchanged
+// (itemId was already a plain u8).
 
 export enum MessageType {
   Hello = 1,
@@ -44,9 +60,11 @@ export enum MessageType {
   TeamPing = 10,
   MatchEvent = 11,
   SellCmd = 12,
+  AgentSelectCmd = 13,
+  AbilityEvent = 14,
 }
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /** Fixed length (bytes) of a reconnect session token. All-zero = "no token". */
 export const TOKEN_LENGTH = 16;
@@ -75,6 +93,11 @@ export interface InputSample {
   readonly slot2: boolean;
   readonly interact: boolean;
   readonly ping: boolean;
+  /** M4a, edge-triggered: cast basic1/basic2/signature/ult. */
+  readonly ability1: boolean;
+  readonly ability2: boolean;
+  readonly signature: boolean;
+  readonly ult: boolean;
 }
 
 export interface InputBatchMessage {
@@ -95,6 +118,12 @@ export interface BuyCmdMessage {
 export interface SellCmdMessage {
   readonly type: MessageType.SellCmd;
   readonly itemId: number; // u8
+}
+
+/** C->S (M4a): pick an agent during the waiting phase (see @vg/sim abilities/effects.ts selectAgent). */
+export interface AgentSelectCmdMessage {
+  readonly type: MessageType.AgentSelectCmd;
+  readonly agentId: number; // u8
 }
 
 export interface WelcomeMessage {
@@ -122,7 +151,8 @@ export interface SnapshotPlayer {
   readonly grounded: boolean;
   readonly connected: boolean;
   readonly alive: boolean;
-  readonly activeSlot: number; // 0 | 1
+  /** 0 primary, 1 secondary, 2 = ult weapon (M4a: was 0|1). */
+  readonly activeSlot: number;
   readonly adsStage: number; // 0..2
   readonly health: number; // u8
   readonly armor: number; // u8
@@ -135,6 +165,13 @@ export interface SnapshotPlayer {
   readonly respawnTicksLeft: number; // u8 (clamped)
   /** M3: 0 attackers, 1 defenders, 255 unassigned. */
   readonly team: number; // u8
+  /** M4a: AGENT_NONE (255) if unpicked. */
+  readonly agentId: number; // u8
+  readonly ultPoints: number; // u8
+  readonly flashedTicksLeft: number; // u16 (clamped)
+  readonly flashIntensity: number; // 0/1/2 (FLASH_NONE/HALF/FULL) — packed into flags on the wire
+  /** Charge counts for ABILITY_SLOT_BASIC1/BASIC2/SIGNATURE/ULT (ult slot always 0 — gated by ultPoints instead). */
+  readonly abilityCharges: readonly [number, number, number, number];
 }
 
 export interface SnapshotDroppedWeapon {
@@ -146,12 +183,27 @@ export interface SnapshotDroppedWeapon {
   readonly mag: number; // u16, ammo the drop was left with
 }
 
+/** M4a: one live ability world-entity (projectile/smoke/wall/zone/recon dart/orb — see @vg/sim constants.ts ENT_*). */
+export interface SnapshotAbilityEntity {
+  readonly entType: number; // u8
+  readonly owner: number; // u8, 255 = none (e.g. ult orbs)
+  readonly abilityId: number; // u8
+  readonly x: number; // f32
+  readonly y: number; // f32
+  readonly z: number; // f32
+  readonly endTicksLeft: number; // u16, ticks until expiry (0 if n/a, e.g. still-flying projectiles)
+  /** Wall HP / recon-dart pulses-remaining / unused — see @vg/sim SimState.entParam. */
+  readonly param: number; // u16
+}
+
 export interface SnapshotMessage {
   readonly type: MessageType.Snapshot;
   readonly serverTick: number; // u32
   readonly lastProcessedSeq: number; // u32, for the receiving client
   readonly players: readonly SnapshotPlayer[]; // numPlayers: u8, then that many entries
   readonly droppedWeapons: readonly SnapshotDroppedWeapon[]; // count: u8, then that many entries (server caps at 32 live drops)
+  /** M4a: count u8 (0..64), then that many entries — see @vg/sim MAX_ABILITY_ENTITIES. */
+  readonly abilityEntities: readonly SnapshotAbilityEntity[];
 
   // ---- M3 match section ----
   readonly mode: number; // u8: 0 dm, 1 match
@@ -226,6 +278,18 @@ export interface MatchEventMessage {
   readonly roundNumber: number; // u8
 }
 
+/** S->C (M4a): a VFX/sound cue for an ability world-event — cast/detonate/pulse/expire (see @vg/sim state.ts AbilityEvent). Purely cosmetic; damage/flash/heal/reveal/res are carried by existing messages (HitConfirm/DamageTaken/KillEvent/Snapshot). */
+export interface AbilityEventMessage {
+  readonly type: MessageType.AbilityEvent;
+  readonly kind: number; // u8: 0 cast, 1 detonate, 2 pulse, 3 expire
+  readonly owner: number; // u8
+  readonly abilityId: number; // u8
+  readonly x: number; // f32
+  readonly y: number; // f32
+  readonly z: number; // f32
+  readonly targetIndex: number; // u8, 255 = n/a (e.g. Mend's healed teammate, Resurrect's revived teammate)
+}
+
 export type ProtocolMessage =
   | HelloMessage
   | InputBatchMessage
@@ -238,7 +302,9 @@ export type ProtocolMessage =
   | DamageTakenMessage
   | MapPingMessage
   | TeamPingMessage
-  | MatchEventMessage;
+  | MatchEventMessage
+  | AgentSelectCmdMessage
+  | AbilityEventMessage;
 
 const JUMP_BIT = 1 << 0;
 const CROUCH_BIT = 1 << 1;
@@ -250,14 +316,21 @@ const SLOT1_BIT = 1 << 6;
 const SLOT2_BIT = 1 << 7;
 const INTERACT_BIT = 1 << 8;
 const PING_BIT = 1 << 9;
+const ABILITY1_BIT = 1 << 10;
+const ABILITY2_BIT = 1 << 11;
+const SIGNATURE_BIT = 1 << 12;
+const ULT_BIT = 1 << 13;
 
 const CROUCHING_BIT = 1 << 0;
 const GROUNDED_BIT = 1 << 1;
 const CONNECTED_BIT = 1 << 2;
 const ALIVE_BIT = 1 << 3;
-const ACTIVE_SLOT_BIT = 1 << 4;
-const ADS_STAGE_SHIFT = 5; // 2 bits: 5,6
+const ACTIVE_SLOT_SHIFT = 4; // 2 bits: 4,5 (M4a: widened from 1 bit -- 0 primary, 1 secondary, 2 ult weapon)
+const ACTIVE_SLOT_MASK = 0b11;
+const ADS_STAGE_SHIFT = 6; // 2 bits: 6,7
 const ADS_STAGE_MASK = 0b11;
+const FLASH_INTENSITY_SHIFT = 8; // 2 bits: 8,9 -- flags widens to u16 for M4a (was u8)
+const FLASH_INTENSITY_MASK = 0b11;
 
 const HEADSHOT_BIT = 1 << 0;
 
@@ -445,7 +518,10 @@ export function quantizeInputSample<T extends { forward: number; right: number; 
 }
 
 function encodeButtons(
-  s: Pick<InputSample, "jump" | "crouch" | "walk" | "fire" | "ads" | "reload" | "slot1" | "slot2" | "interact" | "ping">,
+  s: Pick<
+    InputSample,
+    "jump" | "crouch" | "walk" | "fire" | "ads" | "reload" | "slot1" | "slot2" | "interact" | "ping" | "ability1" | "ability2" | "signature" | "ult"
+  >,
 ): number {
   return (
     (s.jump ? JUMP_BIT : 0) |
@@ -457,35 +533,45 @@ function encodeButtons(
     (s.slot1 ? SLOT1_BIT : 0) |
     (s.slot2 ? SLOT2_BIT : 0) |
     (s.interact ? INTERACT_BIT : 0) |
-    (s.ping ? PING_BIT : 0)
+    (s.ping ? PING_BIT : 0) |
+    (s.ability1 ? ABILITY1_BIT : 0) |
+    (s.ability2 ? ABILITY2_BIT : 0) |
+    (s.signature ? SIGNATURE_BIT : 0) |
+    (s.ult ? ULT_BIT : 0)
   );
 }
 
 /**
- * Snapshot per-player flags byte layout: bit0 crouching, bit1 grounded,
- * bit2 connected, bit3 alive, bit4 activeSlot (0=primary,1=secondary),
- * bits5-6 adsStage (0..2), bit7 reserved/unused. (`team` is its own u8 field,
- * not packed here — see the module doc comment's deviation note.)
+ * Snapshot per-player flags layout (M4a: widened u8 -> u16 to fit activeSlot
+ * 0..2 and flashIntensity): bit0 crouching, bit1 grounded, bit2 connected,
+ * bit3 alive, bits4-5 activeSlot (0=primary,1=secondary,2=ult weapon),
+ * bits6-7 adsStage (0..2), bits8-9 flashIntensity (0..2), bits10-15
+ * reserved/unused. (`team`/`agentId`/etc. are their own fields, not packed
+ * here — see the module doc comment's deviation note.)
  */
-function encodeFlags(p: Pick<SnapshotPlayer, "crouching" | "grounded" | "connected" | "alive" | "activeSlot" | "adsStage">): number {
+function encodeFlags(p: Pick<SnapshotPlayer, "crouching" | "grounded" | "connected" | "alive" | "activeSlot" | "adsStage" | "flashIntensity">): number {
   return (
     (p.crouching ? CROUCHING_BIT : 0) |
     (p.grounded ? GROUNDED_BIT : 0) |
     (p.connected ? CONNECTED_BIT : 0) |
     (p.alive ? ALIVE_BIT : 0) |
-    (p.activeSlot ? ACTIVE_SLOT_BIT : 0) |
-    ((p.adsStage & ADS_STAGE_MASK) << ADS_STAGE_SHIFT)
+    ((p.activeSlot & ACTIVE_SLOT_MASK) << ACTIVE_SLOT_SHIFT) |
+    ((p.adsStage & ADS_STAGE_MASK) << ADS_STAGE_SHIFT) |
+    ((p.flashIntensity & FLASH_INTENSITY_MASK) << FLASH_INTENSITY_SHIFT)
   );
 }
 
-function decodeFlags(flags: number): Pick<SnapshotPlayer, "crouching" | "grounded" | "connected" | "alive" | "activeSlot" | "adsStage"> {
+function decodeFlags(
+  flags: number,
+): Pick<SnapshotPlayer, "crouching" | "grounded" | "connected" | "alive" | "activeSlot" | "adsStage" | "flashIntensity"> {
   return {
     crouching: (flags & CROUCHING_BIT) !== 0,
     grounded: (flags & GROUNDED_BIT) !== 0,
     connected: (flags & CONNECTED_BIT) !== 0,
     alive: (flags & ALIVE_BIT) !== 0,
-    activeSlot: (flags & ACTIVE_SLOT_BIT) !== 0 ? 1 : 0,
+    activeSlot: (flags >> ACTIVE_SLOT_SHIFT) & ACTIVE_SLOT_MASK,
     adsStage: (flags >> ADS_STAGE_SHIFT) & ADS_STAGE_MASK,
+    flashIntensity: (flags >> FLASH_INTENSITY_SHIFT) & FLASH_INTENSITY_MASK,
   };
 }
 
@@ -552,7 +638,7 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
         w.f32(p.velZ);
         w.f32(p.yaw);
         w.f32(p.pitch);
-        w.u8(encodeFlags(p));
+        w.u16(encodeFlags(p));
         w.u8(p.health);
         w.u8(p.armor);
         w.u8(p.weaponPrimary);
@@ -563,6 +649,13 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
         w.u16(Math.min(CREDITS_CLAMP, p.credits));
         w.u8(Math.min(255, p.respawnTicksLeft));
         w.u8(p.team);
+        w.u8(p.agentId);
+        w.u8(p.ultPoints);
+        w.u16(Math.min(65535, p.flashedTicksLeft));
+        w.u8(p.abilityCharges[0]);
+        w.u8(p.abilityCharges[1]);
+        w.u8(p.abilityCharges[2]);
+        w.u8(p.abilityCharges[3]);
       }
       w.u8(msg.droppedWeapons.length);
       for (const d of msg.droppedWeapons) {
@@ -572,6 +665,17 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
         w.f32(d.y);
         w.f32(d.z);
         w.u16(d.mag);
+      }
+      w.u8(msg.abilityEntities.length);
+      for (const e of msg.abilityEntities) {
+        w.u8(e.entType);
+        w.u8(e.owner);
+        w.u8(e.abilityId);
+        w.f32(e.x);
+        w.f32(e.y);
+        w.f32(e.z);
+        w.u16(Math.min(65535, e.endTicksLeft));
+        w.u16(Math.min(65535, e.param));
       }
       w.u8(msg.mode);
       w.u8(msg.matchPhase);
@@ -632,6 +736,20 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
       w.u8(msg.roundNumber);
       break;
     }
+    case MessageType.AgentSelectCmd: {
+      w.u8(msg.agentId);
+      break;
+    }
+    case MessageType.AbilityEvent: {
+      w.u8(msg.kind);
+      w.u8(msg.owner);
+      w.u8(msg.abilityId);
+      w.f32(msg.x);
+      w.f32(msg.y);
+      w.f32(msg.z);
+      w.u8(msg.targetIndex);
+      break;
+    }
   }
   return w.finish();
 }
@@ -671,6 +789,10 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
           slot2: (buttons & SLOT2_BIT) !== 0,
           interact: (buttons & INTERACT_BIT) !== 0,
           ping: (buttons & PING_BIT) !== 0,
+          ability1: (buttons & ABILITY1_BIT) !== 0,
+          ability2: (buttons & ABILITY2_BIT) !== 0,
+          signature: (buttons & SIGNATURE_BIT) !== 0,
+          ult: (buttons & ULT_BIT) !== 0,
         });
       }
       return { type, firstSeq, viewTick, frames };
@@ -707,7 +829,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         const velZ = r.f32();
         const yaw = r.f32();
         const pitch = r.f32();
-        const flags = r.u8();
+        const flags = r.u16();
         const health = r.u8();
         const armor = r.u8();
         const weaponPrimary = r.u8();
@@ -718,6 +840,13 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         const credits = r.u16();
         const respawnTicksLeft = r.u8();
         const team = r.u8();
+        const agentId = r.u8();
+        const ultPoints = r.u8();
+        const flashedTicksLeft = r.u16();
+        const charge0 = r.u8();
+        const charge1 = r.u8();
+        const charge2 = r.u8();
+        const charge3 = r.u8();
         players.push({
           posX,
           posY,
@@ -738,6 +867,10 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
           credits,
           respawnTicksLeft,
           team,
+          agentId,
+          ultPoints,
+          flashedTicksLeft,
+          abilityCharges: [charge0, charge1, charge2, charge3],
         });
       }
       const dropCount = r.u8();
@@ -750,6 +883,19 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         const z = r.f32();
         const mag = r.u16();
         droppedWeapons.push({ id, weaponId, x, y, z, mag });
+      }
+      const entityCount = r.u8();
+      const abilityEntities: SnapshotAbilityEntity[] = [];
+      for (let i = 0; i < entityCount; i++) {
+        const entType = r.u8();
+        const owner = r.u8();
+        const abilityId = r.u8();
+        const x = r.f32();
+        const y = r.f32();
+        const z = r.f32();
+        const endTicksLeft = r.u16();
+        const param = r.u16();
+        abilityEntities.push({ entType, owner, abilityId, x, y, z, endTicksLeft, param });
       }
       const mode = r.u8();
       const matchPhase = r.u8();
@@ -774,6 +920,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         lastProcessedSeq,
         players,
         droppedWeapons,
+        abilityEntities,
         mode,
         matchPhase,
         phaseTicksLeft,
@@ -832,6 +979,20 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const reason = r.u8();
       const roundNumber = r.u8();
       return { type, kind, winnerTeam, reason, roundNumber };
+    }
+    case MessageType.AgentSelectCmd: {
+      const agentId = r.u8();
+      return { type, agentId };
+    }
+    case MessageType.AbilityEvent: {
+      const kind = r.u8();
+      const owner = r.u8();
+      const abilityId = r.u8();
+      const x = r.f32();
+      const y = r.f32();
+      const z = r.f32();
+      const targetIndex = r.u8();
+      return { type, kind, owner, abilityId, x, y, z, targetIndex };
     }
     default: {
       const exhaustive: never = type;

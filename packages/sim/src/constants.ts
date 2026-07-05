@@ -153,3 +153,47 @@ export const DEFAULT_OT_START_CREDITS = 5000;
 export const DEFAULT_WIN_CREDITS = 3000;
 export const DEFAULT_LOSS_CREDITS: readonly [number, number, number] = [1900, 2400, 2900];
 export const DEFAULT_PLANT_BONUS = 300;
+
+// ---- M4a abilities/agents ----
+
+/** SimState.agentId sentinel: not yet picked (waiting phase, or DM default). */
+export const AGENT_NONE = 255;
+
+export const AGENT_ZEPHYR = 0; // Duelist (Jett-analog)
+export const AGENT_UMBRA = 1; // Controller (Omen-analog)
+export const AGENT_SONAR = 2; // Initiator (Sova-analog)
+export const AGENT_LUMEN = 3; // Sentinel (Sage-analog)
+export const NUM_AGENTS = 4;
+
+/** Ability slot indices (per player, into abilityCharges / cast input bits). */
+export const ABILITY_SLOT_BASIC1 = 0;
+export const ABILITY_SLOT_BASIC2 = 1;
+export const ABILITY_SLOT_SIGNATURE = 2;
+export const ABILITY_SLOT_ULT = 3;
+
+/** Max simultaneous live ability world-entities (projectiles, smokes, walls, zones, recon darts, orbs). */
+export const MAX_ABILITY_ENTITIES = 64;
+
+/** SimState per-entity `entType` values. */
+export const ENT_NONE = 0;
+export const ENT_PROJECTILE = 1;
+export const ENT_SMOKE = 2;
+export const ENT_WALL_BOX = 3;
+export const ENT_SLOW_ZONE = 4;
+export const ENT_RECON_DART = 5;
+export const ENT_ULT_ORB = 6;
+
+/** Radius (m) a living player must be within an ult orb to pick it up. */
+export const ULT_ORB_PICKUP_RADIUS_M = 1.0;
+
+/** Ability-purchase BuyCmd item ids: 100 + ability slot (0 = basic1, 1 = basic2). */
+export const BUY_ITEM_ABILITY1 = 100;
+export const BUY_ITEM_ABILITY2 = 101;
+
+/** Flash intensity codes (SimState.flashIntensity). */
+export const FLASH_NONE = 0;
+export const FLASH_HALF = 1;
+export const FLASH_FULL = 2;
+
+/** Wall box lifetime/HP tuning shared by @vg/server's wall-damage boundary. */
+export const WALL_BOX_MAX_HP = 400;

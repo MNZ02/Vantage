@@ -1,14 +1,16 @@
 import { FIXED_DT, LAND_PENALTY_TICKS, MODE_MATCH, PHASE_MATCH_END, PHASE_ROUND_END, TAG_MULT } from "./constants.js";
 import { advanceMatchState, computeChannelDecisions, effectiveBoxesForPlayer, isChanneling } from "./match.js";
+import { computeSlowMultiplier, stepAbilities } from "./abilities/logic.js";
+import { liveWallBoxes } from "./abilities/entities.js";
 import { movePlayer } from "./movement.js";
 import { nextRandom } from "./prng.js";
-import { cloneState, type Box, type InputFrame, type ShotEvent, type SimState } from "./state.js";
-import { getActiveWeaponId, respawnPlayer, stepWeaponLogic } from "./weapons/logic.js";
-import { getWeaponDef } from "./weapons/data.js";
+import { cloneState, type AbilityEvent, type Box, type InputFrame, type ShotEvent, type SimState } from "./state.js";
+import { getActiveWeaponId, getCombatWeaponDef, respawnPlayer, stepWeaponLogic } from "./weapons/logic.js";
 
 export interface TickResult {
   state: SimState;
   shots: ShotEvent[];
+  abilityEvents: AbilityEvent[];
 }
 
 /**
@@ -50,6 +52,13 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
   const movementFrozenByPhase =
     state.mode === MODE_MATCH && (state.matchPhase === PHASE_ROUND_END || state.matchPhase === PHASE_MATCH_END);
 
+  // M4a: live Lumen wall boxes block movement (and bullets, resolved server-
+  // side) for everyone — merged into the shared boxes list once per tick, on
+  // top of whatever effectiveBoxesForPlayer already adds per-player (buy-
+  // phase barriers). In-sim/predicted, same as the level geometry itself.
+  const wallBoxes = liveWallBoxes(state);
+  const boxesWithWalls = wallBoxes.length > 0 ? [...boxes, ...wallBoxes] : boxes;
+
   for (let i = 0; i < next.numPlayers; i++) {
     const input = inputs[i];
 
@@ -79,11 +88,12 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
     if (state.tagTicksLeft[i]! > 0) speedMultiplier *= TAG_MULT;
     if (state.adsStage[i]! > 0) {
       const weaponId = getActiveWeaponId(state, i);
-      const weapon = getWeaponDef(weaponId);
+      const weapon = getCombatWeaponDef(weaponId);
       if (weapon) speedMultiplier *= weapon.adsMoveSpeedMult;
     }
+    speedMultiplier *= computeSlowMultiplier(state, i);
 
-    const effectiveBoxes = effectiveBoxesForPlayer(state, boxes, i);
+    const effectiveBoxes = effectiveBoxesForPlayer(state, boxesWithWalls, i);
     const channeling = isChanneling(channelDecisions, i);
     const movementInput: InputFrame =
       channeling || movementFrozenByPhase ? { ...input, forward: 0, right: 0, jump: false } : input;
@@ -113,6 +123,8 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
     if (shot) shots.push(shot);
   }
 
+  const abilityEvents = stepAbilities(state, next, inputs, boxesWithWalls, currentTick);
+
   if (next.mode === MODE_MATCH) {
     advanceMatchState(state, next, channelDecisions, currentTick);
   }
@@ -121,5 +133,5 @@ export function tick(state: SimState, inputs: readonly InputFrame[], boxes: read
   next.prngState = rng.nextState;
   next.tick = state.tick + 1;
 
-  return { state: next, shots };
+  return { state: next, shots, abilityEvents };
 }

@@ -1,10 +1,24 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  ABILITY_SLOT_BASIC1,
+  ABILITY_SLOT_BASIC2,
+  ABILITY_PENETRATES_WALLS,
+  ABL_LUMEN_MEND,
+  ABL_LUMEN_RES,
+  ABL_SONAR_PULSE,
+  ABL_SONAR_RECON,
+  ABL_SONAR_SHOCK,
+  ABL_UMBRA_BLIND,
   ASSIST_WINDOW_TICKS,
+  BUY_ITEM_ABILITY1,
+  BUY_ITEM_ABILITY2,
   DROP_DESPAWN_TICKS,
+  ENT_NONE,
   FIXED_DT,
+  FLASH_NONE,
   KILL_REWARD,
   LEVEL_BOXES,
+  MAX_ABILITY_ENTITIES,
   MAX_CREDITS,
   MAX_DROPPED_WEAPONS,
   MAX_PLAYERS,
@@ -22,24 +36,40 @@ import {
   TEAM_DEFENDERS,
   TEAM_NONE,
   WEAPON_NONE,
+  applyAbilityBuy,
   applyBuy,
   applyDamage,
+  applyFlash,
+  applyHeal,
+  applyKillAbilitySideEffects,
+  applyRevive,
   applySell,
   applyTag,
+  applyWallDamage,
+  autoAssignAgents,
+  awardUltPoint,
   clamp,
   clearPrimaryWeapon,
+  computeAoeDamage,
+  computeFlash,
+  computeReveal,
   createMatchState,
   createState,
   damageForHit,
   eyePosition,
-  getWeaponDef,
+  getAbilityDef,
+  getCombatWeaponDef,
+  liveWallBoxes,
   pickupWeapon,
   raycastBoxes,
   raycastPlayers,
+  raycastWalls,
+  selectAgent,
   shotDirection,
   spawnForIndex,
   startMatch,
   tick,
+  type AbilityEvent,
   type Box,
   type InputFrame,
   type MatchConfig,
@@ -53,6 +83,8 @@ import {
   TOKEN_LENGTH,
   decodeMessageSafely,
   encodeMessage,
+  type AbilityEventMessage,
+  type AgentSelectCmdMessage,
   type BuyCmdMessage,
   type DamageTakenMessage,
   type HitConfirmMessage,
@@ -61,6 +93,7 @@ import {
   type MapPingMessage,
   type MatchEventMessage,
   type SellCmdMessage,
+  type SnapshotAbilityEntity,
   type SnapshotDroppedWeapon,
   type SnapshotMessage,
   type SnapshotPlayer,
@@ -216,6 +249,26 @@ export class ServerHost {
   // ---- M3 match events (diffed pre/post tick()) ----
   private readonly pendingMatchEvents: MatchEventMessage[] = [];
 
+  // ---- M4a ability event cues (broadcast alongside KillEvent/HitConfirm/etc) ----
+  private readonly pendingAbilityEvents: AbilityEventMessage[] = [];
+
+  /**
+   * M4a heal-over-time bookkeeping (Lumen's Mend): event-driven, server-side
+   * — the ONE deterministic approach chosen for the spec's "pick one and
+   * document" heal representation (see @vg/sim abilities/data.ts's
+   * healChunkTicks/healChunkAmount: 20 chunks of 3 HP every 16 ticks = 60 HP
+   * over 5s, integer math throughout, no fractional HP). A player can only
+   * be actively mended by one cast at a time (a fresh Mend replaces any
+   * still-running one on the same target).
+   */
+  private readonly activeHeals = new Map<number, { nextChunkTick: number; chunksLeft: number }>();
+
+  /**
+   * M4a reveal bookkeeping (Sonar's Pulse/Recon Dart): each entry ORs into
+   * that team's visibility mask (see updateVisibility) until `expiresAtTick`.
+   */
+  private readonly activeReveals: { team: number; mask: number; expiresAtTick: number }[] = [];
+
   /**
    * Per-player edge-gate for walk-over pickup: the id of the drop this
    * player was standing inside PICKUP_RADIUS_M of on the *previous*
@@ -247,6 +300,9 @@ export class ServerHost {
 
     if (this.mode === "match") {
       this.state = createMatchState(this.seed, this.numPlayers, opts.matchConfig ?? {});
+      // Match mode's own startMatch() (@vg/sim match.ts) auto-assigns agents
+      // for anyone still unpicked once the match actually starts — nothing
+      // to do here.
     } else {
       this.state = createState(this.seed, this.numPlayers);
       for (let i = 0; i < this.numPlayers; i++) {
@@ -255,6 +311,10 @@ export class ServerHost {
         this.state.posY[i] = spawn.y;
         this.state.posZ[i] = spawn.z;
       }
+      // DM has no waiting-phase agent-select screen (spec: "no buy gating —
+      // casts anytime alive") — every player/bot gets a default agent
+      // immediately so abilities work in the DM sandbox from tick 0.
+      this.state = autoAssignAgents(this.state);
     }
     this.ring.push(this.state);
     this.lastOverlappingDropId = new Array(this.numPlayers).fill(null);
@@ -594,6 +654,8 @@ export class ServerHost {
       this.handleSell(record.playerIndex, msg);
     } else if (msg.type === MessageType.MapPing) {
       this.handleMapPing(record.playerIndex, msg);
+    } else if (msg.type === MessageType.AgentSelectCmd) {
+      this.handleAgentSelect(record.playerIndex, msg);
     } else if (msg.type === MessageType.Hello) {
       // Welcome is already sent unconditionally at connect() (before any
       // Hello could arrive), so this can't prevent that — but an incompatible
@@ -613,10 +675,25 @@ export class ServerHost {
 
   private handleBuy(playerIndex: number, msg: BuyCmdMessage): void {
     if (!this.canBuyOrSellNow()) return;
+    if (this.state.alive[playerIndex] === 0) return;
+    // M4a: itemId 100/101 buy an ability charge (basic1/basic2) instead of a
+    // weapon/armor — see @vg/sim constants.ts BUY_ITEM_ABILITY1/2.
+    if (msg.itemId === BUY_ITEM_ABILITY1) {
+      this.state = applyAbilityBuy(this.state, playerIndex, ABILITY_SLOT_BASIC1);
+      return;
+    }
+    if (msg.itemId === BUY_ITEM_ABILITY2) {
+      this.state = applyAbilityBuy(this.state, playerIndex, ABILITY_SLOT_BASIC2);
+      return;
+    }
     // applyBuy() itself no-ops (returns state unchanged) for a dead player,
     // insufficient credits, or an unknown itemId — this call is always safe.
-    if (this.state.alive[playerIndex] === 0) return;
     this.state = applyBuy(this.state, playerIndex, msg.itemId);
+  }
+
+  /** C->S AgentSelectCmd (M4a). selectAgent() itself enforces waiting-phase-only (match mode) and no-duplicate-within-team gating — this is always a safe call. */
+  private handleAgentSelect(playerIndex: number, msg: AgentSelectCmdMessage): void {
+    this.state = selectAgent(this.state, playerIndex, msg.agentId);
   }
 
   private handleSell(playerIndex: number, msg: SellCmdMessage): void {
@@ -669,6 +746,10 @@ export class ServerHost {
           slot2: value.slot2,
           interact: value.interact,
           ping: value.ping,
+          ability1: value.ability1,
+          ability2: value.ability2,
+          signature: value.signature,
+          ult: value.ult,
         };
       }
     }
@@ -676,6 +757,7 @@ export class ServerHost {
     const prevPhase = this.state.matchPhase;
     const prevSpike = this.state.spikeState;
     const prevRound = this.state.roundNumber;
+    const prevPlanterIndex = this.state.planterIndex;
 
     // tick() tolerates missing entries for unconnected slots (see tick.ts's
     // `if (!input) continue`); the declared parameter type doesn't spell
@@ -684,18 +766,37 @@ export class ServerHost {
     this.state = result.state;
     this.ring.push(this.state);
 
+    // Combat mutation boundary ordering (documented, see @vg/sim
+    // abilities/effects.ts applyRevive's doc comment): ShotEvents (damage/
+    // kills) are resolved BEFORE AbilityEvents (including a same-tick
+    // Resurrect) — a revive reacting to a kill from this exact tick always
+    // lands before the round-end win-check that runs at the START of the
+    // NEXT tick() call, so it correctly keeps the round alive.
     for (const shot of result.shots) {
       this.allShots.push(shot);
       this.resolveShot(shot);
     }
+    for (const evt of result.abilityEvents) {
+      this.resolveAbilityEvent(evt);
+    }
 
     this.updatePickups();
     this.despawnOldDrops();
+    this.updateActiveHeals();
+    this.pruneExpiredReveals();
 
     if (this.mode === "match") {
       this.diffMatchEvents(prevPhase, prevSpike, prevRound);
       if (prevPhase !== PHASE_BUY && this.state.matchPhase === PHASE_BUY) {
         this.drops.length = 0; // drops cleared at round reset (spec)
+      }
+      // Ult points: plant/defuse (kill/death handled in handleKill; orb
+      // pickup handled in-sim via abilities/logic.ts's updateOrbPickups).
+      if (prevSpike !== SPIKE_PLANTED && this.state.spikeState === SPIKE_PLANTED && prevPlanterIndex !== NO_PLAYER) {
+        awardUltPoint(this.state, prevPlanterIndex);
+      }
+      if (prevSpike !== SPIKE_DEFUSED && this.state.spikeState === SPIKE_DEFUSED && this.state.defuserIndex !== NO_PLAYER) {
+        awardUltPoint(this.state, this.state.defuserIndex);
       }
       if (this.state.tick % VISIBILITY_EVERY_N_TICKS === 0) {
         this.updateVisibility();
@@ -706,6 +807,7 @@ export class ServerHost {
       this.broadcastSnapshot();
     }
     this.broadcastPendingMatchEvents();
+    this.broadcastPendingAbilityEvents();
 
     this.stepDurationsMs.push(nowMs() - startedAt);
   }
@@ -753,6 +855,38 @@ export class ServerHost {
     this.pendingMatchEvents.length = 0;
   }
 
+  private broadcastPendingAbilityEvents(): void {
+    if (this.pendingAbilityEvents.length === 0) return;
+    for (const evt of this.pendingAbilityEvents) {
+      const encoded = encodeMessage(evt);
+      for (const [, client] of this.clients) client.transport.send(encoded);
+    }
+    this.pendingAbilityEvents.length = 0;
+  }
+
+  /**
+   * Occluders for any LoS-style query (visibility cone, flash, LoS-gated
+   * reveal): static level geometry PLUS every live Lumen wall box. A wall is
+   * a solid 0.4m barrier for the ~30s it's up — it should block sightlines
+   * exactly like the level's own walls, and does so here for all three
+   * consumers (updateVisibility, computeFlash, computeReveal's LoS-gated
+   * call). Recomputed on demand (not cached) since walls spawn/break/expire
+   * tick-to-tick; cheap at MAX_ABILITY_ENTITIES=64.
+   *
+   * Deliberately NOT occluding (documented gap, not a bug): smoke spheres.
+   * Smokes are rendered as opaque on the client, but this server's own
+   * raycastBoxes/raycastWalls occlusion tests are AABB-only — there's no
+   * sphere-vs-ray primitive in @vg/sim's raycast module, so a smoke cannot
+   * block a flash/reveal/visibility check the way the plan's §3.1 originally
+   * envisioned ("smokes = sphere occluders (fed to server visibility *and*
+   * flash LoS tests)"). Sphere occlusion is deferred to a follow-up pass;
+   * noted in PLAN.md too.
+   */
+  private occlusionBoxes(): readonly Box[] {
+    const wallBoxes = liveWallBoxes(this.state);
+    return wallBoxes.length > 0 ? [...this.boxes, ...wallBoxes] : this.boxes;
+  }
+
   /**
    * Team-shared visibility (minimap fog of war): for each team, an enemy is
    * visible if ANY living member of that team has an unobstructed raycast
@@ -762,9 +896,16 @@ export class ServerHost {
    * snapshot interest-culling/anti-wallhack is explicitly DEFERRED (see
    * PLAN.md §3.2) — this only feeds the minimap, not what raw combat state
    * a client's own SimState mirror actually contains.
+   *
+   * M4a: Sonar's Pulse/Recon Dart reveals (see activeReveals, populated by
+   * resolveAbilityEvent) are ORed in on top of the raycast-based visibility
+   * computed here — plumbed as an override mask, per spec. Occlusion here
+   * (and in computeFlash/computeReveal) includes live Lumen wall boxes, not
+   * just static level geometry — see occlusionBoxes()'s doc comment.
    */
   private updateVisibility(): void {
     const s = this.state;
+    const boxes = this.occlusionBoxes();
     let team0Mask = 0; // attackers' view of defenders
     let team1Mask = 0; // defenders' view of attackers
 
@@ -795,7 +936,7 @@ export class ServerHost {
         while (diff < -Math.PI) diff += 2 * Math.PI;
         if (Math.abs(diff) > VISIBILITY_HALF_FOV_RAD) continue;
 
-        const blocked = raycastBoxes(this.boxes, eyeM, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
+        const blocked = raycastBoxes(boxes, eyeM, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
         if (blocked === null) {
           visible = true;
           break;
@@ -808,7 +949,113 @@ export class ServerHost {
       }
     }
 
+    for (const reveal of this.activeReveals) {
+      if (reveal.team === TEAM_ATTACKERS) team0Mask |= reveal.mask;
+      else if (reveal.team === TEAM_DEFENDERS) team1Mask |= reveal.mask;
+    }
+
     this.visibilityMasks = [team0Mask, team1Mask];
+  }
+
+  private pruneExpiredReveals(): void {
+    if (this.activeReveals.length === 0) return;
+    const currentTick = this.state.tick;
+    for (let i = this.activeReveals.length - 1; i >= 0; i--) {
+      if (currentTick >= this.activeReveals[i]!.expiresAtTick) this.activeReveals.splice(i, 1);
+    }
+  }
+
+  /** Advances Lumen's Mend heal-over-time bookkeeping by one chunk per activeHeals entry whose nextChunkTick has arrived. */
+  private updateActiveHeals(): void {
+    if (this.activeHeals.size === 0) return;
+    const currentTick = this.state.tick;
+    const def = getAbilityDef(ABL_LUMEN_MEND)!;
+    for (const [target, progress] of Array.from(this.activeHeals.entries())) {
+      if (this.state.alive[target] === 0) {
+        this.activeHeals.delete(target);
+        continue;
+      }
+      if (currentTick >= progress.nextChunkTick) {
+        this.state = applyHeal(this.state, target, def.healChunkAmount!);
+        progress.chunksLeft -= 1;
+        progress.nextChunkTick = currentTick + def.healChunkTicks!;
+        if (progress.chunksLeft <= 0) this.activeHeals.delete(target);
+      }
+    }
+  }
+
+  /**
+   * Resolves one AbilityEvent (cast/detonate/pulse/expire) against
+   * authoritative state — the ability-side counterpart to resolveShot().
+   * Damage/flash/heal/reveal/res are all applied HERE, never inside tick()
+   * (see @vg/sim abilities/logic.ts's module doc comment for the prediction
+   * policy this follows). Always rebroadcasts the event as a cosmetic
+   * AbilityEvent cue afterward, regardless of what (if anything) it did.
+   */
+  private resolveAbilityEvent(evt: AbilityEvent): void {
+    const currentTick = this.state.tick;
+
+    if (evt.abilityId === ABL_UMBRA_BLIND && evt.kind === "detonate") {
+      const flashes = computeFlash(this.state, this.occlusionBoxes(), evt.x, evt.y, evt.z);
+      for (const f of flashes) this.state = applyFlash(this.state, f.playerIndex, f.intensity, currentTick);
+    } else if (evt.abilityId === ABL_SONAR_SHOCK && evt.kind === "detonate") {
+      const def = getAbilityDef(ABL_SONAR_SHOCK)!;
+      const ownerTeam = this.state.team[evt.owner];
+      for (let i = 0; i < this.numPlayers; i++) {
+        if (this.state.alive[i] === 0) continue;
+        if (ownerTeam !== TEAM_NONE && this.state.team[i] === ownerTeam) continue; // FF off
+        const dist = Math.hypot(this.state.posX[i]! - evt.x, this.state.posY[i]! - evt.y, this.state.posZ[i]! - evt.z);
+        const dmg = computeAoeDamage(def.damage!, def.falloffRadius!, dist);
+        if (dmg <= 0) continue;
+        const wasAlive = this.state.alive[i] === 1;
+        this.state = applyDamage(this.state, i, dmg);
+        if (wasAlive && this.state.alive[i] === 0) {
+          // Ability kill: weaponId rides the 100+abilityId space (spec) — see @vg/sim abilities/data.ts abilityWeaponId().
+          this.handleKill(evt.owner, i, 100 + ABL_SONAR_SHOCK, false, NO_PLAYER, currentTick);
+        }
+      }
+    } else if (evt.abilityId === ABL_SONAR_PULSE && evt.kind === "cast") {
+      const def = getAbilityDef(ABL_SONAR_PULSE)!;
+      const team = this.state.team[evt.owner]!;
+      // requireLoS=false: Pulse ignores walls entirely (spec: "walls
+      // irrelevant") — occlusionBoxes() is passed for call-site consistency
+      // but has no effect here since the LoS raycast itself is skipped.
+      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, false);
+      if (mask !== 0 && (team === TEAM_ATTACKERS || team === TEAM_DEFENDERS)) {
+        this.activeReveals.push({ team, mask, expiresAtTick: currentTick + def.durationTicks! });
+      }
+    } else if (evt.abilityId === ABL_SONAR_RECON && evt.kind === "pulse") {
+      const def = getAbilityDef(ABL_SONAR_RECON)!;
+      const team = this.state.team[evt.owner]!;
+      // requireLoS=true: a live Lumen wall blocks Recon Dart's reveal, same as level geometry.
+      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, true);
+      if (mask !== 0 && (team === TEAM_ATTACKERS || team === TEAM_DEFENDERS)) {
+        this.activeReveals.push({ team, mask, expiresAtTick: currentTick + def.durationTicks! });
+      }
+    } else if (evt.abilityId === ABL_LUMEN_MEND && evt.kind === "cast") {
+      const def = getAbilityDef(ABL_LUMEN_MEND)!;
+      const target = evt.entitySlot;
+      if (target >= 0 && this.state.alive[target] === 1) {
+        this.activeHeals.set(target, { nextChunkTick: currentTick + def.healChunkTicks!, chunksLeft: Math.round(def.healDurationTicks! / def.healChunkTicks!) });
+      }
+    } else if (evt.abilityId === ABL_LUMEN_RES && evt.kind === "detonate") {
+      const def = getAbilityDef(ABL_LUMEN_RES)!;
+      const target = evt.entitySlot;
+      if (target >= 0 && target < this.numPlayers && this.state.alive[target] === 0) {
+        this.state = applyRevive(this.state, target, def.reviveHp!);
+      }
+    }
+
+    this.pendingAbilityEvents.push({
+      type: MessageType.AbilityEvent,
+      kind: evt.kind === "cast" ? 0 : evt.kind === "detonate" ? 1 : evt.kind === "pulse" ? 2 : 3,
+      owner: evt.owner,
+      abilityId: evt.abilityId,
+      x: evt.x,
+      y: evt.y,
+      z: evt.z,
+      targetIndex: evt.entitySlot >= 0 && evt.entitySlot < 256 ? evt.entitySlot : 255,
+    });
   }
 
   private resolveShot(shot: ShotEvent): void {
@@ -819,8 +1066,9 @@ export class ServerHost {
     // future sim regression can't reintroduce buy/roundEnd kills here too.
     if (this.mode === "match" && this.state.matchPhase !== PHASE_ROUND) return;
 
-    const weapon = getWeaponDef(shot.weaponId);
+    const weapon = getCombatWeaponDef(shot.weaponId);
     if (!weapon) return;
+    const penetratesWalls = ABILITY_PENETRATES_WALLS.has(shot.weaponId);
 
     const shooterIndex = shot.playerIndex;
     const currentTick = this.state.tick;
@@ -840,10 +1088,28 @@ export class ServerHost {
     // teammates entirely (never a hit, never a blocker) so a teammate
     // standing in the shot's path doesn't even absorb it.
     const hit = raycastPlayers(targetState, shooterIndex, origin, dir, this.fireMaxRange, this.mode === "match");
+
+    // M4a: Lumen's wall boxes block bullets too (spec: "shootable — weapon
+    // hits damage wall first"), UNLESS this weapon explicitly penetrates
+    // walls (Sonar's Rail ult — spec: "hitscan THROUGH walls"). Checked
+    // against CURRENT (not lag-compensated) wall positions since walls never
+    // move. A wall nearer than any player hit absorbs the shot outright.
+    if (!penetratesWalls) {
+      const maxCheckDist = hit ? hit.dist : this.fireMaxRange;
+      const wallHit = raycastWalls(this.state, origin, dir, maxCheckDist);
+      if (wallHit !== null) {
+        const wallDmg = damageForHit(weapon, wallHit.dist, "body");
+        this.state = applyWallDamage(this.state, wallHit.slot, wallDmg);
+        return;
+      }
+    }
+
     if (!hit) return;
 
-    const wallDist = raycastBoxes(this.boxes, origin, dir, hit.dist);
-    if (wallDist !== null) return; // a wall blocks the shot before it reaches the target
+    if (!penetratesWalls) {
+      const wallDist = raycastBoxes(this.boxes, origin, dir, hit.dist);
+      if (wallDist !== null) return; // static level geometry blocks the shot before it reaches the target
+    }
 
     const damage = damageForHit(weapon, hit.dist, hit.region);
     const targetIndex = hit.playerIndex;
@@ -888,6 +1154,14 @@ export class ServerHost {
     // credits ... work in match mode"); no-respawn is handled entirely
     // inside sim's scheduleDeath (see @vg/sim weapons/logic.ts).
     this.state.credits[killerIndex] = Math.min(MAX_CREDITS, this.state.credits[killerIndex]! + KILL_REWARD);
+
+    // M4a: ult points for both killer (+1) and victim (+1, "death" award),
+    // each capped at that player's own ult cost (DM included — abilities
+    // work anytime alive there too, per spec); Zephyr's Dash re-earn and
+    // Blades' kill-refresh-to-max (see @vg/sim abilities/effects.ts).
+    awardUltPoint(this.state, killerIndex);
+    awardUltPoint(this.state, victimIndex);
+    this.state = applyKillAbilitySideEffects(this.state, killerIndex);
 
     // Drop the victim's primary weapon (if any) at the death spot, then clear it from their loadout.
     const primaryId = this.state.weaponPrimary[victimIndex]!;
@@ -986,9 +1260,11 @@ export class ServerHost {
     const players: SnapshotPlayer[] = [];
     for (let i = 0; i < this.numPlayers; i++) {
       const activeSlot = this.state.activeSlot[i]!;
-      const magActive = activeSlot === 0 ? this.state.magPrimary[i]! : this.state.magSecondary[i]!;
-      const reserveActive = activeSlot === 0 ? this.state.reservePrimary[i]! : this.state.reserveSecondary[i]!;
+      const magActive = activeSlot === 2 ? this.state.magUlt[i]! : activeSlot === 0 ? this.state.magPrimary[i]! : this.state.magSecondary[i]!;
+      const reserveActive = activeSlot === 2 ? 0 : activeSlot === 0 ? this.state.reservePrimary[i]! : this.state.reserveSecondary[i]!;
       const respawnTicksLeft = this.state.alive[i] === 1 ? 0 : Math.max(0, this.state.respawnTick[i]! - this.state.tick);
+      const flashedTicksLeft = Math.max(0, this.state.flashedUntilTick[i]! - this.state.tick);
+      const flashIntensity = flashedTicksLeft > 0 ? this.state.flashIntensity[i]! : FLASH_NONE;
       players.push({
         posX: this.state.posX[i]!,
         posY: this.state.posY[i]!,
@@ -1014,10 +1290,36 @@ export class ServerHost {
         credits: this.state.credits[i]!,
         respawnTicksLeft,
         team: this.state.team[i]!,
+        agentId: this.state.agentId[i]!,
+        ultPoints: this.state.ultPoints[i]!,
+        flashedTicksLeft,
+        flashIntensity,
+        abilityCharges: [
+          this.state.abilityCharges[i * 4 + 0]!,
+          this.state.abilityCharges[i * 4 + 1]!,
+          this.state.abilityCharges[i * 4 + 2]!,
+          this.state.abilityCharges[i * 4 + 3]!,
+        ],
       });
     }
 
     const droppedWeapons: SnapshotDroppedWeapon[] = this.drops.map((d) => ({ id: d.id, weaponId: d.weaponId, x: d.x, y: d.y, z: d.z, mag: d.mag }));
+
+    const abilityEntities: SnapshotAbilityEntity[] = [];
+    for (let e = 0; e < MAX_ABILITY_ENTITIES; e++) {
+      if (this.state.entType[e] === ENT_NONE) continue;
+      const endTick = this.state.entEndTick[e]!;
+      abilityEntities.push({
+        entType: this.state.entType[e]!,
+        owner: this.state.entOwner[e]!,
+        abilityId: this.state.entAbilityId[e]!,
+        x: this.state.entX[e]!,
+        y: this.state.entY[e]!,
+        z: this.state.entZ[e]!,
+        endTicksLeft: endTick === -1 ? 0 : Math.max(0, endTick - this.state.tick),
+        param: Math.max(0, this.state.entParam[e]!),
+      });
+    }
 
     const phaseTicksLeft = isMatch && this.state.phaseEndTick >= 0 ? Math.max(0, this.state.phaseEndTick - this.state.tick) : 0;
     const spikePlantedTicksLeft =
@@ -1034,6 +1336,7 @@ export class ServerHost {
         lastProcessedSeq: Math.max(0, record.jitter.lastConsumedSeq),
         players,
         droppedWeapons,
+        abilityEntities,
         mode: this.state.mode,
         matchPhase: isMatch ? this.state.matchPhase : 0,
         phaseTicksLeft,

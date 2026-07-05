@@ -6,6 +6,8 @@
 // already cloned by tick()), never touching wall-clock/random ambient state.
 
 import {
+  ABILITY_SLOT_ULT,
+  AGENT_NONE,
   COUNTER_STRAFE_DEADZONE,
   FIXED_DT,
   MODE_MATCH,
@@ -31,28 +33,49 @@ import {
   type ShotEvent,
   type SimState,
 } from "../state.js";
+import { ABILITY_WEAPONS, abilityIdForSlot, abilityWeaponId } from "../abilities/data.js";
 import { getWeaponDef, type WeaponDef } from "./data.js";
 
-/** The weapon id currently equipped in `state`'s active slot for `playerIndex`, or WEAPON_NONE. */
+/** getWeaponDef() plus the ult-weapon combat defs (Blades/Rail, id space 100+abilityId — see abilities/data.ts). Used everywhere gunplay math needs to resolve "whatever weapon is active", including while an ult weapon is equipped; NEVER used by the shop buy/sell path (applyBuy/applySell keep using getWeaponDef directly, so itemId>=100 can't be "bought"). */
+export function getCombatWeaponDef(id: number): WeaponDef | null {
+  return getWeaponDef(id) ?? ABILITY_WEAPONS[id] ?? null;
+}
+
+/** The weapon id currently equipped in `state`'s active slot for `playerIndex` (0 primary, 1 secondary, 2 = ult weapon override — see abilities/logic.ts's Blades/Rail casts), or WEAPON_NONE. */
 export function getActiveWeaponId(state: SimState, playerIndex: number): number {
-  return state.activeSlot[playerIndex] === 0 ? state.weaponPrimary[playerIndex]! : state.weaponSecondary[playerIndex]!;
+  const slot = state.activeSlot[playerIndex];
+  if (slot === 2) {
+    const agentId = state.agentId[playerIndex]!;
+    if (agentId === AGENT_NONE) return WEAPON_NONE;
+    const ultAbilityId = abilityIdForSlot(agentId, ABILITY_SLOT_ULT);
+    return ultAbilityId !== null ? abilityWeaponId(ultAbilityId) : WEAPON_NONE;
+  }
+  return slot === 0 ? state.weaponPrimary[playerIndex]! : state.weaponSecondary[playerIndex]!;
 }
 
 function getActiveMag(state: SimState, playerIndex: number): number {
-  return state.activeSlot[playerIndex] === 0 ? state.magPrimary[playerIndex]! : state.magSecondary[playerIndex]!;
+  const slot = state.activeSlot[playerIndex];
+  if (slot === 2) return state.magUlt[playerIndex]!;
+  return slot === 0 ? state.magPrimary[playerIndex]! : state.magSecondary[playerIndex]!;
 }
 
 function getActiveReserve(state: SimState, playerIndex: number): number {
-  return state.activeSlot[playerIndex] === 0 ? state.reservePrimary[playerIndex]! : state.reserveSecondary[playerIndex]!;
+  const slot = state.activeSlot[playerIndex];
+  if (slot === 2) return 0; // ult weapons never reload
+  return slot === 0 ? state.reservePrimary[playerIndex]! : state.reserveSecondary[playerIndex]!;
 }
 
 function setActiveMag(state: SimState, playerIndex: number, value: number): void {
-  if (state.activeSlot[playerIndex] === 0) state.magPrimary[playerIndex] = value;
+  const slot = state.activeSlot[playerIndex];
+  if (slot === 2) state.magUlt[playerIndex] = value;
+  else if (slot === 0) state.magPrimary[playerIndex] = value;
   else state.magSecondary[playerIndex] = value;
 }
 
 function setActiveReserve(state: SimState, playerIndex: number, value: number): void {
-  if (state.activeSlot[playerIndex] === 0) state.reservePrimary[playerIndex] = value;
+  const slot = state.activeSlot[playerIndex];
+  if (slot === 2) return; // no-op: ult weapons carry no reserve ammo
+  if (slot === 0) state.reservePrimary[playerIndex] = value;
   else state.reserveSecondary[playerIndex] = value;
 }
 
@@ -136,7 +159,7 @@ export function stepWeaponLogic(prev: SimState, next: SimState, playerIndex: num
   // ---- Slot switching (edge-triggered) ----
   const slot1Edge = input.slot1 && !wasButtonHeld(prevButtons, SLOT1_BIT);
   const slot2Edge = input.slot2 && !wasButtonHeld(prevButtons, SLOT2_BIT);
-  if (slot1Edge && next.activeSlot[playerIndex] !== 0 && next.weaponPrimary[playerIndex] !== WEAPON_NONE) {
+  if (slot1Edge && next.weaponPrimary[playerIndex] !== WEAPON_NONE && next.activeSlot[playerIndex] !== 0) {
     next.activeSlot[playerIndex] = 0;
     next.reloadEndTick[playerIndex] = -1;
     const def = getWeaponDef(next.weaponPrimary[playerIndex]!);
@@ -149,7 +172,7 @@ export function stepWeaponLogic(prev: SimState, next: SimState, playerIndex: num
   }
 
   const weaponId = getActiveWeaponId(next, playerIndex);
-  const weapon = getWeaponDef(weaponId);
+  const weapon = getCombatWeaponDef(weaponId);
 
   // ---- ADS stage cycling (edge-triggered) ----
   const adsEdge = input.ads && !wasButtonHeld(prevButtons, ADS_BIT);
@@ -214,6 +237,19 @@ export function stepWeaponLogic(prev: SimState, next: SimState, playerIndex: num
     if (ticksSince < 65535) next.ticksSinceFire[playerIndex] = ticksSince + 1;
     if (next.ticksSinceFire[playerIndex]! > SPRAY_RESET_TICKS) {
       next.sprayIndex[playerIndex] = 0;
+    }
+  }
+
+  // Ult weapon (Blades/Rail) auto-reverts to the gun once its charges are
+  // spent or (Rail only) its activation window closes — see abilities/data.ts.
+  if (next.activeSlot[playerIndex] === 2) {
+    const magNow = getActiveMag(next, playerIndex);
+    const windowEnd = next.ultWindowEndTick[playerIndex]!;
+    const windowExpired = windowEnd !== -1 && currentTick >= windowEnd;
+    if (magNow <= 0 || windowExpired) {
+      next.activeSlot[playerIndex] = next.weaponPrimary[playerIndex] !== WEAPON_NONE ? 0 : 1;
+      next.magUlt[playerIndex] = 0;
+      next.ultWindowEndTick[playerIndex] = -1;
     }
   }
 

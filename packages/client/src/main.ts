@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import {
+  AGENT_NONE,
   EYE_HEIGHT_CROUCH,
   EYE_HEIGHT_STAND,
   FIXED_DT,
@@ -7,6 +8,7 @@ import {
   MODE_MATCH,
   NO_PLAYER,
   PHASE_BUY,
+  PHASE_WAITING,
   SPIKE_CARRIED,
   SPIKE_PLANTED,
   WEAPON_NONE,
@@ -23,9 +25,13 @@ import {
 import { buildInputFrame, getPitch, getYaw, onBuyKeyPressed, onBuyMenuToggle, setLookSensitivityMultiplier, setupInput } from "./input.js";
 import { GRAYBOX_BOXES, SPAWN_POSITION } from "./graybox.js";
 import {
+  createAbilityEntityRenderer,
+  createAbilityHud,
+  createAgentSelectOverlay,
   createBuyMenu,
   createCombatHud,
   createDamageDirectionIndicator,
+  createFlashOverlay,
   createFpsCounter,
   createViewmodel,
   createHitFlashOverlay,
@@ -59,6 +65,10 @@ const matchHud = createMatchHud();
 const minimap = createMinimap();
 const spectateOverlay = createSpectateOverlay();
 const reconnectBanner = createReconnectBanner();
+const abilityHud = createAbilityHud();
+const flashOverlay = createFlashOverlay();
+const abilityEntities = createAbilityEntityRenderer(scene);
+const agentSelect = createAgentSelectOverlay((agentId) => netClient?.selectAgent(agentId));
 
 let netClient: NetClient | null = null;
 const remoteProxies = new Map<number, RemotePlayerProxy>();
@@ -324,6 +334,29 @@ function updateHud(): void {
     respawnSecondsLeft: respawnTicksLeft * FIXED_DT,
   });
   buyMenu.setState(state.credits[localIndex]!, alive);
+
+  // ---- M4a: ability HUD, flash overlay, ability world-entities, agent select ----
+  abilityHud.update({
+    agentId: state.agentId[localIndex]!,
+    charges: [
+      state.abilityCharges[localIndex * 4 + 0]!,
+      state.abilityCharges[localIndex * 4 + 1]!,
+      state.abilityCharges[localIndex * 4 + 2]!,
+      state.abilityCharges[localIndex * 4 + 3]!,
+    ],
+    ultPoints: state.ultPoints[localIndex]!,
+  });
+  const flashedTicksLeft = Math.max(0, state.flashedUntilTick[localIndex]! - state.tick);
+  flashOverlay.update(flashedTicksLeft, state.flashIntensity[localIndex]!);
+  abilityEntities.sync(state);
+
+  const inWaitingPhase = state.mode === MODE_MATCH && state.matchPhase === PHASE_WAITING;
+  agentSelect.setOpen(inWaitingPhase);
+  if (inWaitingPhase) {
+    const picks = Array.from(state.agentId);
+    const teams = Array.from(state.team);
+    agentSelect.setPicks(picks, teams, localIndex, state.agentId[localIndex]!);
+  }
 
   if (state.mode !== MODE_MATCH) {
     matchHud.update({

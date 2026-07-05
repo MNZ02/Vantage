@@ -49,6 +49,24 @@ export interface AuthoritativePlayerState {
   respawnTicksLeft: number;
   /** M3: 0 attackers, 1 defenders, 255 unassigned (TEAM_NONE). */
   team: number;
+  // ---- M4a ----
+  agentId: number;
+  ultPoints: number;
+  flashedTicksLeft: number;
+  flashIntensity: number;
+  abilityCharges: readonly [number, number, number, number];
+}
+
+/** M4a: one live ability world-entity, mirroring @vg/protocol's SnapshotAbilityEntity. */
+export interface AuthoritativeAbilityEntity {
+  entType: number;
+  owner: number;
+  abilityId: number;
+  x: number;
+  y: number;
+  z: number;
+  endTicksLeft: number;
+  param: number;
 }
 
 /**
@@ -81,6 +99,8 @@ export interface AuthoritativeSnapshot {
   lastProcessedSeq: number;
   players: readonly AuthoritativePlayerState[];
   match?: AuthoritativeMatchSection;
+  /** M4a: full ability world-entity list (projectiles/smokes/walls/zones/recon darts/orbs) — always authoritative-overwrite, same treatment as the match section (see reconcile()'s doc comment on why this is safe for the local player's own in-flight casts too: determinism means they should already match, mod f32 quantization). */
+  abilityEntities?: readonly AuthoritativeAbilityEntity[];
 }
 
 export interface Vec3 {
@@ -266,6 +286,69 @@ export class PredictedClient {
       if (base.equipEndTick[i] !== -1) base.equipEndTick[i] = base.equipEndTick[i]! + tickOffset;
       // respawnTick is set directly from the snapshot below (when present)
       // in the new tick frame already; no separate shift needed for it.
+
+      // M4a: same absolute-tick rebasing rule applies to every unconfirmed
+      // (never sent over the wire) ability timer compared against
+      // state.tick — a pending cast's ready tick, a signature's in-progress
+      // recharge deadline, and Rail's activation-window close time.
+      if (base.pendingReadyTick[i] !== -1) base.pendingReadyTick[i] = base.pendingReadyTick[i]! + tickOffset;
+      if (base.signatureRechargeEndTick[i] !== -1) base.signatureRechargeEndTick[i] = base.signatureRechargeEndTick[i]! + tickOffset;
+      if (base.ultWindowEndTick[i] !== -1) base.ultWindowEndTick[i] = base.ultWindowEndTick[i]! + tickOffset;
+    }
+
+    // M4a: ability world-entities are global (not owned per-player in the
+    // sense combat state is), so — like the match section — position/type/
+    // param/lifetime are a straight authoritative overwrite rather than a
+    // partial-confirmation merge. This also correctly seeds OTHER players'
+    // in-flight casts (never predicted locally, since stepLocalOnly only
+    // ever feeds real input to the local player — every other player's
+    // tick() input is `undefined`, so their casts never spawn entities in
+    // this client's own forward prediction) without disturbing the local
+    // player's own cast entities, whose position should already match
+    // bit-for-bit (mod f32 wire quantization) thanks to determinism.
+    //
+    // Deliberately NOT overwritten (documented limitation): entVelX/Y/Z.
+    // The wire format carries no velocity at all (bandwidth), so a
+    // reconciled projectile's true in-flight velocity is unknowable here —
+    // left as whatever `base` already had (the client's own prior
+    // prediction) rather than zeroed, since entVelX/Z is ALSO how a
+    // stationary wall box's long-axis orientation rides along (see @vg/sim
+    // abilities/entities.ts wallBoxFromEntity) and zeroing it would corrupt
+    // a remote-cast wall's collision shape on this client. A brand-new
+    // remote entity this client has never seen before defaults to 0/0/0
+    // (createState's initial fill) — for a wall that means "assume
+    // Z-aligned" until the *next* full state rebuild (e.g. a fresh
+    // PredictedClient), a narrow, accepted gap given the wire budget.
+    // entSpawnTick isn't on the wire either (only ticks-*remaining*,
+    // endTicksLeft) — approximated as "spawned this instant", which only
+    // matters for a still-flying projectile very close to its
+    // maxFlightTicks safety fuse.
+    if (snapshot.abilityEntities) {
+      const n = base.entType.length;
+      for (let e = 0; e < n; e++) {
+        const ent = snapshot.abilityEntities[e];
+        if (!ent) {
+          base.entType[e] = 0; // ENT_NONE
+          base.entOwner[e] = 255;
+          base.entAbilityId[e] = 0;
+          base.entX[e] = 0;
+          base.entY[e] = 0;
+          base.entZ[e] = 0;
+          base.entSpawnTick[e] = 0;
+          base.entEndTick[e] = -1;
+          base.entParam[e] = 0;
+          continue;
+        }
+        base.entType[e] = ent.entType;
+        base.entOwner[e] = ent.owner;
+        base.entAbilityId[e] = ent.abilityId;
+        base.entX[e] = ent.x;
+        base.entY[e] = ent.y;
+        base.entZ[e] = ent.z;
+        base.entSpawnTick[e] = snapshot.serverTick;
+        base.entEndTick[e] = ent.endTicksLeft > 0 ? snapshot.serverTick + ent.endTicksLeft : -1;
+        base.entParam[e] = ent.param;
+      }
     }
     for (let i = 0; i < numPlayers; i++) {
       const p = snapshot.players[i];
@@ -293,8 +376,21 @@ export class PredictedClient {
       base.respawnTick[i] = p.alive ? -1 : snapshot.serverTick + p.respawnTicksLeft;
       base.team[i] = p.team;
 
+      // M4a: agentId/ultPoints/flash/abilityCharges are ALL sent for every
+      // player every snapshot (no "active slot only" partial-confirmation
+      // rule like ammo has — see @vg/protocol's module doc comment), so
+      // these are straight overwrites too.
+      base.agentId[i] = p.agentId;
+      base.ultPoints[i] = p.ultPoints;
+      base.flashedUntilTick[i] = p.flashedTicksLeft > 0 ? snapshot.serverTick + p.flashedTicksLeft : 0;
+      base.flashIntensity[i] = p.flashIntensity;
+      base.abilityCharges[i * 4 + 0] = p.abilityCharges[0];
+      base.abilityCharges[i * 4 + 1] = p.abilityCharges[1];
+      base.abilityCharges[i * 4 + 2] = p.abilityCharges[2];
+      base.abilityCharges[i * 4 + 3] = p.abilityCharges[3];
+
       // Only the confirmed *active* slot's ammo is authoritative; the other
-      // slot keeps whatever this client already predicted (see doc comment).
+      // slot(s) keep whatever this client already predicted (see doc comment).
       if (p.weaponPrimary === WEAPON_NONE) {
         base.magPrimary[i] = 0;
         base.reservePrimary[i] = 0;
@@ -302,9 +398,12 @@ export class PredictedClient {
       if (p.activeSlot === 0) {
         base.magPrimary[i] = p.magActive;
         base.reservePrimary[i] = p.reserveActive;
-      } else {
+      } else if (p.activeSlot === 1) {
         base.magSecondary[i] = p.magActive;
         base.reserveSecondary[i] = p.reserveActive;
+      } else {
+        // activeSlot 2 = ult weapon (Blades/Rail) — see @vg/sim weapons/logic.ts.
+        base.magUlt[i] = p.magActive;
       }
     }
 

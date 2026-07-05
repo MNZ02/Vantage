@@ -150,3 +150,13 @@ export const BARRIERS: ReadonlyArray<{ box: Box; team: 0 | 1 }> = [
   { box: box([0, 1.5, -8], [FLOOR_SIZE, 3, 1]), team: 0 }, // blocks attackers from pushing north past z=-8
   { box: box([0, 1.5, 8], [FLOOR_SIZE, 3, 1]), team: 1 }, // blocks defenders from pushing south past z=8
 ];
+
+/**
+ * M4a: fixed ult-orb pickup spots, one off to each side of mid, clear of
+ * existing geometry and both site zones. Orbs respawn at every round start
+ * (see match.ts's enterBuyPhase ability-reset hook) and are removed on pickup.
+ */
+export const ORB_SPOTS: ReadonlyArray<{ x: number; y: number; z: number }> = [
+  { x: -10, y: 0, z: 0 },
+  { x: 10, y: 0, z: 0 },
+];

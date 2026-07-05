@@ -1,4 +1,5 @@
 import {
+  AGENT_NONE,
   DEFAULT_BUY_TICKS,
   DEFAULT_DEFUSE_CHECKPOINT_TICKS,
   DEFAULT_DEFUSE_TICKS,
@@ -13,6 +14,8 @@ import {
   DEFAULT_SPIKE_TICKS,
   DEFAULT_WIN_CREDITS,
   DEFAULT_WIN_TARGET,
+  ENT_NONE,
+  MAX_ABILITY_ENTITIES,
   MAX_CREDITS,
   MAX_PLAYERS,
   MODE_DM,
@@ -57,6 +60,11 @@ export interface InputFrame {
   readonly interact: boolean;
   /** Edge-triggered: cast a map ping (server-only concern — sim's tick() never reads this field). */
   readonly ping: boolean;
+  /** M4a, edge-triggered: cast the agent's basic1/basic2/signature/ult ability. See abilities/logic.ts. */
+  readonly ability1: boolean;
+  readonly ability2: boolean;
+  readonly signature: boolean;
+  readonly ult: boolean;
 }
 
 export function defaultInput(yaw = 0, pitch = 0): InputFrame {
@@ -75,7 +83,23 @@ export function defaultInput(yaw = 0, pitch = 0): InputFrame {
     slot2: false,
     interact: false,
     ping: false,
+    ability1: false,
+    ability2: false,
+    signature: false,
+    ult: false,
   };
+}
+
+/** One ability event this tick, as returned by tick(). Effects on players (damage/flash/slow/reveal/heal/res) are applied ONLY server-side (see abilities/effects.ts), never inside tick(). */
+export interface AbilityEvent {
+  readonly kind: "cast" | "detonate" | "pulse" | "expire";
+  readonly owner: number;
+  readonly abilityId: number;
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  /** Recon dart/pulse: which entity slot this came from (-1 if n/a), so the server can track per-dart pulse counts if needed. */
+  readonly entitySlot: number;
 }
 
 /** One shot fired this tick, as returned by tick(). Damage/hit resolution happens server-side, outside tick(). */
@@ -234,6 +258,56 @@ export interface SimState {
   readonly secondaryPurchasedItemId: Uint8Array;
   /** Armor item id purchased this buy phase (BUY_ITEM_LIGHT_ARMOR/BUY_ITEM_HEAVY_ARMOR), or 255 (NO_PLAYER-reused sentinel) if none. */
   readonly armorPurchasedItemId: Uint8Array;
+
+  // ---- M4a abilities/agents ----
+  /** AGENT_NONE (255) until picked (see abilities/effects.ts selectAgent). */
+  readonly agentId: Uint8Array;
+  readonly ultPoints: Uint8Array;
+  /** Flat [playerIndex*4 + slot] charge counts for ABILITY_SLOT_BASIC1/BASIC2/SIGNATURE (slot 3/ult is gated by ultPoints instead and always reads 0 here). */
+  readonly abilityCharges: Uint8Array;
+  /** Absolute tick the player's signature ability's NEXT charge finishes recharging, or -1 if already at max/no signature recharge in progress. */
+  readonly signatureRechargeEndTick: Int32Array;
+  /** Absolute tick a flash (if any) expires; compare against currentTick, not a countdown. 0 = never flashed / expired. */
+  readonly flashedUntilTick: Int32Array;
+  /** FLASH_NONE/HALF/FULL, valid only while currentTick < flashedUntilTick. */
+  readonly flashIntensity: Uint8Array;
+  /** Zephyr only: kills since the last free Dash-charge re-earn (see abilities/logic.ts killsToRefresh). */
+  readonly dashKillCounter: Uint8Array;
+  /** Ult-weapon (Blades/Rail) charge count while activeSlot === 2; unused (0) otherwise. */
+  readonly magUlt: Uint8Array;
+  /** Rail only: absolute tick its 3-shot activation window closes, or -1 if not active. */
+  readonly ultWindowEndTick: Int32Array;
+  /** Bitmask of ability1/ability2/signature/ult from the previous tick's input, for edge detection (see abilities/logic.ts). */
+  readonly prevAbilityButtons: Uint8Array;
+
+  // ---- M4a pending (cast-delayed) ability resolution — at most one in flight per player ----
+  /** 255 = no pending cast. Charge/ult-points cost is deducted at cast time, not resolve time (Valorant locks it in on cast attempt). */
+  readonly pendingAbilityId: Uint8Array;
+  /** Absolute tick the pending cast resolves, or -1 if none pending. */
+  readonly pendingReadyTick: Int32Array;
+  readonly pendingOriginX: Float64Array;
+  readonly pendingOriginY: Float64Array;
+  readonly pendingOriginZ: Float64Array;
+  readonly pendingYaw: Float64Array;
+  /** Resurrect only: the dead teammate index chosen at cast time, re-validated at resolve time. NO_PLAYER otherwise. */
+  readonly pendingTargetIndex: Uint8Array;
+
+  // ---- M4a ability world-entities (projectiles, smokes, walls, zones, recon darts, ult orbs) ----
+  readonly entType: Uint8Array;
+  readonly entOwner: Uint8Array;
+  readonly entAbilityId: Uint8Array;
+  readonly entX: Float64Array;
+  readonly entY: Float64Array;
+  readonly entZ: Float64Array;
+  /** Flight velocity while entType===ENT_PROJECTILE; reused as a fixed (unit-ish) long-axis direction vector for stationary ENT_WALL_BOX entities (see abilities/entities.ts) — never both at once for the same entity. */
+  readonly entVelX: Float64Array;
+  readonly entVelY: Float64Array;
+  readonly entVelZ: Float64Array;
+  readonly entSpawnTick: Int32Array;
+  /** Meaning depends on entType: smoke/zone/wall/orb-respawn = expiry tick; reconDart = next-pulse-due tick; projectile = flight-timeout deadline. */
+  readonly entEndTick: Int32Array;
+  /** Meaning depends on entType: wallBox = current HP; reconDart = pulses remaining; otherwise unused (0). */
+  readonly entParam: Int32Array;
 }
 
 const ADS_BIT = 1 << 0;
@@ -360,6 +434,38 @@ function createStateInternal(seed: number, numPlayers: number, mode: number, con
     primaryPurchasedItemId: new Uint8Array(numPlayers).fill(WEAPON_NONE),
     secondaryPurchasedItemId: new Uint8Array(numPlayers).fill(WEAPON_NONE),
     armorPurchasedItemId: new Uint8Array(numPlayers).fill(NO_PLAYER),
+
+    agentId: new Uint8Array(numPlayers).fill(AGENT_NONE),
+    ultPoints: new Uint8Array(numPlayers),
+    abilityCharges: new Uint8Array(numPlayers * 4),
+    signatureRechargeEndTick: new Int32Array(numPlayers).fill(-1),
+    flashedUntilTick: new Int32Array(numPlayers),
+    flashIntensity: new Uint8Array(numPlayers),
+    dashKillCounter: new Uint8Array(numPlayers),
+    magUlt: new Uint8Array(numPlayers),
+    ultWindowEndTick: new Int32Array(numPlayers).fill(-1),
+    prevAbilityButtons: new Uint8Array(numPlayers),
+
+    pendingAbilityId: new Uint8Array(numPlayers).fill(255),
+    pendingReadyTick: new Int32Array(numPlayers).fill(-1),
+    pendingOriginX: new Float64Array(numPlayers),
+    pendingOriginY: new Float64Array(numPlayers),
+    pendingOriginZ: new Float64Array(numPlayers),
+    pendingYaw: new Float64Array(numPlayers),
+    pendingTargetIndex: new Uint8Array(numPlayers).fill(NO_PLAYER),
+
+    entType: new Uint8Array(MAX_ABILITY_ENTITIES).fill(ENT_NONE),
+    entOwner: new Uint8Array(MAX_ABILITY_ENTITIES).fill(NO_PLAYER),
+    entAbilityId: new Uint8Array(MAX_ABILITY_ENTITIES),
+    entX: new Float64Array(MAX_ABILITY_ENTITIES),
+    entY: new Float64Array(MAX_ABILITY_ENTITIES),
+    entZ: new Float64Array(MAX_ABILITY_ENTITIES),
+    entVelX: new Float64Array(MAX_ABILITY_ENTITIES),
+    entVelY: new Float64Array(MAX_ABILITY_ENTITIES),
+    entVelZ: new Float64Array(MAX_ABILITY_ENTITIES),
+    entSpawnTick: new Int32Array(MAX_ABILITY_ENTITIES),
+    entEndTick: new Int32Array(MAX_ABILITY_ENTITIES),
+    entParam: new Int32Array(MAX_ABILITY_ENTITIES),
   };
 }
 
@@ -440,6 +546,38 @@ export function cloneState(state: SimState): SimState {
     primaryPurchasedItemId: state.primaryPurchasedItemId.slice(),
     secondaryPurchasedItemId: state.secondaryPurchasedItemId.slice(),
     armorPurchasedItemId: state.armorPurchasedItemId.slice(),
+
+    agentId: state.agentId.slice(),
+    ultPoints: state.ultPoints.slice(),
+    abilityCharges: state.abilityCharges.slice(),
+    signatureRechargeEndTick: state.signatureRechargeEndTick.slice(),
+    flashedUntilTick: state.flashedUntilTick.slice(),
+    flashIntensity: state.flashIntensity.slice(),
+    dashKillCounter: state.dashKillCounter.slice(),
+    magUlt: state.magUlt.slice(),
+    ultWindowEndTick: state.ultWindowEndTick.slice(),
+    prevAbilityButtons: state.prevAbilityButtons.slice(),
+
+    pendingAbilityId: state.pendingAbilityId.slice(),
+    pendingReadyTick: state.pendingReadyTick.slice(),
+    pendingOriginX: state.pendingOriginX.slice(),
+    pendingOriginY: state.pendingOriginY.slice(),
+    pendingOriginZ: state.pendingOriginZ.slice(),
+    pendingYaw: state.pendingYaw.slice(),
+    pendingTargetIndex: state.pendingTargetIndex.slice(),
+
+    entType: state.entType.slice(),
+    entOwner: state.entOwner.slice(),
+    entAbilityId: state.entAbilityId.slice(),
+    entX: state.entX.slice(),
+    entY: state.entY.slice(),
+    entZ: state.entZ.slice(),
+    entVelX: state.entVelX.slice(),
+    entVelY: state.entVelY.slice(),
+    entVelZ: state.entVelZ.slice(),
+    entSpawnTick: state.entSpawnTick.slice(),
+    entEndTick: state.entEndTick.slice(),
+    entParam: state.entParam.slice(),
   };
 }
 
@@ -511,6 +649,35 @@ export function serializeState(state: SimState): string {
     `primaryPurchasedItemId:${Array.from(state.primaryPurchasedItemId).join(",")}`,
     `secondaryPurchasedItemId:${Array.from(state.secondaryPurchasedItemId).join(",")}`,
     `armorPurchasedItemId:${Array.from(state.armorPurchasedItemId).join(",")}`,
+    `agentId:${Array.from(state.agentId).join(",")}`,
+    `ultPoints:${Array.from(state.ultPoints).join(",")}`,
+    `abilityCharges:${Array.from(state.abilityCharges).join(",")}`,
+    `signatureRechargeEndTick:${Array.from(state.signatureRechargeEndTick).join(",")}`,
+    `flashedUntilTick:${Array.from(state.flashedUntilTick).join(",")}`,
+    `flashIntensity:${Array.from(state.flashIntensity).join(",")}`,
+    `dashKillCounter:${Array.from(state.dashKillCounter).join(",")}`,
+    `magUlt:${Array.from(state.magUlt).join(",")}`,
+    `ultWindowEndTick:${Array.from(state.ultWindowEndTick).join(",")}`,
+    `prevAbilityButtons:${Array.from(state.prevAbilityButtons).join(",")}`,
+    `pendingAbilityId:${Array.from(state.pendingAbilityId).join(",")}`,
+    `pendingReadyTick:${Array.from(state.pendingReadyTick).join(",")}`,
+    `pendingOriginX:${Array.from(state.pendingOriginX).join(",")}`,
+    `pendingOriginY:${Array.from(state.pendingOriginY).join(",")}`,
+    `pendingOriginZ:${Array.from(state.pendingOriginZ).join(",")}`,
+    `pendingYaw:${Array.from(state.pendingYaw).join(",")}`,
+    `pendingTargetIndex:${Array.from(state.pendingTargetIndex).join(",")}`,
+    `entType:${Array.from(state.entType).join(",")}`,
+    `entOwner:${Array.from(state.entOwner).join(",")}`,
+    `entAbilityId:${Array.from(state.entAbilityId).join(",")}`,
+    `entX:${Array.from(state.entX).join(",")}`,
+    `entY:${Array.from(state.entY).join(",")}`,
+    `entZ:${Array.from(state.entZ).join(",")}`,
+    `entVelX:${Array.from(state.entVelX).join(",")}`,
+    `entVelY:${Array.from(state.entVelY).join(",")}`,
+    `entVelZ:${Array.from(state.entVelZ).join(",")}`,
+    `entSpawnTick:${Array.from(state.entSpawnTick).join(",")}`,
+    `entEndTick:${Array.from(state.entEndTick).join(",")}`,
+    `entParam:${Array.from(state.entParam).join(",")}`,
   ];
   return parts.join("|");
 }
