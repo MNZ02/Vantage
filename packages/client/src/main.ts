@@ -1,11 +1,27 @@
 import * as THREE from "three";
-import { EYE_HEIGHT_CROUCH, EYE_HEIGHT_STAND, FIXED_DT, createState, tick, type SimState } from "@vg/sim";
-import { buildInputFrame, getPitch, getYaw, setupInput } from "./input.js";
+import {
+  EYE_HEIGHT_CROUCH,
+  EYE_HEIGHT_STAND,
+  FIXED_DT,
+  WEAPON_NONE,
+  createState,
+  eyePosition,
+  getWeaponDef,
+  shotDirection,
+  tick,
+  viewDirection,
+  type SimState,
+} from "@vg/sim";
+import { buildInputFrame, getPitch, getYaw, onBuyKeyPressed, onBuyMenuToggle, setLookSensitivityMultiplier, setupInput } from "./input.js";
 import { GRAYBOX_BOXES, SPAWN_POSITION } from "./graybox.js";
 import {
+  createBuyMenu,
+  createCombatHud,
+  createDamageDirectionIndicator,
   createFpsCounter,
   createHitFlashOverlay,
   createHitmarker,
+  createKillFeed,
   createRemotePlayerProxy,
   createScene,
   buildGrayboxMeshes,
@@ -22,9 +38,24 @@ buildGrayboxMeshes(scene, GRAYBOX_BOXES);
 const fpsCounter = createFpsCounter();
 const hitFlash = createHitFlashOverlay();
 const hitmarker = createHitmarker();
+const killFeed = createKillFeed((i) => `P${i}`);
+const damageIndicator = createDamageDirectionIndicator();
+const combatHud = createCombatHud();
 
 let netClient: NetClient | null = null;
 const remoteProxies = new Map<number, RemotePlayerProxy>();
+const remoteLastMagActive = new Map<number, number>();
+
+const buyMenu = createBuyMenu((itemId) => {
+  netClient?.buy(itemId);
+});
+onBuyMenuToggle((open) => buyMenu.setOpen(open));
+onBuyKeyPressed((digit) => {
+  // Rows are numbered 1..8 in createBuyMenu's item order (6 weapons + 2 armors).
+  const itemIds = [0, 1, 2, 3, 4, 5, 200, 201];
+  const itemId = itemIds[digit - 1];
+  if (itemId !== undefined) netClient?.buy(itemId);
+});
 
 // ---- Offline (M0) fallback state — used only if connecting fails/times out. ----
 let offlineState: SimState | null = null;
@@ -43,15 +74,27 @@ function startOffline(): void {
 connectNetClient().then((client) => {
   if (client) {
     netClient = client;
-    client.onHit(({ youAreShooter, youAreTarget }) => {
-      if (youAreShooter) {
-        hitmarker.show();
-        // eslint-disable-next-line no-console
-        console.log("[hit] confirmed hit");
+    client.onPredictedHit(() => {
+      hitmarker.showPredicted();
+    });
+    client.onConfirmedHit(({ damage }) => {
+      hitmarker.showConfirmed(damage);
+    });
+    client.onDamageTaken(({ attackerIndex }) => {
+      hitFlash.flash();
+      const localIndex = netClient?.getLocalIndex();
+      const state = netClient?.getPredictedState();
+      if (localIndex !== null && localIndex !== undefined && state) {
+        // Screen-relative angle from the local player's current yaw toward the attacker.
+        const dx = state.posX[attackerIndex]! - state.posX[localIndex]!;
+        const dz = state.posZ[attackerIndex]! - state.posZ[localIndex]!;
+        const worldAngle = Math.atan2(dx, dz);
+        const screenAngle = worldAngle - getYaw();
+        damageIndicator.show(screenAngle);
       }
-      if (youAreTarget) {
-        hitFlash.flash();
-      }
+    });
+    client.onKillEvent((e) => {
+      killFeed.push(e);
     });
     // eslint-disable-next-line no-console
     console.log("[net] connected, playing online");
@@ -96,6 +139,7 @@ function syncRemoteProxies(): void {
         proxy.dispose(scene);
         remoteProxies.delete(i);
       }
+      remoteLastMagActive.delete(i);
       continue;
     }
     if (!proxy) {
@@ -103,7 +147,96 @@ function syncRemoteProxies(): void {
       remoteProxies.set(i, proxy);
     }
     proxy.setPose(pose);
+
+    // Remote shot tracer heuristic: active-slot ammo decreased since the
+    // last check -> they fired (see interpolation.ts's RemotePose.magActive
+    // doc comment for why this proxies shotCounter, which isn't on the wire).
+    const prevMag = remoteLastMagActive.get(i);
+    if (prevMag !== undefined && pose.magActive < prevMag && pose.alive) {
+      const from = new THREE.Vector3(pose.posX, pose.posY + EYE_HEIGHT_STAND, pose.posZ);
+      const dir = viewDirection(pose.yaw, pose.pitch);
+      const to = from.clone().add(new THREE.Vector3(dir.x, dir.y, dir.z).multiplyScalar(50));
+      spawnTracer(scene, from, to, 100);
+    }
+    remoteLastMagActive.set(i, pose.magActive);
   }
+}
+
+/** FOV smoothing state for ADS zoom (see updateAds()). */
+let currentFov = 90;
+let adsSensitivityMult = 1;
+
+function zoomForStage(weaponId: number, adsStage: number): number {
+  if (adsStage === 0) return 1;
+  const weapon = getWeaponDef(weaponId);
+  if (!weapon) return 1;
+  return weapon.adsZoomStages[adsStage - 1] ?? 1;
+}
+
+function updateAds(frameSeconds: number): void {
+  if (!netClient) return;
+  const localIndex = netClient.getLocalIndex();
+  const state = netClient.getPredictedState();
+  if (localIndex === null || !state) return;
+
+  const weaponId = state.activeSlot[localIndex] === 0 ? state.weaponPrimary[localIndex]! : state.weaponSecondary[localIndex]!;
+  const zoom = weaponId === WEAPON_NONE ? 1 : zoomForStage(weaponId, state.adsStage[localIndex]!);
+  const targetFov = 90 / zoom;
+
+  // ~100ms smoothing: exponential approach with a time-constant tuned so it
+  // visually settles in roughly that window.
+  const smoothing = 1 - Math.exp(-frameSeconds / 0.05);
+  currentFov = lerp(currentFov, targetFov, smoothing);
+  camera.fov = currentFov;
+  camera.updateProjectionMatrix();
+
+  adsSensitivityMult = 1 / zoom; // sensitivity scales down proportionally to zoom while ADS
+  setLookSensitivityMultiplier(adsSensitivityMult);
+}
+
+function fireLocalTracersAndHitmarkers(): void {
+  if (!netClient) return;
+  const localIndex = netClient.getLocalIndex();
+  const state = netClient.getPredictedState();
+  if (localIndex === null || !state) return;
+  const shots = netClient.getLastLocalShots();
+  if (shots.length === 0) return;
+
+  const origin = eyePosition(state, localIndex);
+  for (const shot of shots) {
+    const weapon = getWeaponDef(shot.weaponId);
+    if (!weapon) continue;
+    const dir = shotDirection(state, localIndex, weapon, shot.shotIndex, shot.sprayIndex);
+    const from = new THREE.Vector3(origin.x, origin.y, origin.z);
+    const to = from.clone().add(new THREE.Vector3(dir.x, dir.y, dir.z).multiplyScalar(50));
+    spawnTracer(scene, from, to, 80);
+  }
+}
+
+function updateHud(): void {
+  if (!netClient) return;
+  const localIndex = netClient.getLocalIndex();
+  const state = netClient.getPredictedState();
+  if (localIndex === null || !state) return;
+
+  const weaponId = state.activeSlot[localIndex] === 0 ? state.weaponPrimary[localIndex]! : state.weaponSecondary[localIndex]!;
+  const weapon = getWeaponDef(weaponId);
+  const mag = state.activeSlot[localIndex] === 0 ? state.magPrimary[localIndex]! : state.magSecondary[localIndex]!;
+  const reserve = state.activeSlot[localIndex] === 0 ? state.reservePrimary[localIndex]! : state.reserveSecondary[localIndex]!;
+  const alive = state.alive[localIndex] === 1;
+  const respawnTicksLeft = alive ? 0 : Math.max(0, state.respawnTick[localIndex]! - state.tick);
+
+  combatHud.update({
+    health: state.health[localIndex]!,
+    armor: state.armor[localIndex]!,
+    weaponName: weapon?.name ?? "none",
+    magAmmo: mag,
+    reserveAmmo: reserve,
+    credits: state.credits[localIndex]!,
+    alive,
+    respawnSecondsLeft: respawnTicksLeft * FIXED_DT,
+  });
+  buyMenu.setState(state.credits[localIndex]!, alive);
 }
 
 function frame(now: number): void {
@@ -120,16 +253,12 @@ function frame(now: number): void {
   let renderY = 0;
   let renderZ = 0;
   let eyeHeight = EYE_HEIGHT_STAND;
-  let fired = false;
 
   if (netClient && netClient.isOnline()) {
     while (accumulator >= FIXED_DT) {
       const input = buildInputFrame();
       netClient.sendInput(input);
-      if (input.fire) {
-        netClient.fire();
-        fired = true;
-      }
+      fireLocalTracersAndHitmarkers();
       accumulator -= FIXED_DT;
     }
     const pos = netClient.getLocalRenderPosition();
@@ -140,11 +269,13 @@ function frame(now: number): void {
     }
     eyeHeight = netClient.isLocalCrouching() ? EYE_HEIGHT_CROUCH : EYE_HEIGHT_STAND;
     syncRemoteProxies();
+    updateAds(frameSeconds);
+    updateHud();
   } else if (offlineState && offlinePreviousState) {
     while (accumulator >= FIXED_DT) {
       offlinePreviousState = offlineState;
-      const input = buildInputFrame();
-      offlineState = tick(offlineState, [input], GRAYBOX_BOXES);
+      const input = buildInputFrame(); // already zeroes movement/actions while the buy menu is open
+      offlineState = tick(offlineState, [input], GRAYBOX_BOXES).state;
       accumulator -= FIXED_DT;
     }
     const alpha = accumulator / FIXED_DT;
@@ -163,13 +294,6 @@ function frame(now: number): void {
   camera.rotation.y = getYaw() + Math.PI;
   camera.rotation.x = getPitch();
 
-  if (fired) {
-    const dir = camera.getWorldDirection(new THREE.Vector3());
-    const from = camera.position.clone();
-    const to = from.clone().addScaledVector(dir, 50);
-    spawnTracer(scene, from, to, 100);
-  }
-
   renderer.render(scene, camera);
 
   if (frameSeconds > 0) {
@@ -177,11 +301,13 @@ function frame(now: number): void {
   }
   if (netClient && netClient.isOnline()) {
     const hud = netClient.getHud();
+    const hitreg = netClient.getHitRegStats();
     fpsCounter.updateExtra([
       `rtt: ${hud.rttMs !== null ? hud.rttMs.toFixed(0) + "ms" : "--"}`,
       `snapshot age: ${hud.snapshotAgeMs.toFixed(0)}ms`,
       `corrections/s: ${hud.correctionsPerSecond.toFixed(1)}`,
       `interp starved frames: ${hud.starvedFrames}`,
+      `hitreg agree: ${hitreg.agreementPercent.toFixed(1)}% (n=${hitreg.totalResolved})`,
     ]);
   } else {
     fpsCounter.updateExtra(["offline (single-player)"]);

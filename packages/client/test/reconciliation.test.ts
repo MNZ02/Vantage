@@ -1,9 +1,9 @@
-import { createLoopbackPair, createVirtualClock, decodeMessage, MessageType, withLatency, type SnapshotMessage } from "@vg/protocol";
+import { createLoopbackPair, createVirtualClock, decodeMessage, MessageType, withLatency } from "@vg/protocol";
 import { FIXED_DT, LEVEL_BOXES, type InputFrame } from "@vg/sim";
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
-import { PredictedClient, type AuthoritativeSnapshot } from "../src/prediction.js";
-import { createScriptedInputSender } from "./testUtils.js";
+import { PredictedClient } from "../src/prediction.js";
+import { createScriptedInputSender, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
 
@@ -26,25 +26,10 @@ function scriptedInput(t: number): InputFrame {
     crouch: t % 300 < 40,
     walk: false,
     fire: false,
-  };
-}
-
-function toAuthoritative(msg: SnapshotMessage): AuthoritativeSnapshot {
-  return {
-    serverTick: msg.serverTick,
-    lastProcessedSeq: msg.lastProcessedSeq,
-    players: msg.players.map((pl) => ({
-      posX: pl.posX,
-      posY: pl.posY,
-      posZ: pl.posZ,
-      velX: pl.velX,
-      velY: pl.velY,
-      velZ: pl.velZ,
-      yaw: pl.yaw,
-      pitch: pl.pitch,
-      crouching: pl.crouching,
-      grounded: pl.grounded,
-    })),
+    ads: false,
+    reload: false,
+    slot1: false,
+    slot2: false,
   };
 }
 

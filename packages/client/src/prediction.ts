@@ -1,13 +1,15 @@
 // Client-side prediction + reconciliation for the local player. Pure logic,
 // no DOM/rendering — net.ts wires this to the real WebSocket, tests wire it
 // to a loopback @vg/server ServerHost directly.
-import { createState, tick, type Box, type InputFrame, type SimState } from "@vg/sim";
+import { WEAPON_NONE, cloneState, createState, tick, type Box, type InputFrame, type ShotEvent, type SimState } from "@vg/sim";
 import { quantizeInputSample } from "@vg/protocol";
 
 /** Per-tick decay applied to the render-only correction offset (see reconcile()). */
 const CORRECTION_DECAY_PER_TICK = 0.85;
 /** Below this, a reconciliation diff is treated as noise and silently kept (no visible correction). */
 const RECONCILE_EPSILON_M = 1e-3;
+/** How many past (seq -> state) entries to retain for reconcile()'s base lookup — generous headroom over any realistic RTT+jitter-buffer depth. */
+const HISTORY_RETENTION = 512;
 
 export interface AuthoritativePlayerState {
   posX: number;
@@ -20,6 +22,19 @@ export interface AuthoritativePlayerState {
   pitch: number;
   crouching: boolean;
   grounded: boolean;
+  // M2 combat fields (mirror @vg/protocol SnapshotPlayer's confirmed subset).
+  alive: boolean;
+  activeSlot: number;
+  adsStage: number;
+  health: number;
+  armor: number;
+  weaponPrimary: number;
+  weaponSecondary: number;
+  magActive: number;
+  reserveActive: number;
+  tagTicksLeft: number;
+  credits: number;
+  respawnTicksLeft: number;
 }
 
 export interface AuthoritativeSnapshot {
@@ -40,13 +55,34 @@ export interface Vec3 {
  * (see interpolation.ts) — their slots in the predicted SimState are simply
  * left frozen at whatever the last snapshot said, since we never advance
  * them with real input.
+ *
+ * M2: weapon state (ammo, spray, ADS, reload, tag/land timers) rides along
+ * for free — it's just more fields on SimState that tick() already advances
+ * deterministically. The one wrinkle: Snapshot only confirms the *active*
+ * slot's ammo (bandwidth), never the inactive slot's — see reconcile()'s
+ * doc comment for how the inactive slot and shot-spray-only bookkeeping
+ * (shotCounter/sprayIndex/timers, never sent over the wire at all) are
+ * carried forward from the client's own prediction instead of being reset.
  */
 export class PredictedClient {
   private state: SimState;
   private readonly boxes: readonly Box[];
   private readonly localIndex: number;
   private readonly inputBuffer = new Map<number, InputFrame>();
+  /**
+   * The predicted state as it was right after each queueAndPredict() call,
+   * keyed by that call's seq — reconcile()'s base for fields the snapshot
+   * doesn't confirm (ammo, spray/fire timers) must come from THIS history at
+   * `lastProcessedSeq`, not from the *current* `this.state`: by the time a
+   * snapshot arrives, `this.state` already reflects having applied every
+   * buffered-and-about-to-be-replayed input once already, so carrying it
+   * forward as the replay base would double-apply them (double-firing shots,
+   * double-decrementing ammo, etc.) — a real bug caught by
+   * prediction-under-fire.test.ts.
+   */
+  private readonly stateHistory = new Map<number, SimState>();
   private nextSeq = 0;
+  private lastShots: ShotEvent[] = [];
 
   private correctionOffset: Vec3 = { x: 0, y: 0, z: 0 };
   /** Count of corrections whose diff exceeded the epsilon (for HUD "corrections/s"). */
@@ -75,10 +111,16 @@ export class PredictedClient {
     return this.localIndex;
   }
 
-  private stepLocalOnly(state: SimState, input: InputFrame): SimState {
+  /** ShotEvents fired by the local player on the most recent queueAndPredict() call (usually 0 or 1). */
+  getLastShots(): readonly ShotEvent[] {
+    return this.lastShots;
+  }
+
+  private stepLocalOnly(state: SimState, input: InputFrame): { state: SimState; shots: ShotEvent[] } {
     const inputs: (InputFrame | undefined)[] = new Array(state.numPlayers);
     inputs[this.localIndex] = input;
-    return tick(state, inputs as readonly InputFrame[], this.boxes);
+    const result = tick(state, inputs as readonly InputFrame[], this.boxes);
+    return { state: result.state, shots: result.shots.filter((s) => s.playerIndex === this.localIndex) };
   }
 
   /**
@@ -95,9 +137,22 @@ export class PredictedClient {
     const quantizedInput = quantizeInputSample(input);
     const seq = this.nextSeq++;
     this.inputBuffer.set(seq, quantizedInput);
-    this.state = this.stepLocalOnly(this.state, quantizedInput);
+    const result = this.stepLocalOnly(this.state, quantizedInput);
+    this.state = result.state;
+    this.lastShots = result.shots;
+    this.stateHistory.set(seq, this.state); // tick() always returns a fresh object, safe to keep by reference
+    this.pruneHistory();
     this.decayCorrection();
     return { seq, quantizedInput };
+  }
+
+  private pruneHistory(): void {
+    const cutoff = this.nextSeq - HISTORY_RETENTION;
+    if (cutoff <= 0) return;
+    for (const seq of this.stateHistory.keys()) {
+      if (seq < cutoff) this.stateHistory.delete(seq);
+      else break; // Map preserves insertion order, which is ascending seq order here
+    }
   }
 
   private decayCorrection(): void {
@@ -114,6 +169,19 @@ export class PredictedClient {
    * kept as-is (no-op) to avoid visible micro-jitter; otherwise the new
    * state is adopted and the *difference* is folded into a decaying
    * render-only offset so the displayed position doesn't snap.
+   *
+   * base starts as a CLONE of this client's OWN predicted state as it was at
+   * `snapshot.lastProcessedSeq` (see stateHistory) — not the current
+   * `this.state` — and only the fields the snapshot actually confirms are
+   * overwritten from it. This is what keeps reconciliation exact while
+   * reloading/switching weapons: Snapshot only ever carries the *active*
+   * slot's ammo and none of the shot-spray/fire-timer bookkeeping at all
+   * (see @vg/protocol SnapshotPlayer) — those un-confirmed fields must
+   * survive from the client's own prediction AT THAT POINT IN TIME, before
+   * any of the about-to-be-replayed buffered inputs were applied — using the
+   * *current* state instead would double-apply those inputs' weapon-state
+   * effects (double-firing a shot, double-decrementing ammo, ...) since the
+   * current state already reflects having applied them once, forward.
    */
   reconcile(snapshot: AuthoritativeSnapshot): number {
     for (const seq of Array.from(this.inputBuffer.keys())) {
@@ -121,8 +189,32 @@ export class PredictedClient {
     }
 
     const numPlayers = this.state.numPlayers;
-    let base = createState(0, numPlayers);
+    const historicalBase = this.stateHistory.get(snapshot.lastProcessedSeq);
+    const sourceForBase = historicalBase ?? this.state;
+    const base = cloneState(sourceForBase);
+    // Rebasing base.tick to the server's absolute tick numbering (below) is
+    // necessary (the server IS the authoritative clock), but every
+    // ABSOLUTE-tick-referencing weapon-timer field carried forward from
+    // sourceForBase (nextFireTick, reloadEndTick, equipEndTick — anything
+    // compared against state.tick, as opposed to a ticks-*remaining* counter
+    // like tagTicksLeft/landPenaltyTicksLeft, which need no adjustment) was
+    // computed in sourceForBase's OWN tick numbering. Left un-shifted, a
+    // rebase to a very different absolute tick (e.g. right after the
+    // server's jitter-buffer warm-up, where its tick count is already well
+    // ahead of the small number of local ticks this client has actually
+    // simulated) makes those timers compare against the wrong reference
+    // frame entirely — e.g. a fire-rate cooldown that should still be
+    // active reads as already-expired, letting a shot fire far too early.
+    // This was a real bug, caught by prediction-under-fire.test.ts.
+    const tickOffset = snapshot.serverTick - sourceForBase.tick;
     base.tick = snapshot.serverTick;
+    for (let i = 0; i < numPlayers; i++) {
+      base.nextFireTick[i] = base.nextFireTick[i]! + tickOffset;
+      if (base.reloadEndTick[i] !== -1) base.reloadEndTick[i] = base.reloadEndTick[i]! + tickOffset;
+      if (base.equipEndTick[i] !== -1) base.equipEndTick[i] = base.equipEndTick[i]! + tickOffset;
+      // respawnTick is set directly from the snapshot below (when present)
+      // in the new tick frame already; no separate shift needed for it.
+    }
     for (let i = 0; i < numPlayers; i++) {
       const p = snapshot.players[i];
       if (!p) continue;
@@ -136,32 +228,75 @@ export class PredictedClient {
       base.pitch[i] = p.pitch;
       base.crouching[i] = p.crouching ? 1 : 0;
       base.grounded[i] = p.grounded ? 1 : 0;
+
+      base.alive[i] = p.alive ? 1 : 0;
+      base.activeSlot[i] = p.activeSlot;
+      base.adsStage[i] = p.adsStage;
+      base.health[i] = p.health;
+      base.armor[i] = p.armor;
+      base.weaponPrimary[i] = p.weaponPrimary;
+      base.weaponSecondary[i] = p.weaponSecondary;
+      base.tagTicksLeft[i] = p.tagTicksLeft;
+      base.credits[i] = p.credits;
+      base.respawnTick[i] = p.alive ? -1 : snapshot.serverTick + p.respawnTicksLeft;
+
+      // Only the confirmed *active* slot's ammo is authoritative; the other
+      // slot keeps whatever this client already predicted (see doc comment).
+      if (p.weaponPrimary === WEAPON_NONE) {
+        base.magPrimary[i] = 0;
+        base.reservePrimary[i] = 0;
+      }
+      if (p.activeSlot === 0) {
+        base.magPrimary[i] = p.magActive;
+        base.reservePrimary[i] = p.reserveActive;
+      } else {
+        base.magSecondary[i] = p.magActive;
+        base.reserveSecondary[i] = p.reserveActive;
+      }
     }
 
     const remaining = Array.from(this.inputBuffer.entries()).sort((a, b) => a[0] - b[0]);
     let replayed = base;
-    for (const [, input] of remaining) {
-      replayed = this.stepLocalOnly(replayed, input);
+    let replayedShots: ShotEvent[] = [];
+    for (const [seq, input] of remaining) {
+      const result = this.stepLocalOnly(replayed, input);
+      replayed = result.state;
+      replayedShots = result.shots;
+      // Refresh stateHistory for every replayed seq: a later reconcile()
+      // call may look up one of these seqs as ITS base, and it must see
+      // this corrected trajectory, not whatever the original (now possibly
+      // superseded) forward-prediction pass had stored there.
+      this.stateHistory.set(seq, replayed);
     }
 
     const oldPos = this.getRenderPositionForState(this.state);
     const newPos = this.getRenderPositionForState(replayed);
     const diff = Math.hypot(newPos.x - oldPos.x, newPos.y - oldPos.y, newPos.z - oldPos.z);
 
-    if (diff < RECONCILE_EPSILON_M) {
-      return diff; // keep the old prediction untouched
+    // Below epsilon, skip the *visible* correction (fold nothing into the
+    // render offset — a sub-mm nudge would be imperceptible noise) but still
+    // ADOPT the replayed state. M2 correctness note: the position epsilon
+    // gate predates weapon state; a replay can legitimately correct
+    // ammo/spray/fire-timing fields (e.g. exactly which tick a shot's
+    // gating landed on) with *zero* position difference (imagine a
+    // corrected fire-rate timer while standing still) — discarding the
+    // replay whenever position happened to match would silently keep a
+    // stale/wrong weapon-state prediction forever. Position is what decides
+    // whether to show a *visible* correction; it must not decide whether to
+    // adopt the state at all.
+    if (diff >= RECONCILE_EPSILON_M) {
+      this.correctionsApplied++;
+      // Fold the jump into the render offset so getRenderPosition() is
+      // continuous at this instant, then let it decay each subsequent tick.
+      // Continuity requires renderAfter == renderBefore, i.e.
+      // newPos - offsetNew == oldPos - offsetOld, so offsetNew must be
+      // offsetOld + (newPos - oldPos) — *not* offsetOld + (oldPos - newPos).
+      this.correctionOffset.x += newPos.x - oldPos.x;
+      this.correctionOffset.y += newPos.y - oldPos.y;
+      this.correctionOffset.z += newPos.z - oldPos.z;
     }
-
-    this.correctionsApplied++;
-    // Fold the jump into the render offset so getRenderPosition() is
-    // continuous at this instant, then let it decay each subsequent tick.
-    // Continuity requires renderAfter == renderBefore, i.e.
-    // newPos - offsetNew == oldPos - offsetOld, so offsetNew must be
-    // offsetOld + (newPos - oldPos) — *not* offsetOld + (oldPos - newPos).
-    this.correctionOffset.x += newPos.x - oldPos.x;
-    this.correctionOffset.y += newPos.y - oldPos.y;
-    this.correctionOffset.z += newPos.z - oldPos.z;
     this.state = replayed;
+    this.lastShots = replayedShots;
     return diff;
   }
 

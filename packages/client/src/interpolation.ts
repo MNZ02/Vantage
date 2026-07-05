@@ -29,6 +29,23 @@ export interface RemotePose {
   crouching: boolean;
   grounded: boolean;
   connected: boolean;
+  alive: boolean;
+  weaponPrimary: number;
+  weaponSecondary: number;
+  activeSlot: number;
+  /**
+   * Active-slot ammo as of this pose (from Snapshot.magActive) — used as a
+   * "did they just fire?" heuristic for remote tracers (see main.ts): a
+   * decrease between successive raw snapshots (not interpolated samples)
+   * means a shot was fired (reloads only ever increase it). Deviation,
+   * stated plainly: the spec describes gating remote tracers on a
+   * `shotCounter` increment, but shotCounter is intentionally not on the
+   * wire (see @vg/protocol messages.ts) — it's pure local-prediction
+   * bookkeeping, never confirmed/broadcast. This magActive-delta heuristic
+   * is the closest observable proxy and is exact except for the rare case
+   * of a shot that doesn't consume ammo (there is none, currently).
+   */
+  magActive: number;
 }
 
 export interface RemoteInterpolatorOptions {
@@ -52,10 +69,15 @@ function lerpPose(a: RemotePose, b: RemotePose, t: number): RemotePose {
     posZ: a.posZ + (b.posZ - a.posZ) * t,
     yaw: a.yaw + wrapAngleDiff(a.yaw, b.yaw) * t,
     pitch: a.pitch + wrapAngleDiff(a.pitch, b.pitch) * t,
-    // Booleans don't lerp; use the later sample once we're at/past it.
+    // Booleans/discrete fields don't lerp; use the later sample once we're at/past it.
     crouching: t < 1 ? a.crouching : b.crouching,
     grounded: t < 1 ? a.grounded : b.grounded,
     connected: t < 1 ? a.connected : b.connected,
+    alive: t < 1 ? a.alive : b.alive,
+    weaponPrimary: t < 1 ? a.weaponPrimary : b.weaponPrimary,
+    weaponSecondary: t < 1 ? a.weaponSecondary : b.weaponSecondary,
+    activeSlot: t < 1 ? a.activeSlot : b.activeSlot,
+    magActive: t < 1 ? a.magActive : b.magActive,
   };
 }
 
@@ -87,7 +109,7 @@ export class RemoteInterpolator {
     return this.starvedFrames;
   }
 
-  /** The newest serverTick actually received so far (-1 if none yet); an integer, used e.g. for FireCmd.viewTick. */
+  /** The newest serverTick actually received so far (-1 if none yet); an integer. */
   getNewestTick(): number {
     return this.newestTick;
   }

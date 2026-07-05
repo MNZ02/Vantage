@@ -15,7 +15,20 @@ const FIXED_DT_MS = FIXED_DT * 1000;
 // exercise the interpolator's reconstruction fidelity.
 function strafeInput(t: number): InputFrame {
   const phase = Math.floor(t / 40) % 2;
-  return { forward: 0, right: phase === 0 ? 1 : -1, yaw: 0, pitch: 0, jump: t % 40 === 20, crouch: false, walk: false, fire: false };
+  return {
+    forward: 0,
+    right: phase === 0 ? 1 : -1,
+    yaw: 0,
+    pitch: 0,
+    jump: t % 40 === 20,
+    crouch: false,
+    walk: false,
+    fire: false,
+    ads: false,
+    reload: false,
+    slot1: false,
+    slot2: false,
+  };
 }
 
 /** Linearly interpolates the recorded ground-truth path to a fractional tick. */
@@ -35,6 +48,11 @@ function groundTruthAt(path: Map<number, RemotePose>, targetTick: number): Remot
     crouching: a.crouching,
     grounded: a.grounded,
     connected: true,
+    alive: true,
+    weaponPrimary: 255,
+    weaponSecondary: 0,
+    activeSlot: 0,
+    magActive: 0,
   };
 }
 
@@ -81,6 +99,11 @@ describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
             crouching: p.crouching,
             grounded: p.grounded,
             connected: p.connected,
+            alive: p.alive,
+            weaponPrimary: p.weaponPrimary,
+            weaponSecondary: p.weaponSecondary,
+            activeSlot: p.activeSlot,
+            magActive: p.magActive,
           })),
         );
       }
@@ -103,7 +126,23 @@ describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
 
         if (sub === RENDER_SUBSTEPS_PER_TICK - 1) {
           // One full network tick's worth of time has now elapsed.
-          sendObserver(i, { forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false });
+          sendObserver(
+            i,
+            {
+              forward: 0,
+              right: 0,
+              yaw: 0,
+              pitch: 0,
+              jump: false,
+              crouch: false,
+              walk: false,
+              fire: false,
+              ads: false,
+              reload: false,
+              slot1: false,
+              slot2: false,
+            },
+          );
           sendStrafer(i, strafeInput(i));
           host.step();
 
@@ -117,6 +156,11 @@ describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
             crouching: s.crouching[straferIndex] === 1,
             grounded: s.grounded[straferIndex] === 1,
             connected: true,
+            alive: s.alive[straferIndex] === 1,
+            weaponPrimary: s.weaponPrimary[straferIndex]!,
+            weaponSecondary: s.weaponSecondary[straferIndex]!,
+            activeSlot: s.activeSlot[straferIndex]!,
+            magActive: s.activeSlot[straferIndex] === 0 ? s.magPrimary[straferIndex]! : s.magSecondary[straferIndex]!,
           });
         }
 

@@ -7,17 +7,20 @@ import {
   decodeMessageSafely,
   encodeMessage,
   withLatency,
-  type FireCmdMessage,
-  type HitEventMessage,
+  type DamageTakenMessage,
+  type KillEventMessage,
+  type HitConfirmMessage,
   type SnapshotMessage,
   type Transport,
 } from "@vg/protocol";
-import { LEVEL_BOXES, type InputFrame } from "@vg/sim";
+import { LEVEL_BOXES, createState, eyePosition, getWeaponDef, raycastPlayers, shotDirection, type InputFrame, type ShotEvent, type SimState } from "@vg/sim";
+import { HitRegTracker, type HitRegStats } from "./hitreg.js";
 import { RemoteInterpolator, type RemotePose } from "./interpolation.js";
 import { PredictedClient, type AuthoritativeSnapshot } from "./prediction.js";
 
 const CONNECT_TIMEOUT_MS = 2000;
 const INPUT_REDUNDANCY = 3; // newest + previous 2, see @vg/protocol InputBatch docs
+const FIRE_MAX_RANGE = 100; // mirrors the server's default (see ServerHostOptions.fireMaxRange)
 
 export interface NetHud {
   connected: boolean;
@@ -27,9 +30,28 @@ export interface NetHud {
   starvedFrames: number;
 }
 
-export interface HitFeedbackEvent {
-  youAreShooter: boolean;
-  youAreTarget: boolean;
+export interface PredictedHitEvent {
+  targetIndex: number;
+}
+
+export interface ConfirmedHitEvent {
+  targetIndex: number;
+  damage: number;
+  region: number; // 0=head,1=body,2=legs
+  targetHealthAfter: number;
+}
+
+export interface DamageTakenEvent {
+  attackerIndex: number;
+  damage: number;
+}
+
+export interface KillFeedEvent {
+  killerIndex: number;
+  victimIndex: number;
+  weaponId: number;
+  headshot: boolean;
+  assistIndex: number;
 }
 
 export interface NetClient {
@@ -40,12 +62,20 @@ export interface NetClient {
   getLocalRenderPosition(): { x: number; y: number; z: number } | null;
   isLocalCrouching(): boolean;
   getLocalIndex(): number | null;
+  /** Full predicted SimState — HUD/weapon/ADS/credits all read from here for the local player. */
+  getPredictedState(): SimState | null;
   getRemotePoses(): readonly RemotePose[] | null;
-  /** The server tick remote players are currently being rendered at (for FireCmd.viewTick). */
+  /** The server tick remote players are currently being rendered at (carried in every InputBatch's viewTick header). */
   getViewTick(): number;
-  fire(): void;
-  onHit(cb: (e: HitFeedbackEvent) => void): void;
+  /** Shots the local player fired on the most recent sendInput() call (for tracer/hitmarker rendering). */
+  getLastLocalShots(): readonly ShotEvent[];
+  buy(itemId: number): void;
+  onPredictedHit(cb: (e: PredictedHitEvent) => void): void;
+  onConfirmedHit(cb: (e: ConfirmedHitEvent) => void): void;
+  onDamageTaken(cb: (e: DamageTakenEvent) => void): void;
+  onKillEvent(cb: (e: KillFeedEvent) => void): void;
   getHud(): NetHud;
+  getHitRegStats(): HitRegStats;
   close(): void;
 }
 
@@ -65,6 +95,31 @@ function maybeWrapWithFakeLag(transport: Transport): Transport {
   const jitterMs = Number(params.get("jitter") ?? 0) || 0;
   const lossRate = Number(params.get("loss") ?? 0) || 0;
   return withLatency(transport, { delayMs, jitterMs, lossRate, seed: Date.now() >>> 0 });
+}
+
+/**
+ * Builds a scratch SimState populated only with the position/crouching/alive
+ * fields a cosmetic raycast needs, from currently-interpolated remote poses
+ * — used solely for the client's own predicted-hit feedback (see PLAN.md
+ * §3.2 hit feedback policy: predicted hitmarkers are cosmetic only, never
+ * authoritative). The local player's own row is left at rest (irrelevant:
+ * raycastPlayers always excludes the shooter index).
+ */
+function buildCosmeticState(poses: readonly RemotePose[], numPlayers: number): SimState {
+  const scratch = createState(0, numPlayers);
+  for (let i = 0; i < numPlayers; i++) {
+    const p = poses[i];
+    if (!p) {
+      scratch.alive[i] = 0;
+      continue;
+    }
+    scratch.posX[i] = p.posX;
+    scratch.posY[i] = p.posY;
+    scratch.posZ[i] = p.posZ;
+    scratch.crouching[i] = p.crouching ? 1 : 0;
+    scratch.alive[i] = p.connected && p.alive ? 1 : 0;
+  }
+  return scratch;
 }
 
 /**
@@ -100,10 +155,11 @@ export function connectNetClient(): Promise<NetClient | null> {
 
     let predicted: PredictedClient | null = null;
     let localIndex: number | null = null;
+    let numPlayers = 0;
     const interpolator = new RemoteInterpolator();
+    const hitreg = new HitRegTracker();
 
     const inputHistory: InputFrame[] = [];
-    let fireSeq = 0;
     let lastSnapshotAt = performance.now();
     let lastSendAt = 0;
     let rttEstimateMs: number | null = null;
@@ -111,10 +167,14 @@ export function connectNetClient(): Promise<NetClient | null> {
     let correctionsAtWindowStart = 0;
     let correctionsPerSecond = 0;
 
-    const hitCbs: Array<(e: HitFeedbackEvent) => void> = [];
+    const predictedHitCbs: Array<(e: PredictedHitEvent) => void> = [];
+    const confirmedHitCbs: Array<(e: ConfirmedHitEvent) => void> = [];
+    const damageTakenCbs: Array<(e: DamageTakenEvent) => void> = [];
+    const killEventCbs: Array<(e: KillFeedEvent) => void> = [];
 
     function onSnapshot(msg: SnapshotMessage): void {
       lastSnapshotAt = performance.now();
+      hitreg.expire();
       if (lastSendAt > 0) {
         // Coarse RTT estimate: time since we last sent an input to now, when
         // a snapshot arrives acknowledging recent input. Not exact (snapshots
@@ -134,6 +194,11 @@ export function connectNetClient(): Promise<NetClient | null> {
             crouching: p.crouching,
             grounded: p.grounded,
             connected: p.connected,
+            alive: p.alive,
+            weaponPrimary: p.weaponPrimary,
+            weaponSecondary: p.weaponSecondary,
+            activeSlot: p.activeSlot,
+            magActive: p.magActive,
           }),
         ),
       );
@@ -152,18 +217,41 @@ export function connectNetClient(): Promise<NetClient | null> {
             pitch: p.pitch,
             crouching: p.crouching,
             grounded: p.grounded,
+            alive: p.alive,
+            activeSlot: p.activeSlot,
+            adsStage: p.adsStage,
+            health: p.health,
+            armor: p.armor,
+            weaponPrimary: p.weaponPrimary,
+            weaponSecondary: p.weaponSecondary,
+            magActive: p.magActive,
+            reserveActive: p.reserveActive,
+            tagTicksLeft: p.tagTicksLeft,
+            credits: p.credits,
+            respawnTicksLeft: p.respawnTicksLeft,
           })),
         };
         predicted.reconcile(authoritative);
       }
     }
 
-    function onHitEvent(msg: HitEventMessage): void {
-      if (localIndex === null) return;
-      const youAreShooter = msg.shooterIndex === localIndex;
-      const youAreTarget = msg.targetIndex === localIndex;
-      if (!youAreShooter && !youAreTarget) return;
-      for (const cb of hitCbs) cb({ youAreShooter, youAreTarget });
+    function onHitConfirm(msg: HitConfirmMessage): void {
+      if (localIndex === null || msg.shooterIndex !== localIndex) return;
+      hitreg.recordConfirmedHit();
+      for (const cb of confirmedHitCbs) {
+        cb({ targetIndex: msg.targetIndex, damage: msg.damage, region: msg.region, targetHealthAfter: msg.targetHealthAfter });
+      }
+    }
+
+    function onDamageTaken(msg: DamageTakenMessage): void {
+      if (localIndex === null || msg.victimIndex !== localIndex) return;
+      for (const cb of damageTakenCbs) cb({ attackerIndex: msg.attackerIndex, damage: msg.damage });
+    }
+
+    function onKillEvent(msg: KillEventMessage): void {
+      for (const cb of killEventCbs) {
+        cb({ killerIndex: msg.killerIndex, victimIndex: msg.victimIndex, weaponId: msg.weaponId, headshot: msg.headshot, assistIndex: msg.assistIndex });
+      }
     }
 
     transport.onMessage((data) => {
@@ -177,12 +265,13 @@ export function connectNetClient(): Promise<NetClient | null> {
         settled = true;
         clearTimeout(timeoutHandle);
         localIndex = msg.playerIndex;
+        numPlayers = msg.numPlayers;
         predicted = new PredictedClient(msg.seed, msg.numPlayers, msg.playerIndex, LEVEL_BOXES);
 
         const client: NetClient = {
           isOnline: () => true,
           sendInput(input: InputFrame) {
-            if (!predicted) return;
+            if (!predicted || localIndex === null) return;
             // Send exactly the quantized input PredictedClient predicted
             // with (F4 fix) — not the raw one — so the wire bytes agree
             // bit-for-bit with what local prediction/replay assumed.
@@ -190,8 +279,33 @@ export function connectNetClient(): Promise<NetClient | null> {
             inputHistory.push(quantizedInput);
             if (inputHistory.length > INPUT_REDUNDANCY) inputHistory.shift();
             const firstSeq = thisSeq - inputHistory.length + 1;
-            transport.send(encodeMessage({ type: MessageType.InputBatch, firstSeq, frames: inputHistory.slice() }));
+            const viewTick = Math.max(0, Math.round(interpolator.getCurrentTargetTick()));
+            transport.send(encodeMessage({ type: MessageType.InputBatch, firstSeq, viewTick, frames: inputHistory.slice() }));
             lastSendAt = performance.now();
+
+            // Cosmetic predicted-hit feedback + hit-reg telemetry for any
+            // shots the local player just fired (never applies damage — see
+            // PLAN.md §3.2). Uses the same shotDirection() helper the server
+            // uses, so the *direction* is byte-identical; the *hit test*
+            // itself is intentionally approximate (against interpolated
+            // remote poses, not the server's lag-comp-rewound truth).
+            const shots = predicted.getLastShots();
+            if (shots.length > 0) {
+              const state = predicted.getPredictedState();
+              const poses = interpolator.sample() ?? [];
+              const cosmeticState = buildCosmeticState(poses, numPlayers);
+              const origin = eyePosition(state, localIndex);
+              for (const shot of shots) {
+                const weapon = getWeaponDef(shot.weaponId);
+                if (!weapon) continue;
+                const dir = shotDirection(state, localIndex, weapon, shot.shotIndex, shot.sprayIndex);
+                const hit = raycastPlayers(cosmeticState, localIndex, origin, dir, FIRE_MAX_RANGE);
+                hitreg.recordPredictedShot(hit !== null);
+                if (hit) {
+                  for (const cb of predictedHitCbs) cb({ targetIndex: hit.playerIndex });
+                }
+              }
+            }
           },
           getLocalRenderPosition() {
             return predicted ? predicted.getRenderPosition() : null;
@@ -201,18 +315,24 @@ export function connectNetClient(): Promise<NetClient | null> {
             return predicted.getPredictedState().crouching[localIndex] === 1;
           },
           getLocalIndex: () => localIndex,
+          getPredictedState: () => (predicted ? predicted.getPredictedState() : null),
           getRemotePoses: () => interpolator.sample(),
           getViewTick: () => Math.round(interpolator.getCurrentTargetTick()),
-          fire() {
-            // FireCmd.viewTick is a wire u32 — round the continuous render
-            // target to the nearest integer tick (this is exactly the tick
-            // the client was visually rendering remote players at).
-            const viewTick = Math.max(0, Math.round(interpolator.getCurrentTargetTick()));
-            const msg: FireCmdMessage = { type: MessageType.FireCmd, seq: fireSeq++, viewTick };
-            transport.send(encodeMessage(msg));
+          getLastLocalShots: () => (predicted ? predicted.getLastShots() : []),
+          buy(itemId: number) {
+            transport.send(encodeMessage({ type: MessageType.BuyCmd, itemId }));
           },
-          onHit(cb) {
-            hitCbs.push(cb);
+          onPredictedHit(cb) {
+            predictedHitCbs.push(cb);
+          },
+          onConfirmedHit(cb) {
+            confirmedHitCbs.push(cb);
+          },
+          onDamageTaken(cb) {
+            damageTakenCbs.push(cb);
+          },
+          onKillEvent(cb) {
+            killEventCbs.push(cb);
           },
           getHud(): NetHud {
             const now = performance.now();
@@ -230,6 +350,7 @@ export function connectNetClient(): Promise<NetClient | null> {
               starvedFrames: interpolator.getStarvedFrameCount(),
             };
           },
+          getHitRegStats: () => hitreg.getStats(),
           close() {
             transport.close();
           },
@@ -237,8 +358,12 @@ export function connectNetClient(): Promise<NetClient | null> {
         resolve(client);
       } else if (msg.type === MessageType.Snapshot) {
         onSnapshot(msg);
-      } else if (msg.type === MessageType.HitEvent) {
-        onHitEvent(msg);
+      } else if (msg.type === MessageType.HitConfirm) {
+        onHitConfirm(msg);
+      } else if (msg.type === MessageType.DamageTaken) {
+        onDamageTaken(msg);
+      } else if (msg.type === MessageType.KillEvent) {
+        onKillEvent(msg);
       }
     });
 

@@ -1,9 +1,9 @@
-import { createLoopbackPair, createVirtualClock, decodeMessage, MessageType, withLatency, type SnapshotMessage } from "@vg/protocol";
+import { createLoopbackPair, createVirtualClock, decodeMessage, MessageType, withLatency } from "@vg/protocol";
 import { FIXED_DT, LEVEL_BOXES, type InputFrame } from "@vg/sim";
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
-import { PredictedClient, type AuthoritativeSnapshot } from "../src/prediction.js";
-import { createScriptedInputSender } from "./testUtils.js";
+import { PredictedClient } from "../src/prediction.js";
+import { createScriptedInputSender, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
 const NUM_CLIENTS = 10;
@@ -24,25 +24,6 @@ const PROFILES: ReadonlyArray<{ delayMs: number; jitterMs: number; lossRate: num
   { delayMs: 40, jitterMs: 10, lossRate: 0.01 },
 ];
 
-function toAuthoritative(msg: SnapshotMessage): AuthoritativeSnapshot {
-  return {
-    serverTick: msg.serverTick,
-    lastProcessedSeq: msg.lastProcessedSeq,
-    players: msg.players.map((pl) => ({
-      posX: pl.posX,
-      posY: pl.posY,
-      posZ: pl.posZ,
-      velX: pl.velX,
-      velY: pl.velY,
-      velZ: pl.velZ,
-      yaw: pl.yaw,
-      pitch: pl.pitch,
-      crouching: pl.crouching,
-      grounded: pl.grounded,
-    })),
-  };
-}
-
 // Deterministic per-client wander: forward/right kept to exactly -1/0/1 (like
 // a real keyboard client — the wire quantizes to i8, see messages.ts), yaw
 // drifts slowly. Different phase per client index so they don't all move in
@@ -53,7 +34,20 @@ function wanderInput(clientIndex: number, t: number): InputFrame {
   const forward = Math.sin((t + phase) * 0.023) > 0 ? 1 : -1;
   const right = Math.cos((t + phase) * 0.031) > 0 ? 1 : -1;
   const yaw = Math.sin((t + phase) * 0.007) * 1.2;
-  return { forward, right, yaw, pitch: 0, jump: false, crouch: false, walk: false, fire: false };
+  return {
+    forward,
+    right,
+    yaw,
+    pitch: 0,
+    jump: false,
+    crouch: false,
+    walk: false,
+    fire: false,
+    ads: false,
+    reload: false,
+    slot1: false,
+    slot2: false,
+  };
 }
 
 describe("10-client soak (acceptance criterion 8)", () => {
@@ -110,7 +104,20 @@ describe("10-client soak (acceptance criterion 8)", () => {
       for (let slot = 0; slot < NUM_CLIENTS; slot++) {
         const predicted = predictedByIndex.get(slot);
         if (!predicted) continue;
-        const input: InputFrame = { forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false };
+        const input: InputFrame = {
+          forward: 0,
+          right: 0,
+          yaw: 0,
+          pitch: 0,
+          jump: false,
+          crouch: false,
+          walk: false,
+          fire: false,
+          ads: false,
+          reload: false,
+          slot1: false,
+          slot2: false,
+        };
         const { seq, quantizedInput } = predicted.queueAndPredict(input);
         senders[slot]!(seq, quantizedInput);
       }

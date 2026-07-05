@@ -1,34 +1,11 @@
-import { createLoopbackPair, createVirtualClock, decodeMessage, MessageType, withLatency, type SnapshotMessage } from "@vg/protocol";
-import { FIXED_DT, LEVEL_BOXES, type InputFrame } from "@vg/sim";
+import { createLoopbackPair, createVirtualClock, decodeMessage, MessageType, withLatency } from "@vg/protocol";
+import { FIXED_DT, LEVEL_BOXES } from "@vg/sim";
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
-import { PredictedClient, type AuthoritativeSnapshot } from "../src/prediction.js";
-import { createScriptedInputSender } from "./testUtils.js";
+import { PredictedClient } from "../src/prediction.js";
+import { createScriptedInputSender, idleInput, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
-
-function idleInput(): InputFrame {
-  return { forward: 0, right: 0, yaw: 0, pitch: 0, jump: false, crouch: false, walk: false, fire: false };
-}
-
-function toAuthoritative(msg: SnapshotMessage): AuthoritativeSnapshot {
-  return {
-    serverTick: msg.serverTick,
-    lastProcessedSeq: msg.lastProcessedSeq,
-    players: msg.players.map((pl) => ({
-      posX: pl.posX,
-      posY: pl.posY,
-      posZ: pl.posZ,
-      velX: pl.velX,
-      velY: pl.velY,
-      velZ: pl.velZ,
-      yaw: pl.yaw,
-      pitch: pl.pitch,
-      crouching: pl.crouching,
-      grounded: pl.grounded,
-    })),
-  };
-}
 
 describe("correction smoothing (acceptance criterion 4)", () => {
   it("converges within 32 ticks after a forced server-side teleport, with no single-frame render jump > 0.5m", () => {
