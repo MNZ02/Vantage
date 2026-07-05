@@ -1,15 +1,20 @@
 import { createLoopbackPair, createVirtualClock, decodeMessage, encodeMessage, withLatency, MessageType, type SnapshotMessage } from "@vg/protocol";
 import {
   ABL_LUMEN_RES,
+  ABL_LUMEN_WALL,
+  ABL_UMBRA_BLIND,
   AGENT_LUMEN,
   AGENT_SONAR,
   AGENT_UMBRA,
   BUY_ITEM_ABILITY1,
+  ENT_NONE,
+  ENT_PROJECTILE,
   ENT_ULT_ORB,
   ENT_WALL_BOX,
   FLASH_FULL,
   FLASH_NONE,
   MAX_ABILITY_ENTITIES,
+  NO_PLAYER,
   PHASE_MATCH_END,
   PHASE_ROUND,
   TEAM_ATTACKERS,
@@ -79,6 +84,60 @@ describe("abilities end-to-end (M4a)", () => {
       expect(me.flashedTicksLeft).toBeGreaterThan(0);
       expect([FLASH_FULL, 1]).toContain(me.flashIntensity === FLASH_NONE ? -1 : me.flashIntensity);
     }
+  });
+
+  it("an intact Lumen wall blocks a Blind Orb's flash; a broken wall does not (review finding 3)", () => {
+    const host = new ServerHost({ numPlayers: 2 });
+    host.connect(createLoopbackPair()[1]);
+    const victim = host.connect(createLoopbackPair()[1]);
+    const s = host.getState();
+    // Victim faces straight at the detonation point (unobstructed case would be FULL flash).
+    s.posX[victim] = 0;
+    s.posY[victim] = 0;
+    s.posZ[victim] = 3;
+    s.yaw[victim] = Math.PI; // facing -Z, i.e. toward the detonation at z=-3
+
+    // A 2m-wide, 2m-tall, 0.4m-thick wall centered at z=0 — directly between
+    // the detonation point (z=-3) and the victim (z=3), covering both the
+    // detonation height and the victim's eye height (y in [0,2]).
+    const wallSlot = 0;
+    s.entType[wallSlot] = ENT_WALL_BOX;
+    s.entOwner[wallSlot] = NO_PLAYER;
+    s.entAbilityId[wallSlot] = ABL_LUMEN_WALL;
+    s.entX[wallSlot] = 0;
+    s.entY[wallSlot] = 1;
+    s.entZ[wallSlot] = 0;
+    s.entVelX[wallSlot] = 1; // alignX: long axis along X, thin along Z
+    s.entVelZ[wallSlot] = 0;
+    s.entParam[wallSlot] = WALL_BOX_MAX_HP;
+    s.entEndTick[wallSlot] = s.tick + 1920;
+
+    function spawnLandedBlindOrb(slot: number, fuseTicks: number): void {
+      const st = host.getState();
+      st.entType[slot] = ENT_PROJECTILE;
+      st.entOwner[slot] = NO_PLAYER;
+      st.entAbilityId[slot] = ABL_UMBRA_BLIND;
+      st.entX[slot] = 0;
+      st.entY[slot] = 1;
+      st.entZ[slot] = -3;
+      st.entVelX[slot] = 0;
+      st.entVelY[slot] = 0;
+      st.entVelZ[slot] = 0; // already landed, waiting on its fuse (see @vg/sim abilities/logic.ts onProjectileLand)
+      st.entSpawnTick[slot] = st.tick;
+      st.entEndTick[slot] = st.tick + fuseTicks;
+      st.entParam[slot] = 0;
+    }
+
+    // ---- Phase 1: wall intact -> no flash ----
+    spawnLandedBlindOrb(1, 3);
+    for (let i = 0; i < 10; i++) host.step();
+    expect(host.getState().flashedUntilTick[victim]!).toBeLessThanOrEqual(host.getState().tick);
+
+    // ---- Phase 2: break the wall, detonate again -> flash lands ----
+    host.getState().entType[wallSlot] = ENT_NONE;
+    spawnLandedBlindOrb(1, 3);
+    for (let i = 0; i < 10; i++) host.step();
+    expect(host.getState().flashedUntilTick[victim]!).toBeGreaterThan(host.getState().tick);
   });
 
   it("Sonar's shock dart deals falloff AoE damage and can kill (crediting/ability-side-effects flow through handleKill)", () => {
@@ -357,10 +416,14 @@ describe("ability soak (acceptance criterion 10)", () => {
       }
     }
 
+    // Distinct KITS (agents), not distinct ability ids — spec's ">=3 distinct
+    // kits" bar (e.g. two casts both from Sonar's own basics count as one kit).
+    const distinctKits = new Set(Array.from(castsByAbilityId).map((abilityId) => getAbilityDef(abilityId)?.agentId));
+
     expect(matchEnded).toBe(true);
     expect(castCount).toBeGreaterThanOrEqual(5);
-    expect(castsByAbilityId.size).toBeGreaterThanOrEqual(1); // at least casts observed; distinct-kit coverage is a soft goal given randomness
-    expect(abilityKillOrFlashSeen || castCount > 0).toBe(true);
+    expect(distinctKits.size).toBeGreaterThanOrEqual(3);
+    expect(abilityKillOrFlashSeen).toBe(true);
 
     const durations = host.stepDurationsMs.slice().sort((a, b) => a - b);
     const p95Index = Math.floor(durations.length * 0.95);

@@ -59,6 +59,7 @@ import {
   eyePosition,
   getAbilityDef,
   getCombatWeaponDef,
+  liveWallBoxes,
   pickupWeapon,
   raycastBoxes,
   raycastPlayers,
@@ -864,6 +865,29 @@ export class ServerHost {
   }
 
   /**
+   * Occluders for any LoS-style query (visibility cone, flash, LoS-gated
+   * reveal): static level geometry PLUS every live Lumen wall box. A wall is
+   * a solid 0.4m barrier for the ~30s it's up — it should block sightlines
+   * exactly like the level's own walls, and does so here for all three
+   * consumers (updateVisibility, computeFlash, computeReveal's LoS-gated
+   * call). Recomputed on demand (not cached) since walls spawn/break/expire
+   * tick-to-tick; cheap at MAX_ABILITY_ENTITIES=64.
+   *
+   * Deliberately NOT occluding (documented gap, not a bug): smoke spheres.
+   * Smokes are rendered as opaque on the client, but this server's own
+   * raycastBoxes/raycastWalls occlusion tests are AABB-only — there's no
+   * sphere-vs-ray primitive in @vg/sim's raycast module, so a smoke cannot
+   * block a flash/reveal/visibility check the way the plan's §3.1 originally
+   * envisioned ("smokes = sphere occluders (fed to server visibility *and*
+   * flash LoS tests)"). Sphere occlusion is deferred to a follow-up pass;
+   * noted in PLAN.md too.
+   */
+  private occlusionBoxes(): readonly Box[] {
+    const wallBoxes = liveWallBoxes(this.state);
+    return wallBoxes.length > 0 ? [...this.boxes, ...wallBoxes] : this.boxes;
+  }
+
+  /**
    * Team-shared visibility (minimap fog of war): for each team, an enemy is
    * visible if ANY living member of that team has an unobstructed raycast
    * to the enemy's eye position AND the enemy falls within a 110-degree cone
@@ -875,10 +899,13 @@ export class ServerHost {
    *
    * M4a: Sonar's Pulse/Recon Dart reveals (see activeReveals, populated by
    * resolveAbilityEvent) are ORed in on top of the raycast-based visibility
-   * computed here — plumbed as an override mask, per spec.
+   * computed here — plumbed as an override mask, per spec. Occlusion here
+   * (and in computeFlash/computeReveal) includes live Lumen wall boxes, not
+   * just static level geometry — see occlusionBoxes()'s doc comment.
    */
   private updateVisibility(): void {
     const s = this.state;
+    const boxes = this.occlusionBoxes();
     let team0Mask = 0; // attackers' view of defenders
     let team1Mask = 0; // defenders' view of attackers
 
@@ -909,7 +936,7 @@ export class ServerHost {
         while (diff < -Math.PI) diff += 2 * Math.PI;
         if (Math.abs(diff) > VISIBILITY_HALF_FOV_RAD) continue;
 
-        const blocked = raycastBoxes(this.boxes, eyeM, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
+        const blocked = raycastBoxes(boxes, eyeM, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
         if (blocked === null) {
           visible = true;
           break;
@@ -969,7 +996,7 @@ export class ServerHost {
     const currentTick = this.state.tick;
 
     if (evt.abilityId === ABL_UMBRA_BLIND && evt.kind === "detonate") {
-      const flashes = computeFlash(this.state, this.boxes, evt.x, evt.y, evt.z);
+      const flashes = computeFlash(this.state, this.occlusionBoxes(), evt.x, evt.y, evt.z);
       for (const f of flashes) this.state = applyFlash(this.state, f.playerIndex, f.intensity, currentTick);
     } else if (evt.abilityId === ABL_SONAR_SHOCK && evt.kind === "detonate") {
       const def = getAbilityDef(ABL_SONAR_SHOCK)!;
@@ -990,14 +1017,18 @@ export class ServerHost {
     } else if (evt.abilityId === ABL_SONAR_PULSE && evt.kind === "cast") {
       const def = getAbilityDef(ABL_SONAR_PULSE)!;
       const team = this.state.team[evt.owner]!;
-      const mask = computeReveal(this.state, this.boxes, team, evt.x, evt.y, evt.z, def.radius!, false);
+      // requireLoS=false: Pulse ignores walls entirely (spec: "walls
+      // irrelevant") — occlusionBoxes() is passed for call-site consistency
+      // but has no effect here since the LoS raycast itself is skipped.
+      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, false);
       if (mask !== 0 && (team === TEAM_ATTACKERS || team === TEAM_DEFENDERS)) {
         this.activeReveals.push({ team, mask, expiresAtTick: currentTick + def.durationTicks! });
       }
     } else if (evt.abilityId === ABL_SONAR_RECON && evt.kind === "pulse") {
       const def = getAbilityDef(ABL_SONAR_RECON)!;
       const team = this.state.team[evt.owner]!;
-      const mask = computeReveal(this.state, this.boxes, team, evt.x, evt.y, evt.z, def.radius!, true);
+      // requireLoS=true: a live Lumen wall blocks Recon Dart's reveal, same as level geometry.
+      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, true);
       if (mask !== 0 && (team === TEAM_ATTACKERS || team === TEAM_DEFENDERS)) {
         this.activeReveals.push({ team, mask, expiresAtTick: currentTick + def.durationTicks! });
       }

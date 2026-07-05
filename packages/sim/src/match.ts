@@ -17,6 +17,7 @@ import {
   CHANNEL_STATIONARY_SPEED_MPS,
   DEFUSE_RADIUS_M,
   ENT_ULT_ORB,
+  FLASH_NONE,
   MODE_MATCH,
   NO_PLAYER,
   PHASE_BUY,
@@ -151,7 +152,21 @@ function resetLoadoutToDefault(next: SimState, i: number): void {
  * only at a half swap (spec: "reset charges to defaults at half" while
  * keeping ult points — see enterBuyPhase's call site). Blades/Rail (ult
  * weapon override) is always cleared: forced back off activeSlot 2 if still
- * active from a round that ended mid-ult.
+ * active from a round that ended mid-ult. flash is also cleared here — a
+ * flash landing right at round end must not visibly carry into the next
+ * round's opening moment.
+ *
+ * Documented, harmless gap: a player who voluntarily presses slot1/slot2
+ * while an ult weapon (activeSlot 2) is active switches away from it
+ * mid-round (see weapons/logic.ts's slot1Edge/slot2Edge, which treat "not
+ * already on that slot" as the switch condition — slot 2 always qualifies).
+ * Any charges left in magUlt at that point are simply stranded: there's no
+ * input path back INTO the ult slot short of recasting, which by then costs
+ * ultPoints the player no longer has (already spent on the original cast).
+ * They sit inert (never rendered, never fired) until this function zeroes
+ * magUlt at the next round boundary. Not a bug — Valorant has no "put the
+ * ult away and get it back" mechanic either — but worth naming since it's
+ * the one place a nonzero magUlt can go quietly unused for a whole round.
  */
 function resetAbilitiesForRound(next: SimState, i: number, resetSignatureToo: boolean): void {
   next.abilityCharges[i * 4 + 0] = 0;
@@ -166,6 +181,8 @@ function resetAbilitiesForRound(next: SimState, i: number, resetSignatureToo: bo
   }
   next.magUlt[i] = 0;
   next.ultWindowEndTick[i] = -1;
+  next.flashedUntilTick[i] = 0;
+  next.flashIntensity[i] = FLASH_NONE;
   next.pendingAbilityId[i] = 255;
   next.pendingReadyTick[i] = -1;
 }
