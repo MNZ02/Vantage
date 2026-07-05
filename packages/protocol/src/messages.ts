@@ -12,12 +12,24 @@
 // gains combat fields per player plus a droppedWeapons entity list. New
 // messages: BuyCmd (C->S), KillEvent/HitConfirm/DamageTaken (S->C).
 //
-// Deviation from the spec's field list, stated plainly: Snapshot and
+// M3 changes (protocolVersion bumped 2 -> 3): buttons grow from u8 to u16
+// (interact + ping). Hello gains an optional 16-byte reconnect token
+// (all-zero = none); Welcome gains the (possibly newly-issued) token plus
+// team + mode. Snapshot gains a whole match section (phase/round/score/spike/
+// plant-defuse-progress) and a per-recipient visibleEnemyMask (team-shared
+// fog-of-war — see @vg/server's visibility computation); SnapshotPlayer
+// gains `team`. New messages: MapPing (C->S), TeamPing/MatchEvent (S->C),
+// SellCmd (C->S, buy-phase refund).
+//
+// Deviation from the spec's field list, stated plainly: (1) Snapshot and
 // InputBatch both carry an explicit array-length prefix (Snapshot's
 // `numPlayers`, InputBatch's `count`) so a decoder never needs external
 // context (the client's cached numPlayers, say) to know how many entries
 // follow — self-describing messages are easier to round-trip/fuzz-test and
-// slightly more robust to reconnect-time ordering.
+// slightly more robust to reconnect-time ordering. (2) the spec's "per-player
+// flags gain a team bit" doesn't fit team's THREE-valued domain (attackers/
+// defenders/unassigned-255) into one bit — team is instead its own u8 field
+// per player, exact rather than lossy.
 
 export enum MessageType {
   Hello = 1,
@@ -28,13 +40,23 @@ export enum MessageType {
   KillEvent = 6,
   HitConfirm = 7,
   DamageTaken = 8,
+  MapPing = 9,
+  TeamPing = 10,
+  MatchEvent = 11,
+  SellCmd = 12,
 }
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
+
+/** Fixed length (bytes) of a reconnect session token. All-zero = "no token". */
+export const TOKEN_LENGTH = 16;
+export const NO_TOKEN: Uint8Array = new Uint8Array(TOKEN_LENGTH);
 
 export interface HelloMessage {
   readonly type: MessageType.Hello;
   readonly protocolVersion: number; // u8
+  /** 16 bytes; all-zero (NO_TOKEN) = fresh join, no reconnect attempted. */
+  readonly reconnectToken: Uint8Array;
 }
 
 /** One tick's worth of input as carried on the wire (quantized from InputFrame). */
@@ -51,6 +73,8 @@ export interface InputSample {
   readonly reload: boolean;
   readonly slot1: boolean;
   readonly slot2: boolean;
+  readonly interact: boolean;
+  readonly ping: boolean;
 }
 
 export interface InputBatchMessage {
@@ -67,12 +91,22 @@ export interface BuyCmdMessage {
   readonly itemId: number; // u8
 }
 
+/** C->S (M3): sell back an item purchased THIS buy phase for a full refund (see @vg/sim damage.ts applySell). */
+export interface SellCmdMessage {
+  readonly type: MessageType.SellCmd;
+  readonly itemId: number; // u8
+}
+
 export interface WelcomeMessage {
   readonly type: MessageType.Welcome;
   readonly playerIndex: number; // u8
   readonly seed: number; // u32
   readonly numPlayers: number; // u8
   readonly serverTick: number; // u32
+  /** 16-byte session token for this slot (M3 reconnect) — resend the SAME token/playerIndex on a successful reattach. */
+  readonly token: Uint8Array;
+  readonly team: number; // u8: 0 attackers, 1 defenders, 255 unassigned
+  readonly mode: number; // u8: 0 dm, 1 match
 }
 
 export interface SnapshotPlayer {
@@ -99,6 +133,8 @@ export interface SnapshotPlayer {
   readonly tagTicksLeft: number; // u8 (clamped)
   readonly credits: number; // u16 (clamped to 9000)
   readonly respawnTicksLeft: number; // u8 (clamped)
+  /** M3: 0 attackers, 1 defenders, 255 unassigned. */
+  readonly team: number; // u8
 }
 
 export interface SnapshotDroppedWeapon {
@@ -116,6 +152,26 @@ export interface SnapshotMessage {
   readonly lastProcessedSeq: number; // u32, for the receiving client
   readonly players: readonly SnapshotPlayer[]; // numPlayers: u8, then that many entries
   readonly droppedWeapons: readonly SnapshotDroppedWeapon[]; // count: u8, then that many entries (server caps at 32 live drops)
+
+  // ---- M3 match section ----
+  readonly mode: number; // u8: 0 dm, 1 match
+  readonly matchPhase: number; // u8
+  readonly phaseTicksLeft: number; // u32
+  readonly roundNumber: number; // u8
+  readonly scoreTeam0: number; // u8
+  readonly scoreTeam1: number; // u8
+  readonly spikeState: number; // u8
+  readonly spikeCarrier: number; // u8, 255 = none
+  readonly spikeX: number; // f32
+  readonly spikeY: number; // f32
+  readonly spikeZ: number; // f32
+  readonly spikePlantedTicksLeft: number; // u32, 0 if not planted
+  readonly activePlantProgress: number; // u16
+  readonly planterIndex: number; // u8, 255 = none
+  readonly activeDefuseProgress: number; // u16
+  readonly defuserIndex: number; // u8, 255 = none
+  /** Enemies of the RECEIVING client's own team currently visible to that team (bit i set = player i visible). Per-recipient — see @vg/server visibility computation. */
+  readonly visibleEnemyMask: number; // u16
 }
 
 /** S->C: a player died. */
@@ -146,15 +202,43 @@ export interface DamageTakenMessage {
   readonly damage: number; // u16
 }
 
+/** C->S (M3): cast a map ping at a raycast-hit world position. Rate-limited server-side (1/s per player). */
+export interface MapPingMessage {
+  readonly type: MessageType.MapPing;
+  readonly x: number; // f32
+  readonly z: number; // f32
+}
+
+/** S->C (M3): rebroadcast of a MapPing to the sender's teammates only (and the sender). */
+export interface TeamPingMessage {
+  readonly type: MessageType.TeamPing;
+  readonly playerIndex: number; // u8, who pinged
+  readonly x: number; // f32
+  readonly z: number; // f32
+}
+
+/** S->C (M3): a round/match/spike phase transition. kind: 0 roundStart, 1 roundEnd, 2 matchEnd, 3 spikePlanted, 4 spikeDefused, 5 spikeDetonated. reason: 0 elim, 1 detonation, 2 defuse, 3 timeout, 255 n/a. */
+export interface MatchEventMessage {
+  readonly type: MessageType.MatchEvent;
+  readonly kind: number; // u8
+  readonly winnerTeam: number; // u8, 255 = n/a
+  readonly reason: number; // u8
+  readonly roundNumber: number; // u8
+}
+
 export type ProtocolMessage =
   | HelloMessage
   | InputBatchMessage
   | BuyCmdMessage
+  | SellCmdMessage
   | WelcomeMessage
   | SnapshotMessage
   | KillEventMessage
   | HitConfirmMessage
-  | DamageTakenMessage;
+  | DamageTakenMessage
+  | MapPingMessage
+  | TeamPingMessage
+  | MatchEventMessage;
 
 const JUMP_BIT = 1 << 0;
 const CROUCH_BIT = 1 << 1;
@@ -164,6 +248,8 @@ const ADS_BIT = 1 << 4;
 const RELOAD_BIT = 1 << 5;
 const SLOT1_BIT = 1 << 6;
 const SLOT2_BIT = 1 << 7;
+const INTERACT_BIT = 1 << 8;
+const PING_BIT = 1 << 9;
 
 const CROUCHING_BIT = 1 << 0;
 const GROUNDED_BIT = 1 << 1;
@@ -238,6 +324,12 @@ class Writer {
     this.offset += 4;
   }
 
+  writeBytes(arr: Uint8Array): void {
+    this.ensure(arr.length);
+    this.bytes.set(arr, this.offset);
+    this.offset += arr.length;
+  }
+
   finish(): Uint8Array {
     return this.bytes.slice(0, this.offset);
   }
@@ -260,10 +352,12 @@ export class MalformedMessageError extends Error {
  */
 class Reader {
   private view: DataView;
+  private buf: Uint8Array;
   private offset = 0;
 
   constructor(data: Uint8Array) {
     this.view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    this.buf = data;
   }
 
   private ensureReadable(size: number): void {
@@ -308,6 +402,13 @@ class Reader {
     this.offset += 4;
     return v;
   }
+
+  bytes(len: number): Uint8Array {
+    this.ensureReadable(len);
+    const out = this.buf.slice(this.offset, this.offset + len);
+    this.offset += len;
+    return out;
+  }
 }
 
 function quantizeAxis(v: number): number {
@@ -344,7 +445,7 @@ export function quantizeInputSample<T extends { forward: number; right: number; 
 }
 
 function encodeButtons(
-  s: Pick<InputSample, "jump" | "crouch" | "walk" | "fire" | "ads" | "reload" | "slot1" | "slot2">,
+  s: Pick<InputSample, "jump" | "crouch" | "walk" | "fire" | "ads" | "reload" | "slot1" | "slot2" | "interact" | "ping">,
 ): number {
   return (
     (s.jump ? JUMP_BIT : 0) |
@@ -354,14 +455,17 @@ function encodeButtons(
     (s.ads ? ADS_BIT : 0) |
     (s.reload ? RELOAD_BIT : 0) |
     (s.slot1 ? SLOT1_BIT : 0) |
-    (s.slot2 ? SLOT2_BIT : 0)
+    (s.slot2 ? SLOT2_BIT : 0) |
+    (s.interact ? INTERACT_BIT : 0) |
+    (s.ping ? PING_BIT : 0)
   );
 }
 
 /**
  * Snapshot per-player flags byte layout: bit0 crouching, bit1 grounded,
  * bit2 connected, bit3 alive, bit4 activeSlot (0=primary,1=secondary),
- * bits5-6 adsStage (0..2), bit7 reserved/unused.
+ * bits5-6 adsStage (0..2), bit7 reserved/unused. (`team` is its own u8 field,
+ * not packed here — see the module doc comment's deviation note.)
  */
 function encodeFlags(p: Pick<SnapshotPlayer, "crouching" | "grounded" | "connected" | "alive" | "activeSlot" | "adsStage">): number {
   return (
@@ -387,12 +491,21 @@ function decodeFlags(flags: number): Pick<SnapshotPlayer, "crouching" | "grounde
 
 const CREDITS_CLAMP = 9000;
 
+function writeToken(w: Writer, token: Uint8Array | undefined): void {
+  if (token && token.length === TOKEN_LENGTH) {
+    w.writeBytes(token);
+  } else {
+    w.writeBytes(NO_TOKEN);
+  }
+}
+
 export function encodeMessage(msg: ProtocolMessage): Uint8Array {
   const w = new Writer();
   w.u8(msg.type);
   switch (msg.type) {
     case MessageType.Hello: {
       w.u8(msg.protocolVersion);
+      writeToken(w, msg.reconnectToken);
       break;
     }
     case MessageType.InputBatch: {
@@ -404,11 +517,15 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
         w.i8(quantizeAxis(f.right));
         w.f32(f.yaw);
         w.f32(f.pitch);
-        w.u8(encodeButtons(f));
+        w.u16(encodeButtons(f));
       }
       break;
     }
     case MessageType.BuyCmd: {
+      w.u8(msg.itemId);
+      break;
+    }
+    case MessageType.SellCmd: {
       w.u8(msg.itemId);
       break;
     }
@@ -417,6 +534,9 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
       w.u32(msg.seed);
       w.u8(msg.numPlayers);
       w.u32(msg.serverTick);
+      writeToken(w, msg.token);
+      w.u8(msg.team);
+      w.u8(msg.mode);
       break;
     }
     case MessageType.Snapshot: {
@@ -442,6 +562,7 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
         w.u8(Math.min(255, p.tagTicksLeft));
         w.u16(Math.min(CREDITS_CLAMP, p.credits));
         w.u8(Math.min(255, p.respawnTicksLeft));
+        w.u8(p.team);
       }
       w.u8(msg.droppedWeapons.length);
       for (const d of msg.droppedWeapons) {
@@ -452,6 +573,23 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
         w.f32(d.z);
         w.u16(d.mag);
       }
+      w.u8(msg.mode);
+      w.u8(msg.matchPhase);
+      w.u32(msg.phaseTicksLeft);
+      w.u8(msg.roundNumber);
+      w.u8(msg.scoreTeam0);
+      w.u8(msg.scoreTeam1);
+      w.u8(msg.spikeState);
+      w.u8(msg.spikeCarrier);
+      w.f32(msg.spikeX);
+      w.f32(msg.spikeY);
+      w.f32(msg.spikeZ);
+      w.u32(msg.spikePlantedTicksLeft);
+      w.u16(msg.activePlantProgress);
+      w.u8(msg.planterIndex);
+      w.u16(msg.activeDefuseProgress);
+      w.u8(msg.defuserIndex);
+      w.u16(msg.visibleEnemyMask);
       break;
     }
     case MessageType.KillEvent: {
@@ -476,6 +614,24 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
       w.u16(msg.damage);
       break;
     }
+    case MessageType.MapPing: {
+      w.f32(msg.x);
+      w.f32(msg.z);
+      break;
+    }
+    case MessageType.TeamPing: {
+      w.u8(msg.playerIndex);
+      w.f32(msg.x);
+      w.f32(msg.z);
+      break;
+    }
+    case MessageType.MatchEvent: {
+      w.u8(msg.kind);
+      w.u8(msg.winnerTeam);
+      w.u8(msg.reason);
+      w.u8(msg.roundNumber);
+      break;
+    }
   }
   return w.finish();
 }
@@ -486,7 +642,8 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
   switch (type) {
     case MessageType.Hello: {
       const protocolVersion = r.u8();
-      return { type, protocolVersion };
+      const reconnectToken = r.bytes(TOKEN_LENGTH);
+      return { type, protocolVersion, reconnectToken };
     }
     case MessageType.InputBatch: {
       const firstSeq = r.u32();
@@ -498,7 +655,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         const right = r.i8();
         const yaw = r.f32();
         const pitch = r.f32();
-        const buttons = r.u8();
+        const buttons = r.u16();
         frames.push({
           forward,
           right,
@@ -512,6 +669,8 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
           reload: (buttons & RELOAD_BIT) !== 0,
           slot1: (buttons & SLOT1_BIT) !== 0,
           slot2: (buttons & SLOT2_BIT) !== 0,
+          interact: (buttons & INTERACT_BIT) !== 0,
+          ping: (buttons & PING_BIT) !== 0,
         });
       }
       return { type, firstSeq, viewTick, frames };
@@ -520,12 +679,19 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const itemId = r.u8();
       return { type, itemId };
     }
+    case MessageType.SellCmd: {
+      const itemId = r.u8();
+      return { type, itemId };
+    }
     case MessageType.Welcome: {
       const playerIndex = r.u8();
       const seed = r.u32();
       const numPlayers = r.u8();
       const serverTick = r.u32();
-      return { type, playerIndex, seed, numPlayers, serverTick };
+      const token = r.bytes(TOKEN_LENGTH);
+      const team = r.u8();
+      const mode = r.u8();
+      return { type, playerIndex, seed, numPlayers, serverTick, token, team, mode };
     }
     case MessageType.Snapshot: {
       const serverTick = r.u32();
@@ -551,6 +717,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         const tagTicksLeft = r.u8();
         const credits = r.u16();
         const respawnTicksLeft = r.u8();
+        const team = r.u8();
         players.push({
           posX,
           posY,
@@ -570,6 +737,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
           tagTicksLeft,
           credits,
           respawnTicksLeft,
+          team,
         });
       }
       const dropCount = r.u8();
@@ -583,7 +751,47 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         const mag = r.u16();
         droppedWeapons.push({ id, weaponId, x, y, z, mag });
       }
-      return { type, serverTick, lastProcessedSeq, players, droppedWeapons };
+      const mode = r.u8();
+      const matchPhase = r.u8();
+      const phaseTicksLeft = r.u32();
+      const roundNumber = r.u8();
+      const scoreTeam0 = r.u8();
+      const scoreTeam1 = r.u8();
+      const spikeState = r.u8();
+      const spikeCarrier = r.u8();
+      const spikeX = r.f32();
+      const spikeY = r.f32();
+      const spikeZ = r.f32();
+      const spikePlantedTicksLeft = r.u32();
+      const activePlantProgress = r.u16();
+      const planterIndex = r.u8();
+      const activeDefuseProgress = r.u16();
+      const defuserIndex = r.u8();
+      const visibleEnemyMask = r.u16();
+      return {
+        type,
+        serverTick,
+        lastProcessedSeq,
+        players,
+        droppedWeapons,
+        mode,
+        matchPhase,
+        phaseTicksLeft,
+        roundNumber,
+        scoreTeam0,
+        scoreTeam1,
+        spikeState,
+        spikeCarrier,
+        spikeX,
+        spikeY,
+        spikeZ,
+        spikePlantedTicksLeft,
+        activePlantProgress,
+        planterIndex,
+        activeDefuseProgress,
+        defuserIndex,
+        visibleEnemyMask,
+      };
     }
     case MessageType.KillEvent: {
       const killerIndex = r.u8();
@@ -606,6 +814,24 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const attackerIndex = r.u8();
       const damage = r.u16();
       return { type, victimIndex, attackerIndex, damage };
+    }
+    case MessageType.MapPing: {
+      const x = r.f32();
+      const z = r.f32();
+      return { type, x, z };
+    }
+    case MessageType.TeamPing: {
+      const playerIndex = r.u8();
+      const x = r.f32();
+      const z = r.f32();
+      return { type, playerIndex, x, z };
+    }
+    case MessageType.MatchEvent: {
+      const kind = r.u8();
+      const winnerTeam = r.u8();
+      const reason = r.u8();
+      const roundNumber = r.u8();
+      return { type, kind, winnerTeam, reason, roundNumber };
     }
     default: {
       const exhaustive: never = type;

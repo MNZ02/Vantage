@@ -2,6 +2,8 @@ import { createPrngState, nextRandom } from "@vg/sim";
 import { describe, expect, it } from "vitest";
 import {
   MessageType,
+  NO_TOKEN,
+  TOKEN_LENGTH,
   decodeMessage,
   decodeMessageSafely,
   encodeMessage,
@@ -15,12 +17,19 @@ function approxEqual(a: number, b: number, eps = 1e-4): boolean {
   return Math.abs(a - b) <= eps;
 }
 
+function tokenBytes(seed: number): Uint8Array {
+  const out = new Uint8Array(TOKEN_LENGTH);
+  for (let i = 0; i < TOKEN_LENGTH; i++) out[i] = (seed + i * 7) & 0xff;
+  return out;
+}
+
 function expectMessagesEqual(a: ProtocolMessage, b: ProtocolMessage): void {
   expect(a.type).toBe(b.type);
   switch (a.type) {
     case MessageType.Hello: {
       const bb = b as typeof a;
       expect(a.protocolVersion).toBe(bb.protocolVersion);
+      expect(Array.from(a.reconnectToken)).toEqual(Array.from(bb.reconnectToken));
       break;
     }
     case MessageType.InputBatch: {
@@ -42,10 +51,17 @@ function expectMessagesEqual(a: ProtocolMessage, b: ProtocolMessage): void {
         expect(f.reload).toBe(g.reload);
         expect(f.slot1).toBe(g.slot1);
         expect(f.slot2).toBe(g.slot2);
+        expect(f.interact).toBe(g.interact);
+        expect(f.ping).toBe(g.ping);
       });
       break;
     }
     case MessageType.BuyCmd: {
+      const bb = b as typeof a;
+      expect(a.itemId).toBe(bb.itemId);
+      break;
+    }
+    case MessageType.SellCmd: {
       const bb = b as typeof a;
       expect(a.itemId).toBe(bb.itemId);
       break;
@@ -56,6 +72,9 @@ function expectMessagesEqual(a: ProtocolMessage, b: ProtocolMessage): void {
       expect(a.seed).toBe(bb.seed);
       expect(a.numPlayers).toBe(bb.numPlayers);
       expect(a.serverTick).toBe(bb.serverTick);
+      expect(Array.from(a.token)).toEqual(Array.from(bb.token));
+      expect(a.team).toBe(bb.team);
+      expect(a.mode).toBe(bb.mode);
       break;
     }
     case MessageType.Snapshot: {
@@ -83,6 +102,7 @@ function expectMessagesEqual(a: ProtocolMessage, b: ProtocolMessage): void {
         expect(p.tagTicksLeft).toBe(q.tagTicksLeft);
         expect(p.credits).toBe(q.credits);
         expect(p.respawnTicksLeft).toBe(q.respawnTicksLeft);
+        expect(p.team).toBe(q.team);
       });
       expect(a.droppedWeapons.length).toBe(bb.droppedWeapons.length);
       a.droppedWeapons.forEach((d, i) => {
@@ -94,6 +114,23 @@ function expectMessagesEqual(a: ProtocolMessage, b: ProtocolMessage): void {
         expect(approxEqual(d.z, e.z)).toBe(true);
         expect(d.mag).toBe(e.mag);
       });
+      expect(a.mode).toBe(bb.mode);
+      expect(a.matchPhase).toBe(bb.matchPhase);
+      expect(a.phaseTicksLeft).toBe(bb.phaseTicksLeft);
+      expect(a.roundNumber).toBe(bb.roundNumber);
+      expect(a.scoreTeam0).toBe(bb.scoreTeam0);
+      expect(a.scoreTeam1).toBe(bb.scoreTeam1);
+      expect(a.spikeState).toBe(bb.spikeState);
+      expect(a.spikeCarrier).toBe(bb.spikeCarrier);
+      expect(approxEqual(a.spikeX, bb.spikeX)).toBe(true);
+      expect(approxEqual(a.spikeY, bb.spikeY)).toBe(true);
+      expect(approxEqual(a.spikeZ, bb.spikeZ)).toBe(true);
+      expect(a.spikePlantedTicksLeft).toBe(bb.spikePlantedTicksLeft);
+      expect(a.activePlantProgress).toBe(bb.activePlantProgress);
+      expect(a.planterIndex).toBe(bb.planterIndex);
+      expect(a.activeDefuseProgress).toBe(bb.activeDefuseProgress);
+      expect(a.defuserIndex).toBe(bb.defuserIndex);
+      expect(a.visibleEnemyMask).toBe(bb.visibleEnemyMask);
       break;
     }
     case MessageType.KillEvent: {
@@ -121,6 +158,27 @@ function expectMessagesEqual(a: ProtocolMessage, b: ProtocolMessage): void {
       expect(a.damage).toBe(bb.damage);
       break;
     }
+    case MessageType.MapPing: {
+      const bb = b as typeof a;
+      expect(approxEqual(a.x, bb.x)).toBe(true);
+      expect(approxEqual(a.z, bb.z)).toBe(true);
+      break;
+    }
+    case MessageType.TeamPing: {
+      const bb = b as typeof a;
+      expect(a.playerIndex).toBe(bb.playerIndex);
+      expect(approxEqual(a.x, bb.x)).toBe(true);
+      expect(approxEqual(a.z, bb.z)).toBe(true);
+      break;
+    }
+    case MessageType.MatchEvent: {
+      const bb = b as typeof a;
+      expect(a.kind).toBe(bb.kind);
+      expect(a.winnerTeam).toBe(bb.winnerTeam);
+      expect(a.reason).toBe(bb.reason);
+      expect(a.roundNumber).toBe(bb.roundNumber);
+      break;
+    }
   }
 }
 
@@ -138,6 +196,8 @@ function sampleInput(overrides: Partial<InputSample> = {}): InputSample {
     reload: false,
     slot1: false,
     slot2: true,
+    interact: false,
+    ping: false,
     ...overrides,
   };
 }
@@ -167,6 +227,7 @@ function samplePlayer(overrides: Partial<SnapshotPlayer> = {}): SnapshotPlayer {
     tagTicksLeft: 12,
     credits: 4200,
     respawnTicksLeft: 0,
+    team: 0,
     ...overrides,
   };
 }
@@ -175,17 +236,50 @@ function sampleDrop(overrides: Partial<SnapshotDroppedWeapon> = {}): SnapshotDro
   return { id: 3, weaponId: 4, x: 1, y: 0, z: 2, mag: 17, ...overrides };
 }
 
+function sampleSnapshot(overrides: Partial<ProtocolMessage & { type: MessageType.Snapshot }> = {}): ProtocolMessage {
+  return {
+    type: MessageType.Snapshot,
+    serverTick: 1000,
+    lastProcessedSeq: 998,
+    players: [samplePlayer()],
+    droppedWeapons: [sampleDrop()],
+    mode: 1,
+    matchPhase: 2,
+    phaseTicksLeft: 4321,
+    roundNumber: 7,
+    scoreTeam0: 5,
+    scoreTeam1: 4,
+    spikeState: 2,
+    spikeCarrier: 255,
+    spikeX: 1.5,
+    spikeY: 0,
+    spikeZ: -2.5,
+    spikePlantedTicksLeft: 1800,
+    activePlantProgress: 0,
+    planterIndex: 255,
+    activeDefuseProgress: 30,
+    defuserIndex: 3,
+    visibleEnemyMask: 0b101,
+    ...overrides,
+  };
+}
+
 describe("protocol message round-trip", () => {
-  it("Hello", () => {
-    const msg: ProtocolMessage = { type: MessageType.Hello, protocolVersion: 2 };
+  it("Hello with no reconnect token", () => {
+    const msg: ProtocolMessage = { type: MessageType.Hello, protocolVersion: 3, reconnectToken: NO_TOKEN };
     expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
   });
 
-  it("InputBatch with redundant frames and viewTick", () => {
+  it("Hello with a reconnect token", () => {
+    const msg: ProtocolMessage = { type: MessageType.Hello, protocolVersion: 3, reconnectToken: tokenBytes(42) };
+    expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
+  });
+
+  it("InputBatch with redundant frames, viewTick, interact and ping", () => {
     const frames: InputSample[] = [
       sampleInput({ jump: true, crouch: false, walk: true, fire: false }),
-      sampleInput({ forward: 0, right: 0, jump: false, fire: true, ads: false, reload: true }),
-      sampleInput({ forward: -1, right: 1, crouch: true, slot1: true, slot2: false }),
+      sampleInput({ forward: 0, right: 0, jump: false, fire: true, ads: false, reload: true, interact: true }),
+      sampleInput({ forward: -1, right: 1, crouch: true, slot1: true, slot2: false, ping: true }),
     ];
     const msg: ProtocolMessage = { type: MessageType.InputBatch, firstSeq: 99, viewTick: 4321, frames };
     expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
@@ -196,34 +290,49 @@ describe("protocol message round-trip", () => {
     expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
   });
 
-  it("Welcome", () => {
-    const msg: ProtocolMessage = { type: MessageType.Welcome, playerIndex: 3, seed: 424242, numPlayers: 10, serverTick: 555 };
+  it("SellCmd", () => {
+    const msg: ProtocolMessage = { type: MessageType.SellCmd, itemId: 3 };
     expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
   });
 
-  it("Snapshot with several players and dropped weapons", () => {
-    const players: SnapshotPlayer[] = [
-      samplePlayer(),
-      samplePlayer({
-        posX: -10,
-        posY: 2.2,
-        posZ: 0,
-        crouching: true,
-        grounded: false,
-        alive: false,
-        activeSlot: 1,
-        adsStage: 0,
-        respawnTicksLeft: 120,
-      }),
-    ];
-    const droppedWeapons: SnapshotDroppedWeapon[] = [sampleDrop(), sampleDrop({ id: 9, weaponId: 5, x: -5, y: 0, z: 10, mag: 5 })];
-    const msg: ProtocolMessage = { type: MessageType.Snapshot, serverTick: 1000, lastProcessedSeq: 998, players, droppedWeapons };
+  it("Welcome carries token/team/mode", () => {
+    const msg: ProtocolMessage = {
+      type: MessageType.Welcome,
+      playerIndex: 3,
+      seed: 424242,
+      numPlayers: 10,
+      serverTick: 555,
+      token: tokenBytes(7),
+      team: 1,
+      mode: 1,
+    };
+    expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
+  });
+
+  it("Snapshot with the M3 match section, several players, and dropped weapons", () => {
+    const msg = sampleSnapshot({
+      players: [
+        samplePlayer(),
+        samplePlayer({
+          posX: -10,
+          posY: 2.2,
+          posZ: 0,
+          crouching: true,
+          grounded: false,
+          alive: false,
+          activeSlot: 1,
+          adsStage: 0,
+          respawnTicksLeft: 120,
+          team: 1,
+        }),
+      ],
+      droppedWeapons: [sampleDrop(), sampleDrop({ id: 9, weaponId: 5, x: -5, y: 0, z: 10, mag: 5 })],
+    });
     expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
   });
 
   it("Snapshot clamps credits to 9000 and huge tagTicksLeft/respawnTicksLeft to 255 on the wire", () => {
-    const players: SnapshotPlayer[] = [samplePlayer({ credits: 50000, tagTicksLeft: 9999, respawnTicksLeft: 9999 })];
-    const msg: ProtocolMessage = { type: MessageType.Snapshot, serverTick: 1, lastProcessedSeq: 0, players, droppedWeapons: [] };
+    const msg = sampleSnapshot({ players: [samplePlayer({ credits: 50000, tagTicksLeft: 9999, respawnTicksLeft: 9999 })] });
     const decoded = decodeMessage(encodeMessage(msg));
     if (decoded.type === MessageType.Snapshot) {
       expect(decoded.players[0]!.credits).toBe(9000);
@@ -246,6 +355,21 @@ describe("protocol message round-trip", () => {
 
   it("DamageTaken", () => {
     const msg: ProtocolMessage = { type: MessageType.DamageTaken, victimIndex: 4, attackerIndex: 1, damage: 40 };
+    expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
+  });
+
+  it("MapPing", () => {
+    const msg: ProtocolMessage = { type: MessageType.MapPing, x: 12.5, z: -3.25 };
+    expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
+  });
+
+  it("TeamPing", () => {
+    const msg: ProtocolMessage = { type: MessageType.TeamPing, playerIndex: 2, x: 12.5, z: -3.25 };
+    expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
+  });
+
+  it("MatchEvent", () => {
+    const msg: ProtocolMessage = { type: MessageType.MatchEvent, kind: 3, winnerTeam: 255, reason: 255, roundNumber: 9 };
     expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
   });
 });
@@ -274,12 +398,17 @@ describe("protocol message fuzz round-trip", () => {
     function randAxis(): number {
       return randInt(3) - 1; // -1, 0, 1 (exact wire representation)
     }
+    function randToken(): Uint8Array {
+      const t = new Uint8Array(TOKEN_LENGTH);
+      for (let i = 0; i < TOKEN_LENGTH; i++) t[i] = randInt(256);
+      return t;
+    }
 
     function randomMessage(): ProtocolMessage {
-      const kind = randInt(8);
+      const kind = randInt(12);
       switch (kind) {
         case 0:
-          return { type: MessageType.Hello, protocolVersion: randInt(256) };
+          return { type: MessageType.Hello, protocolVersion: randInt(256), reconnectToken: randBool() ? randToken() : NO_TOKEN };
         case 1: {
           const count = 1 + randInt(3);
           const frames: InputSample[] = [];
@@ -297,6 +426,8 @@ describe("protocol message fuzz round-trip", () => {
               reload: randBool(),
               slot1: randBool(),
               slot2: randBool(),
+              interact: randBool(),
+              ping: randBool(),
             });
           }
           return { type: MessageType.InputBatch, firstSeq: randInt(2 ** 31), viewTick: randInt(2 ** 31), frames };
@@ -310,6 +441,9 @@ describe("protocol message fuzz round-trip", () => {
             seed: randInt(2 ** 31),
             numPlayers: 1 + randInt(16),
             serverTick: randInt(2 ** 31),
+            token: randToken(),
+            team: randInt(256),
+            mode: randInt(2),
           };
         case 4: {
           const count = randInt(16);
@@ -339,6 +473,7 @@ describe("protocol message fuzz round-trip", () => {
               tagTicksLeft: randInt(256),
               credits: randInt(9001),
               respawnTicksLeft: randInt(256),
+              team: randInt(256),
             });
           }
           const dropCount = randInt(5);
@@ -359,6 +494,23 @@ describe("protocol message fuzz round-trip", () => {
             lastProcessedSeq: randInt(2 ** 31),
             players,
             droppedWeapons,
+            mode: randInt(2),
+            matchPhase: randInt(256),
+            phaseTicksLeft: randInt(2 ** 31),
+            roundNumber: randInt(256),
+            scoreTeam0: randInt(256),
+            scoreTeam1: randInt(256),
+            spikeState: randInt(256),
+            spikeCarrier: randInt(256),
+            spikeX: randF32(),
+            spikeY: randF32(),
+            spikeZ: randF32(),
+            spikePlantedTicksLeft: randInt(2 ** 31),
+            activePlantProgress: randInt(65536),
+            planterIndex: randInt(256),
+            activeDefuseProgress: randInt(65536),
+            defuserIndex: randInt(256),
+            visibleEnemyMask: randInt(65536),
           };
         }
         case 5:
@@ -379,13 +531,21 @@ describe("protocol message fuzz round-trip", () => {
             region: randInt(3),
             targetHealthAfter: randInt(256),
           };
-        default:
+        case 7:
           return {
             type: MessageType.DamageTaken,
             victimIndex: randInt(16),
             attackerIndex: randInt(16),
             damage: randInt(65536),
           };
+        case 8:
+          return { type: MessageType.MapPing, x: randF32(), z: randF32() };
+        case 9:
+          return { type: MessageType.TeamPing, playerIndex: randInt(16), x: randF32(), z: randF32() };
+        case 10:
+          return { type: MessageType.MatchEvent, kind: randInt(256), winnerTeam: randInt(256), reason: randInt(256), roundNumber: randInt(256) };
+        default:
+          return { type: MessageType.SellCmd, itemId: randInt(256) };
       }
     }
 
@@ -402,34 +562,50 @@ describe("malformed-frame safety for new/changed messages", () => {
     expect(decodeMessageSafely(new Uint8Array([MessageType.BuyCmd]))).toBeNull();
   });
 
-  it("drops a truncated InputBatch missing the new viewTick field", () => {
-    // type=2, firstSeq (4 bytes) but nothing else (no viewTick, no count).
-    expect(decodeMessageSafely(new Uint8Array([MessageType.InputBatch, 0, 0, 0, 0]))).toBeNull();
+  it("drops a truncated SellCmd (no itemId byte)", () => {
+    expect(decodeMessageSafely(new Uint8Array([MessageType.SellCmd]))).toBeNull();
   });
 
-  it("drops a Snapshot truncated mid-player (missing the new combat fields)", () => {
-    const full = encodeMessage({
-      type: MessageType.Snapshot,
-      serverTick: 1,
-      lastProcessedSeq: 1,
-      players: [samplePlayer()],
-      droppedWeapons: [],
-    });
-    // Cut off partway through the first player's record.
-    const truncated = full.slice(0, full.length - 10);
+  it("drops a truncated Hello (missing the 16-byte reconnect token)", () => {
+    expect(decodeMessageSafely(new Uint8Array([MessageType.Hello, 3]))).toBeNull();
+    expect(decodeMessageSafely(new Uint8Array([MessageType.Hello, 3, 1, 2, 3]))).toBeNull(); // partial token
+  });
+
+  it("drops a truncated Welcome (missing token/team/mode)", () => {
+    const bytes = [MessageType.Welcome, 1, 0, 0, 0, 0, 5, 0, 0, 0, 0]; // playerIndex,seed(4),numPlayers,serverTick(4) then nothing
+    expect(decodeMessageSafely(new Uint8Array(bytes))).toBeNull();
+  });
+
+  it("drops a truncated InputBatch missing the new u16 buttons field", () => {
+    // type, firstSeq(4), viewTick(4), count=1, forward, right, yaw(4), pitch(4), then only 1 button byte (needs 2).
+    const bytes = [MessageType.InputBatch, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    expect(decodeMessageSafely(new Uint8Array(bytes))).toBeNull();
+  });
+
+  it("drops a Snapshot truncated mid-player (missing team/combat fields)", () => {
+    const full = encodeMessage(sampleSnapshot());
+    const truncated = full.slice(0, full.length - 40);
+    expect(decodeMessageSafely(truncated)).toBeNull();
+  });
+
+  it("drops a Snapshot truncated inside the match section", () => {
+    const full = encodeMessage(sampleSnapshot());
+    const truncated = full.slice(0, full.length - 5);
     expect(decodeMessageSafely(truncated)).toBeNull();
   });
 
   it("drops a Snapshot truncated inside the droppedWeapons list", () => {
-    const full = encodeMessage({
-      type: MessageType.Snapshot,
-      serverTick: 1,
-      lastProcessedSeq: 1,
-      players: [],
-      droppedWeapons: [sampleDrop()],
-    });
-    const truncated = full.slice(0, full.length - 3);
+    const full = encodeMessage(sampleSnapshot({ players: [], droppedWeapons: [sampleDrop()] }));
+    // Cut inside the match section AND partially into drops is covered above;
+    // here we cut precisely mid-drop-list, well before the match section.
+    const truncated = full.slice(0, 12);
     expect(decodeMessageSafely(truncated)).toBeNull();
+  });
+
+  it("drops truncated MapPing/TeamPing/MatchEvent", () => {
+    expect(decodeMessageSafely(new Uint8Array([MessageType.MapPing, 1, 2]))).toBeNull();
+    expect(decodeMessageSafely(new Uint8Array([MessageType.TeamPing, 1, 2]))).toBeNull();
+    expect(decodeMessageSafely(new Uint8Array([MessageType.MatchEvent, 1, 2]))).toBeNull();
   });
 
   it("drops a truncated KillEvent/HitConfirm/DamageTaken", () => {
@@ -438,15 +614,18 @@ describe("malformed-frame safety for new/changed messages", () => {
     expect(decodeMessageSafely(new Uint8Array([MessageType.DamageTaken, 1]))).toBeNull();
   });
 
-  it("drops the removed FireCmd tag (3) if it now decodes as BuyCmd-shaped garbage without throwing", () => {
-    // Tag 3 is now BuyCmd (u8 itemId); feeding it FireCmd's old 8-byte body
-    // must still decode safely (extra trailing bytes are simply unread) —
-    // never throw past the boundary regardless of stale-client payloads.
-    expect(() => decodeMessageSafely(new Uint8Array([3, 1, 2, 3, 4, 5, 6, 7, 8]))).not.toThrow();
-  });
-
   it("still handles a fully unknown type tag and an empty frame", () => {
     expect(decodeMessageSafely(new Uint8Array([250, 1, 2, 3]))).toBeNull();
     expect(decodeMessageSafely(new Uint8Array([]))).toBeNull();
+  });
+});
+
+describe("protocol version", () => {
+  it("a v2-shaped Hello (old 1-byte body, no token) is rejected as malformed by a v3 decoder", () => {
+    // Old Hello was exactly [type, protocolVersion] — 2 bytes total. A v3
+    // decoder additionally expects a 16-byte token and must treat the
+    // missing bytes as a truncated (thus malformed, thus safely-dropped)
+    // frame, never silently accept it as valid.
+    expect(decodeMessageSafely(new Uint8Array([MessageType.Hello, 2]))).toBeNull();
   });
 });
