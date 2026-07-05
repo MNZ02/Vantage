@@ -2,25 +2,35 @@
 // leading u8 type tag followed by fixed-size little-endian fields (DataView),
 // so encode/decode never depend on platform endianness.
 //
+// M2 changes (protocolVersion bumped 1 -> 2): FireCmd is removed entirely —
+// shots are now derived deterministically inside sim's tick() from the
+// `fire` input bit (see @vg/sim tick.ts/weapons/logic.ts), so there is
+// nothing left for a discrete "I fired" message to carry. InputBatch's
+// header gains `viewTick` (replacing FireCmd's per-shot viewTick — the
+// server now just keeps the latest per client for lag-comp rewind). The
+// buttons byte grows from 4 to 8 bits (ads/reload/slot1/slot2). Snapshot
+// gains combat fields per player plus a droppedWeapons entity list. New
+// messages: BuyCmd (C->S), KillEvent/HitConfirm/DamageTaken (S->C).
+//
 // Deviation from the spec's field list, stated plainly: Snapshot and
 // InputBatch both carry an explicit array-length prefix (Snapshot's
 // `numPlayers`, InputBatch's `count`) so a decoder never needs external
 // context (the client's cached numPlayers, say) to know how many entries
 // follow — self-describing messages are easier to round-trip/fuzz-test and
-// slightly more robust to reconnect-time ordering. Both were already named as
-// fields in the spec for InputBatch; Snapshot's `numPlayers` is the only
-// addition, and it costs one byte.
+// slightly more robust to reconnect-time ordering.
 
 export enum MessageType {
   Hello = 1,
   InputBatch = 2,
-  FireCmd = 3,
+  BuyCmd = 3,
   Welcome = 4,
   Snapshot = 5,
-  HitEvent = 6,
+  KillEvent = 6,
+  HitConfirm = 7,
+  DamageTaken = 8,
 }
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export interface HelloMessage {
   readonly type: MessageType.Hello;
@@ -37,18 +47,24 @@ export interface InputSample {
   readonly crouch: boolean;
   readonly walk: boolean;
   readonly fire: boolean;
+  readonly ads: boolean;
+  readonly reload: boolean;
+  readonly slot1: boolean;
+  readonly slot2: boolean;
 }
 
 export interface InputBatchMessage {
   readonly type: MessageType.InputBatch;
   readonly firstSeq: number; // u32, sequence number of frames[0]
+  /** The client's current interpolation target tick (for server-side lag-comp rewind of this batch's shots). */
+  readonly viewTick: number; // u32
   readonly frames: readonly InputSample[]; // count: u8, up to 255
 }
 
-export interface FireCmdMessage {
-  readonly type: MessageType.FireCmd;
-  readonly seq: number; // u32
-  readonly viewTick: number; // u32
+/** C->S: buy a weapon (itemId = weapon id) or armor (itemId = BUY_ITEM_LIGHT_ARMOR/BUY_ITEM_HEAVY_ARMOR, see @vg/sim constants). */
+export interface BuyCmdMessage {
+  readonly type: MessageType.BuyCmd;
+  readonly itemId: number; // u8
 }
 
 export interface WelcomeMessage {
@@ -71,6 +87,27 @@ export interface SnapshotPlayer {
   readonly crouching: boolean;
   readonly grounded: boolean;
   readonly connected: boolean;
+  readonly alive: boolean;
+  readonly activeSlot: number; // 0 | 1
+  readonly adsStage: number; // 0..2
+  readonly health: number; // u8
+  readonly armor: number; // u8
+  readonly weaponPrimary: number; // u8, 255 = none
+  readonly weaponSecondary: number; // u8
+  readonly magActive: number; // u16
+  readonly reserveActive: number; // u16
+  readonly tagTicksLeft: number; // u8 (clamped)
+  readonly credits: number; // u16 (clamped to 9000)
+  readonly respawnTicksLeft: number; // u8 (clamped)
+}
+
+export interface SnapshotDroppedWeapon {
+  readonly id: number; // u8, entity id (stable while the drop exists)
+  readonly weaponId: number; // u8
+  readonly x: number;
+  readonly y: number;
+  readonly z: number;
+  readonly mag: number; // u16, ammo the drop was left with
 }
 
 export interface SnapshotMessage {
@@ -78,31 +115,77 @@ export interface SnapshotMessage {
   readonly serverTick: number; // u32
   readonly lastProcessedSeq: number; // u32, for the receiving client
   readonly players: readonly SnapshotPlayer[]; // numPlayers: u8, then that many entries
+  readonly droppedWeapons: readonly SnapshotDroppedWeapon[]; // count: u8, then that many entries (server caps at 32 live drops)
 }
 
-export interface HitEventMessage {
-  readonly type: MessageType.HitEvent;
+/** S->C: a player died. */
+export interface KillEventMessage {
+  readonly type: MessageType.KillEvent;
+  readonly killerIndex: number; // u8
+  readonly victimIndex: number; // u8
+  readonly weaponId: number; // u8
+  readonly headshot: boolean; // flags bit 0
+  readonly assistIndex: number; // u8, 255 = none
+}
+
+/** S->C: sent to the shooter only, confirming a hit it just landed. */
+export interface HitConfirmMessage {
+  readonly type: MessageType.HitConfirm;
   readonly shooterIndex: number; // u8
   readonly targetIndex: number; // u8
-  readonly serverTick: number; // u32
+  readonly damage: number; // u16
+  readonly region: number; // u8: 0 = head, 1 = body, 2 = legs
+  readonly targetHealthAfter: number; // u8
+}
+
+/** S->C: sent to the victim only, for a damage-direction indicator. */
+export interface DamageTakenMessage {
+  readonly type: MessageType.DamageTaken;
+  readonly victimIndex: number; // u8
+  readonly attackerIndex: number; // u8
+  readonly damage: number; // u16
 }
 
 export type ProtocolMessage =
   | HelloMessage
   | InputBatchMessage
-  | FireCmdMessage
+  | BuyCmdMessage
   | WelcomeMessage
   | SnapshotMessage
-  | HitEventMessage;
+  | KillEventMessage
+  | HitConfirmMessage
+  | DamageTakenMessage;
 
 const JUMP_BIT = 1 << 0;
 const CROUCH_BIT = 1 << 1;
 const WALK_BIT = 1 << 2;
 const FIRE_BIT = 1 << 3;
+const ADS_BIT = 1 << 4;
+const RELOAD_BIT = 1 << 5;
+const SLOT1_BIT = 1 << 6;
+const SLOT2_BIT = 1 << 7;
 
 const CROUCHING_BIT = 1 << 0;
 const GROUNDED_BIT = 1 << 1;
 const CONNECTED_BIT = 1 << 2;
+const ALIVE_BIT = 1 << 3;
+const ACTIVE_SLOT_BIT = 1 << 4;
+const ADS_STAGE_SHIFT = 5; // 2 bits: 5,6
+const ADS_STAGE_MASK = 0b11;
+
+const HEADSHOT_BIT = 1 << 0;
+
+/** Regions in a stable wire order, matching @vg/sim's HitRegion union. */
+export const HIT_REGIONS = ["head", "body", "legs"] as const;
+export type WireHitRegion = (typeof HIT_REGIONS)[number];
+
+export function encodeRegion(region: WireHitRegion): number {
+  return HIT_REGIONS.indexOf(region);
+}
+
+export function decodeRegion(code: number): WireHitRegion {
+  return HIT_REGIONS[code] ?? "body";
+}
 
 /** Small growable little-endian byte writer. */
 class Writer {
@@ -135,6 +218,12 @@ class Writer {
     this.ensure(1);
     this.view.setInt8(this.offset, v);
     this.offset += 1;
+  }
+
+  u16(v: number): void {
+    this.ensure(2);
+    this.view.setUint16(this.offset, v & 0xffff, true);
+    this.offset += 2;
   }
 
   u32(v: number): void {
@@ -199,6 +288,13 @@ class Reader {
     return v;
   }
 
+  u16(): number {
+    this.ensureReadable(2);
+    const v = this.view.getUint16(this.offset, true);
+    this.offset += 2;
+    return v;
+  }
+
   u32(): number {
     this.ensureReadable(4);
     const v = this.view.getUint32(this.offset, true);
@@ -247,13 +343,49 @@ export function quantizeInputSample<T extends { forward: number; right: number; 
   };
 }
 
-function encodeButtons(s: Pick<InputSample, "jump" | "crouch" | "walk" | "fire">): number {
-  return (s.jump ? JUMP_BIT : 0) | (s.crouch ? CROUCH_BIT : 0) | (s.walk ? WALK_BIT : 0) | (s.fire ? FIRE_BIT : 0);
+function encodeButtons(
+  s: Pick<InputSample, "jump" | "crouch" | "walk" | "fire" | "ads" | "reload" | "slot1" | "slot2">,
+): number {
+  return (
+    (s.jump ? JUMP_BIT : 0) |
+    (s.crouch ? CROUCH_BIT : 0) |
+    (s.walk ? WALK_BIT : 0) |
+    (s.fire ? FIRE_BIT : 0) |
+    (s.ads ? ADS_BIT : 0) |
+    (s.reload ? RELOAD_BIT : 0) |
+    (s.slot1 ? SLOT1_BIT : 0) |
+    (s.slot2 ? SLOT2_BIT : 0)
+  );
 }
 
-function encodeFlags(p: Pick<SnapshotPlayer, "crouching" | "grounded" | "connected">): number {
-  return (p.crouching ? CROUCHING_BIT : 0) | (p.grounded ? GROUNDED_BIT : 0) | (p.connected ? CONNECTED_BIT : 0);
+/**
+ * Snapshot per-player flags byte layout: bit0 crouching, bit1 grounded,
+ * bit2 connected, bit3 alive, bit4 activeSlot (0=primary,1=secondary),
+ * bits5-6 adsStage (0..2), bit7 reserved/unused.
+ */
+function encodeFlags(p: Pick<SnapshotPlayer, "crouching" | "grounded" | "connected" | "alive" | "activeSlot" | "adsStage">): number {
+  return (
+    (p.crouching ? CROUCHING_BIT : 0) |
+    (p.grounded ? GROUNDED_BIT : 0) |
+    (p.connected ? CONNECTED_BIT : 0) |
+    (p.alive ? ALIVE_BIT : 0) |
+    (p.activeSlot ? ACTIVE_SLOT_BIT : 0) |
+    ((p.adsStage & ADS_STAGE_MASK) << ADS_STAGE_SHIFT)
+  );
 }
+
+function decodeFlags(flags: number): Pick<SnapshotPlayer, "crouching" | "grounded" | "connected" | "alive" | "activeSlot" | "adsStage"> {
+  return {
+    crouching: (flags & CROUCHING_BIT) !== 0,
+    grounded: (flags & GROUNDED_BIT) !== 0,
+    connected: (flags & CONNECTED_BIT) !== 0,
+    alive: (flags & ALIVE_BIT) !== 0,
+    activeSlot: (flags & ACTIVE_SLOT_BIT) !== 0 ? 1 : 0,
+    adsStage: (flags >> ADS_STAGE_SHIFT) & ADS_STAGE_MASK,
+  };
+}
+
+const CREDITS_CLAMP = 9000;
 
 export function encodeMessage(msg: ProtocolMessage): Uint8Array {
   const w = new Writer();
@@ -265,6 +397,7 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
     }
     case MessageType.InputBatch: {
       w.u32(msg.firstSeq);
+      w.u32(msg.viewTick);
       w.u8(msg.frames.length);
       for (const f of msg.frames) {
         w.i8(quantizeAxis(f.forward));
@@ -275,9 +408,8 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
       }
       break;
     }
-    case MessageType.FireCmd: {
-      w.u32(msg.seq);
-      w.u32(msg.viewTick);
+    case MessageType.BuyCmd: {
+      w.u8(msg.itemId);
       break;
     }
     case MessageType.Welcome: {
@@ -301,13 +433,47 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
         w.f32(p.yaw);
         w.f32(p.pitch);
         w.u8(encodeFlags(p));
+        w.u8(p.health);
+        w.u8(p.armor);
+        w.u8(p.weaponPrimary);
+        w.u8(p.weaponSecondary);
+        w.u16(p.magActive);
+        w.u16(p.reserveActive);
+        w.u8(Math.min(255, p.tagTicksLeft));
+        w.u16(Math.min(CREDITS_CLAMP, p.credits));
+        w.u8(Math.min(255, p.respawnTicksLeft));
+      }
+      w.u8(msg.droppedWeapons.length);
+      for (const d of msg.droppedWeapons) {
+        w.u8(d.id);
+        w.u8(d.weaponId);
+        w.f32(d.x);
+        w.f32(d.y);
+        w.f32(d.z);
+        w.u16(d.mag);
       }
       break;
     }
-    case MessageType.HitEvent: {
+    case MessageType.KillEvent: {
+      w.u8(msg.killerIndex);
+      w.u8(msg.victimIndex);
+      w.u8(msg.weaponId);
+      w.u8(msg.headshot ? HEADSHOT_BIT : 0);
+      w.u8(msg.assistIndex);
+      break;
+    }
+    case MessageType.HitConfirm: {
       w.u8(msg.shooterIndex);
       w.u8(msg.targetIndex);
-      w.u32(msg.serverTick);
+      w.u16(msg.damage);
+      w.u8(msg.region);
+      w.u8(msg.targetHealthAfter);
+      break;
+    }
+    case MessageType.DamageTaken: {
+      w.u8(msg.victimIndex);
+      w.u8(msg.attackerIndex);
+      w.u16(msg.damage);
       break;
     }
   }
@@ -324,6 +490,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
     }
     case MessageType.InputBatch: {
       const firstSeq = r.u32();
+      const viewTick = r.u32();
       const count = r.u8();
       const frames: InputSample[] = [];
       for (let i = 0; i < count; i++) {
@@ -341,14 +508,17 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
           crouch: (buttons & CROUCH_BIT) !== 0,
           walk: (buttons & WALK_BIT) !== 0,
           fire: (buttons & FIRE_BIT) !== 0,
+          ads: (buttons & ADS_BIT) !== 0,
+          reload: (buttons & RELOAD_BIT) !== 0,
+          slot1: (buttons & SLOT1_BIT) !== 0,
+          slot2: (buttons & SLOT2_BIT) !== 0,
         });
       }
-      return { type, firstSeq, frames };
+      return { type, firstSeq, viewTick, frames };
     }
-    case MessageType.FireCmd: {
-      const seq = r.u32();
-      const viewTick = r.u32();
-      return { type, seq, viewTick };
+    case MessageType.BuyCmd: {
+      const itemId = r.u8();
+      return { type, itemId };
     }
     case MessageType.Welcome: {
       const playerIndex = r.u8();
@@ -372,6 +542,15 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         const yaw = r.f32();
         const pitch = r.f32();
         const flags = r.u8();
+        const health = r.u8();
+        const armor = r.u8();
+        const weaponPrimary = r.u8();
+        const weaponSecondary = r.u8();
+        const magActive = r.u16();
+        const reserveActive = r.u16();
+        const tagTicksLeft = r.u8();
+        const credits = r.u16();
+        const respawnTicksLeft = r.u8();
         players.push({
           posX,
           posY,
@@ -381,18 +560,52 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
           velZ,
           yaw,
           pitch,
-          crouching: (flags & CROUCHING_BIT) !== 0,
-          grounded: (flags & GROUNDED_BIT) !== 0,
-          connected: (flags & CONNECTED_BIT) !== 0,
+          ...decodeFlags(flags),
+          health,
+          armor,
+          weaponPrimary,
+          weaponSecondary,
+          magActive,
+          reserveActive,
+          tagTicksLeft,
+          credits,
+          respawnTicksLeft,
         });
       }
-      return { type, serverTick, lastProcessedSeq, players };
+      const dropCount = r.u8();
+      const droppedWeapons: SnapshotDroppedWeapon[] = [];
+      for (let i = 0; i < dropCount; i++) {
+        const id = r.u8();
+        const weaponId = r.u8();
+        const x = r.f32();
+        const y = r.f32();
+        const z = r.f32();
+        const mag = r.u16();
+        droppedWeapons.push({ id, weaponId, x, y, z, mag });
+      }
+      return { type, serverTick, lastProcessedSeq, players, droppedWeapons };
     }
-    case MessageType.HitEvent: {
+    case MessageType.KillEvent: {
+      const killerIndex = r.u8();
+      const victimIndex = r.u8();
+      const weaponId = r.u8();
+      const flags = r.u8();
+      const assistIndex = r.u8();
+      return { type, killerIndex, victimIndex, weaponId, headshot: (flags & HEADSHOT_BIT) !== 0, assistIndex };
+    }
+    case MessageType.HitConfirm: {
       const shooterIndex = r.u8();
       const targetIndex = r.u8();
-      const serverTick = r.u32();
-      return { type, shooterIndex, targetIndex, serverTick };
+      const damage = r.u16();
+      const region = r.u8();
+      const targetHealthAfter = r.u8();
+      return { type, shooterIndex, targetIndex, damage, region, targetHealthAfter };
+    }
+    case MessageType.DamageTaken: {
+      const victimIndex = r.u8();
+      const attackerIndex = r.u8();
+      const damage = r.u16();
+      return { type, victimIndex, attackerIndex, damage };
     }
     default: {
       const exhaustive: never = type;
