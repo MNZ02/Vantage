@@ -1,4 +1,18 @@
-import { CROUCH_HEIGHT, EYE_HEIGHT_STAND, STAND_HEIGHT, WEAPONS, createPrngState, nextRandom } from "@vg/sim";
+import {
+  CROUCH_HEIGHT,
+  EYE_HEIGHT_STAND,
+  MODE_MATCH,
+  PHASE_BUY,
+  PHASE_ROUND,
+  SITE_ZONES,
+  SPIKE_CARRIED,
+  SPIKE_PLANTED,
+  STAND_HEIGHT,
+  TEAM_ATTACKERS,
+  WEAPONS,
+  createPrngState,
+  nextRandom,
+} from "@vg/sim";
 import { MessageType, decodeMessageSafely, encodeMessage, type InputSample, type ProtocolMessage, type Transport } from "@vg/protocol";
 
 // Bot movement/action lives here (server-side), not sim/src, so it is not
@@ -16,10 +30,18 @@ const WAYPOINTS: ReadonlyArray<{ x: number; z: number }> = [
 ];
 
 const WAYPOINT_ARRIVE_RADIUS = 1.5;
+const SITE_ARRIVE_RADIUS = 2.0;
+const DEFUSE_RANGE_M = 1.3; // a hair inside DEFUSE_RADIUS_M so bots don't hover right at the edge
 const BURST_LEN_TICKS = 10;
 const BURST_GAP_TICKS = 25;
 const ENGAGE_RANGE_M = 40;
 const AIM_ERROR_RAD = 0.06; // "small error", per spec
+
+/** Site zone centers (2D), derived once from @vg/sim's SITE_ZONES — match-mode bots path to these. */
+const SITE_CENTERS: ReadonlyArray<{ x: number; z: number }> = SITE_ZONES.map((zone) => ({
+  x: (zone.box.minX + zone.box.maxX) / 2,
+  z: (zone.box.minZ + zone.box.maxZ) / 2,
+}));
 
 interface KnownOther {
   x: number;
@@ -28,6 +50,7 @@ interface KnownOther {
   crouching: boolean;
   alive: boolean;
   connected: boolean;
+  team: number;
 }
 
 export class Bot {
@@ -46,12 +69,24 @@ export class Bot {
   private boughtOnce = false;
   private others: KnownOther[] = [];
 
+  // ---- M3 match awareness (only populated when the server runs mode: "match") ----
+  private mode = 0; // MODE_DM by default
+  private matchPhase = 0;
+  private team = 255;
+  private spikeState = 0;
+  private spikeCarrier = 255;
+  private spikeX = 0;
+  private spikeZ = 0;
+  /** Which of the two sites this bot commits to (stable per-instance so a squad naturally splits). */
+  private readonly assignedSiteIndex: number;
+
   constructor(
     private readonly transport: Transport,
     seed: number,
   ) {
     this.prngState = createPrngState(seed);
     this.waypointIndex = this.randInt(WAYPOINTS.length);
+    this.assignedSiteIndex = this.randInt(Math.max(1, SITE_CENTERS.length));
     this.ticksUntilNextBurst = this.randInt(60);
     transport.onMessage((data) => {
       const msg = decodeMessageSafely(data);
@@ -73,27 +108,44 @@ export class Bot {
     if (msg.type === MessageType.Welcome) {
       this.playerIndex = msg.playerIndex;
       this.lastKnownServerTick = msg.serverTick;
+      this.mode = msg.mode;
+      this.team = msg.team;
     } else if (msg.type === MessageType.Snapshot && this.playerIndex !== null) {
       this.lastKnownServerTick = msg.serverTick;
+      this.mode = msg.mode;
+      this.matchPhase = msg.matchPhase;
+      this.spikeState = msg.spikeState;
+      this.spikeCarrier = msg.spikeCarrier;
+      this.spikeX = msg.spikeX;
+      this.spikeZ = msg.spikeZ;
       const me = msg.players[this.playerIndex];
       if (me) {
         this.lastKnownPos = { x: me.posX, z: me.posZ };
         this.credits = me.credits;
         this.alive = me.alive;
         this.hasPrimary = me.weaponPrimary !== 255;
+        this.team = me.team;
       }
       this.others = msg.players
         .filter((_, i) => i !== this.playerIndex)
-        .map((p) => ({ x: p.posX, y: p.posY, z: p.posZ, crouching: p.crouching, alive: p.alive, connected: p.connected }));
+        .map((p) => ({ x: p.posX, y: p.posY, z: p.posZ, crouching: p.crouching, alive: p.alive, connected: p.connected, team: p.team }));
     }
   }
 
-  /** Nearest connected, alive other player within ENGAGE_RANGE_M of `pos`, or null. */
+  /**
+   * Nearest connected, alive other player within ENGAGE_RANGE_M of `pos`, or
+   * null. In match mode, "enemy" means it (teammates are filtered out) —
+   * getting this wrong was a real bug: without the team filter, bots would
+   * usually lock onto the nearest TEAMMATE (who's headed to the same
+   * objective) and "fight" them, which friendly-fire-off makes harmless but
+   * pointless, starving the soak of any actual cross-team engagements.
+   */
   private nearestEnemy(pos: { x: number; z: number }): KnownOther | null {
     let best: KnownOther | null = null;
     let bestDist = ENGAGE_RANGE_M;
     for (const other of this.others) {
       if (!other.alive || !other.connected) continue;
+      if (this.mode === MODE_MATCH && other.team === this.team) continue;
       const dist = Math.hypot(other.x - pos.x, other.z - pos.z);
       if (dist < bestDist) {
         best = other;
@@ -119,6 +171,156 @@ export class Bot {
 
   /** Produces and sends exactly one tick's worth of scripted input (call at 64 Hz). */
   tick(): void {
+    if (this.mode === MODE_MATCH) {
+      this.tickMatch();
+    } else {
+      this.tickDeathmatch();
+    }
+  }
+
+  private send(sample: InputSample): void {
+    this.history.push(sample);
+    if (this.history.length > 3) this.history.shift();
+    const firstSeq = this.seq - this.history.length + 1;
+
+    this.transport.send(
+      encodeMessage({
+        type: MessageType.InputBatch,
+        firstSeq,
+        viewTick: this.lastKnownServerTick,
+        frames: this.history.slice(),
+      }),
+    );
+    this.seq++;
+  }
+
+  private idleSample(yaw = 0): InputSample {
+    return {
+      forward: 0,
+      right: 0,
+      yaw,
+      pitch: 0,
+      jump: false,
+      crouch: false,
+      walk: false,
+      fire: false,
+      ads: false,
+      reload: false,
+      slot1: false,
+      slot2: false,
+      interact: false,
+      ping: false,
+    };
+  }
+
+  /**
+   * M3 match-aware behavior: buy at buy phase; attackers path the spike
+   * carrier toward a site and hold interact to plant once there; other
+   * attackers push toward the same site; defenders roam between sites and
+   * hold interact to defuse once the spike is planted and they're in range.
+   * Deliberately simple/scripted (spec: "keep it simple/scripted; must
+   * produce plants+defuses in the soak"), not a full combat-aware AI.
+   */
+  private tickMatch(): void {
+    const pos = this.lastKnownPos ?? { x: 0, z: 0 };
+
+    if (this.matchPhase === PHASE_BUY) {
+      this.maybeBuy();
+      this.send(this.idleSample(0));
+      return;
+    }
+
+    if (this.matchPhase !== PHASE_ROUND) {
+      this.send(this.idleSample(0));
+      return;
+    }
+
+    const isAttacker = this.team === TEAM_ATTACKERS;
+    const isCarrier = this.spikeCarrier === this.playerIndex && this.spikeState === SPIKE_CARRIED;
+    const spikePlanted = this.spikeState === SPIKE_PLANTED;
+
+    let target: { x: number; z: number };
+    let arriveRadius = SITE_ARRIVE_RADIUS;
+    let shouldInteract = false;
+
+    if (isAttacker) {
+      target = SITE_CENTERS[this.assignedSiteIndex % Math.max(1, SITE_CENTERS.length)] ?? { x: 0, z: 0 };
+      if (isCarrier) {
+        const dist = Math.hypot(target.x - pos.x, target.z - pos.z);
+        shouldInteract = dist <= arriveRadius;
+      }
+    } else if (spikePlanted) {
+      target = { x: this.spikeX, z: this.spikeZ };
+      arriveRadius = DEFUSE_RANGE_M;
+      const dist = Math.hypot(target.x - pos.x, target.z - pos.z);
+      shouldInteract = dist <= arriveRadius;
+    } else {
+      // Patrol between sites while nothing is planted.
+      target = SITE_CENTERS[this.waypointIndex % Math.max(1, SITE_CENTERS.length)] ?? { x: 0, z: 0 };
+      const dist = Math.hypot(target.x - pos.x, target.z - pos.z);
+      if (dist < WAYPOINT_ARRIVE_RADIUS) this.waypointIndex = (this.waypointIndex + 1) % Math.max(1, SITE_CENTERS.length);
+    }
+
+    const dx = target.x - pos.x;
+    const dz = target.z - pos.z;
+    const dist = Math.hypot(dx, dz);
+    const arrived = dist <= arriveRadius;
+
+    this.maybeBuy();
+
+    const enemy = shouldInteract ? null : this.nearestEnemy(pos); // don't get distracted mid-channel
+    // Movement heading (toward the OBJECTIVE) and look/aim yaw (toward an
+    // enemy, if any) are deliberately decoupled: sim's InputFrame always
+    // moves relative to whatever yaw is sent, so if an enemy is in range the
+    // bot needs forward/right computed relative to the AIM yaw (not the
+    // objective's raw heading), or firing at a target off to the side would
+    // otherwise drag it off-course from the site/spike/defuse position.
+    let yaw = Math.atan2(dx, dz); // no enemy: look the way we're walking
+    let pitch = 0;
+    let fire = false;
+    if (enemy) {
+      const edx = enemy.x - pos.x;
+      const edz = enemy.z - pos.z;
+      const horizontalDist = Math.max(0.5, Math.hypot(edx, edz));
+      const enemyHeight = enemy.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
+      const enemyBodyY = enemy.y + enemyHeight * 0.5;
+      const dy = enemyBodyY - EYE_HEIGHT_STAND;
+      yaw = Math.atan2(edx, edz) + (this.rand() * 2 - 1) * AIM_ERROR_RAD;
+      pitch = Math.atan2(dy, horizontalDist) + (this.rand() * 2 - 1) * AIM_ERROR_RAD;
+      fire = this.rand() < 0.5;
+    }
+
+    let forward = 0;
+    let right = 0;
+    if (!shouldInteract && !arrived && dist > 1e-6) {
+      // Decompose the world-space wish direction (toward `target`) into
+      // forward/right components relative to `yaw` (see movement.ts's
+      // wishDirection(): forward = (sin(yaw), cos(yaw)), right = (cos(yaw), -sin(yaw))).
+      const wishX = dx / dist;
+      const wishZ = dz / dist;
+      forward = wishX * Math.sin(yaw) + wishZ * Math.cos(yaw);
+      right = wishX * Math.cos(yaw) - wishZ * Math.sin(yaw);
+    }
+
+    this.send({
+      forward,
+      right,
+      yaw,
+      pitch,
+      jump: false,
+      crouch: false,
+      walk: false,
+      fire,
+      ads: false,
+      reload: false,
+      slot1: false,
+      slot2: false,
+      interact: shouldInteract,
+      ping: false,
+    });
+  }
+
+  private tickDeathmatch(): void {
     const target = WAYPOINTS[this.waypointIndex]!;
     const pos = this.lastKnownPos ?? { x: 0, z: 0 };
     const dx = target.x - pos.x;
@@ -175,7 +377,7 @@ export class Bot {
       this.ticksUntilNextBurst = 5 + this.randInt(20);
     }
 
-    const sample: InputSample = {
+    this.send({
       forward: 1,
       right: 0,
       yaw,
@@ -188,20 +390,8 @@ export class Bot {
       reload: this.rand() < 0.01,
       slot1: false,
       slot2: false,
-    };
-
-    this.history.push(sample);
-    if (this.history.length > 3) this.history.shift();
-    const firstSeq = this.seq - this.history.length + 1;
-
-    this.transport.send(
-      encodeMessage({
-        type: MessageType.InputBatch,
-        firstSeq,
-        viewTick: this.lastKnownServerTick,
-        frames: this.history.slice(),
-      }),
-    );
-    this.seq++;
+      interact: false,
+      ping: false,
+    });
   }
 }

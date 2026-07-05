@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   ASSIST_WINDOW_TICKS,
   DROP_DESPAWN_TICKS,
@@ -7,13 +8,27 @@ import {
   MAX_CREDITS,
   MAX_DROPPED_WEAPONS,
   MAX_PLAYERS,
+  NO_PLAYER,
+  PHASE_BUY,
+  PHASE_MATCH_END,
+  PHASE_ROUND,
+  PHASE_ROUND_END,
+  PHASE_WAITING,
   PICKUP_RADIUS_M,
+  SPIKE_DEFUSED,
+  SPIKE_DETONATED,
+  SPIKE_PLANTED,
+  TEAM_ATTACKERS,
+  TEAM_DEFENDERS,
+  TEAM_NONE,
   WEAPON_NONE,
   applyBuy,
   applyDamage,
+  applySell,
   applyTag,
   clamp,
   clearPrimaryWeapon,
+  createMatchState,
   createState,
   damageForHit,
   eyePosition,
@@ -23,15 +38,19 @@ import {
   raycastPlayers,
   shotDirection,
   spawnForIndex,
+  startMatch,
   tick,
   type Box,
   type InputFrame,
+  type MatchConfig,
   type ShotEvent,
   type SimState,
 } from "@vg/sim";
 import {
   MessageType,
+  NO_TOKEN,
   PROTOCOL_VERSION,
+  TOKEN_LENGTH,
   decodeMessageSafely,
   encodeMessage,
   type BuyCmdMessage,
@@ -39,9 +58,13 @@ import {
   type HitConfirmMessage,
   type InputSample,
   type KillEventMessage,
+  type MapPingMessage,
+  type MatchEventMessage,
+  type SellCmdMessage,
   type SnapshotDroppedWeapon,
   type SnapshotMessage,
   type SnapshotPlayer,
+  type TeamPingMessage,
   type Transport,
 } from "@vg/protocol";
 import { JitterBuffer, type JitterBufferStats } from "./jitterbuffer.js";
@@ -50,6 +73,8 @@ import { StateRingBuffer } from "./ringbuffer.js";
 function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
+
+export type ServerMode = "dm" | "match";
 
 export interface ServerHostOptions {
   seed?: number;
@@ -62,6 +87,14 @@ export interface ServerHostOptions {
   /** Hitscan max range, world units. */
   fireMaxRange?: number;
   boxes?: readonly Box[];
+  /** "dm" (M2 behavior, default — keeps existing tests/offline mode working) or "match" (M3 round structure). */
+  mode?: ServerMode;
+  /** Match mode only: number of connected players required before startMatch() fires. Defaults to 2. */
+  minPlayers?: number;
+  /** Match mode only: overrides for @vg/sim's MatchConfig (tests shrink timers/winTarget). */
+  matchConfig?: Partial<MatchConfig>;
+  /** Match mode only: wall-clock ms a disconnected slot is held before it frees for new joins. Defaults to 90_000. */
+  reconnectHoldMs?: number;
 }
 
 interface ClientRecord {
@@ -70,6 +103,8 @@ interface ClientRecord {
   jitter: JitterBuffer<InputSample>;
   /** The client's most recently received InputBatch.viewTick, used to lag-comp rewind that client's own shots. */
   lastViewTick: number;
+  /** Rate limit state for MapPing (match mode only): tick of this player's last accepted ping. */
+  lastPingTick: number;
 }
 
 /** A hit registered this step, exposed for tests/telemetry in addition to the wire broadcast. */
@@ -101,8 +136,32 @@ interface DroppedWeaponEntity {
   spawnTick: number;
 }
 
+interface HeldSlot {
+  token: Uint8Array;
+  /** Wall-clock ms (nowMs()) after which this slot is freed for new joins. */
+  freeAt: number;
+}
+
 const FIRE_VIEW_TICK_MAX_AGE = 13; // ~200 ms at 64 Hz, per spec
 const RING_BUFFER_CAPACITY = 64; // 1 s at 64 Hz
+const VISIBILITY_EVERY_N_TICKS = 4;
+const VISIBILITY_HALF_FOV_RAD = ((110 / 2) * Math.PI) / 180; // 110 deg total FOV cone
+const MAP_PING_RATE_LIMIT_TICKS = 64; // 1/s @ 64Hz
+
+function isZeroToken(token: Uint8Array): boolean {
+  for (let i = 0; i < token.length; i++) if (token[i] !== 0) return false;
+  return true;
+}
+
+function tokensEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function generateToken(): Uint8Array {
+  return new Uint8Array(randomBytes(TOKEN_LENGTH));
+}
 
 /**
  * The authoritative 64 Hz server: owns the shared SimState, per-client jitter
@@ -117,6 +176,13 @@ const RING_BUFFER_CAPACITY = 64; // 1 s at 64 Hz
  * damage/tag/buy/pickup between ticks via sim's pure applyDamage/applyTag/
  * applyBuy/clearPrimaryWeapon/pickupWeapon helpers. The client never applies
  * damage locally.
+ *
+ * M3: the ENTIRE round/spike/economy state machine lives in @vg/sim's tick()
+ * (mode === MODE_MATCH) — this class stays a thin shell: it starts the match
+ * once enough players connect, applies friendly-fire exclusion + buy-phase
+ * gating, computes team visibility for the minimap, rate-limits/rebroadcasts
+ * pings, diffs matchPhase/spikeState pre/post tick() to emit MatchEvents,
+ * and holds a disconnected slot for reconnectHoldMs instead of freeing it.
  */
 export class ServerHost {
   private state: SimState;
@@ -128,6 +194,9 @@ export class ServerHost {
   private readonly lagComp: boolean;
   private readonly snapshotEvery: number;
   private readonly fireMaxRange: number;
+  private readonly mode: ServerMode;
+  private readonly minPlayers: number;
+  private readonly reconnectHoldMs: number;
   private readonly hits: HitRecord[] = [];
   private readonly kills: KillRecord[] = [];
   private readonly allShots: ShotEvent[] = [];
@@ -135,6 +204,17 @@ export class ServerHost {
   private readonly drops: DroppedWeaponEntity[] = [];
   private nextDropId = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+
+  // ---- M3 reconnect ----
+  private readonly slotTokens = new Map<number, Uint8Array>(); // playerIndex -> current token (match mode only)
+  private readonly heldSlots = new Map<number, HeldSlot>(); // playerIndex -> hold record while disconnected
+
+  // ---- M3 visibility (team-shared fog of war for the minimap) ----
+  /** visibilityMasks[team] = bitmask of ENEMY player indices currently visible to that team. */
+  private visibilityMasks: [number, number] = [0, 0];
+
+  // ---- M3 match events (diffed pre/post tick()) ----
+  private readonly pendingMatchEvents: MatchEventMessage[] = [];
 
   /**
    * Per-player edge-gate for walk-over pickup: the id of the drop this
@@ -161,13 +241,20 @@ export class ServerHost {
     this.lagComp = opts.lagComp ?? (typeof process !== "undefined" ? process.env["LAGCOMP"] !== "off" : true);
     this.snapshotEvery = opts.snapshotEveryNTicks ?? 2;
     this.fireMaxRange = opts.fireMaxRange ?? 100;
+    this.mode = opts.mode ?? "dm";
+    this.minPlayers = opts.minPlayers ?? 2;
+    this.reconnectHoldMs = opts.reconnectHoldMs ?? 90_000;
 
-    this.state = createState(this.seed, this.numPlayers);
-    for (let i = 0; i < this.numPlayers; i++) {
-      const spawn = spawnForIndex(i);
-      this.state.posX[i] = spawn.x;
-      this.state.posY[i] = spawn.y;
-      this.state.posZ[i] = spawn.z;
+    if (this.mode === "match") {
+      this.state = createMatchState(this.seed, this.numPlayers, opts.matchConfig ?? {});
+    } else {
+      this.state = createState(this.seed, this.numPlayers);
+      for (let i = 0; i < this.numPlayers; i++) {
+        const spawn = spawnForIndex(i);
+        this.state.posX[i] = spawn.x;
+        this.state.posY[i] = spawn.y;
+        this.state.posZ[i] = spawn.z;
+      }
     }
     this.ring.push(this.state);
     this.lastOverlappingDropId = new Array(this.numPlayers).fill(null);
@@ -183,6 +270,10 @@ export class ServerHost {
 
   getNumPlayers(): number {
     return this.numPlayers;
+  }
+
+  getMode(): ServerMode {
+    return this.mode;
   }
 
   isConnected(playerIndex: number): boolean {
@@ -224,36 +315,113 @@ export class ServerHost {
     return this.allShots;
   }
 
+  /** Current session token for a connected slot (match mode), or null. Exposed for reconnect tests. */
+  getToken(playerIndex: number): Uint8Array | null {
+    return this.slotTokens.get(playerIndex) ?? null;
+  }
+
+  /** Team-shared visibility mask (bit i = enemy player i visible) for `team` (0/1). Exposed for tests/telemetry. */
+  getVisibilityMask(team: number): number {
+    return team === 0 || team === 1 ? this.visibilityMasks[team]! : 0;
+  }
+
+  private expireHeldSlots(): void {
+    if (this.heldSlots.size === 0) return;
+    const now = nowMs();
+    for (const [index, held] of Array.from(this.heldSlots.entries())) {
+      if (now >= held.freeAt) {
+        this.heldSlots.delete(index);
+        this.slotTokens.delete(index);
+      }
+    }
+  }
+
   private findFreeSlot(): number {
     for (let i = 0; i < this.numPlayers; i++) {
-      if (!this.clients.has(i)) return i;
+      if (this.clients.has(i)) continue;
+      if (this.heldSlots.has(i)) continue; // reserved for a possible reconnect
+      return i;
     }
     return -1;
   }
 
-  /** Assigns the lowest free player slot to `transport`, sends Welcome, wires up message handling. */
+  /**
+   * Assigns the lowest free player slot to `transport`, sends Welcome, wires
+   * up message handling. Returns the assigned index.
+   *
+   * Match mode, no free slot: rather than throwing (a genuinely full match
+   * would incorrectly reject a legitimate reconnect), the transport is
+   * registered PENDING and this returns -1 — see awaitReconnectOrReject().
+   * The caller learns the outcome from the Welcome message (success) or the
+   * connection closing (rejected): a full match with no free slot only
+   * ever accepts a NEW connection here if it turns out, once its first
+   * Hello arrives, to be a valid reconnect for a currently-held slot.
+   */
   connect(transport: Transport): number {
+    this.expireHeldSlots();
     const index = this.findFreeSlot();
-    if (index === -1) throw new Error("ServerHost.connect: no free player slots");
+    if (index === -1) {
+      if (this.mode === "match") {
+        this.awaitReconnectOrReject(transport);
+        return -1;
+      }
+      throw new Error("ServerHost.connect: no free player slots");
+    }
 
-    const spawn = spawnForIndex(index);
-    this.state.posX[index] = spawn.x;
-    this.state.posY[index] = spawn.y;
-    this.state.posZ[index] = spawn.z;
-    this.state.velX[index] = 0;
-    this.state.velY[index] = 0;
-    this.state.velZ[index] = 0;
+    if (this.mode === "dm") {
+      const spawn = spawnForIndex(index);
+      this.state.posX[index] = spawn.x;
+      this.state.posY[index] = spawn.y;
+      this.state.posZ[index] = spawn.z;
+      this.state.velX[index] = 0;
+      this.state.velY[index] = 0;
+      this.state.velZ[index] = 0;
+    }
 
     const record: ClientRecord = {
       transport,
       playerIndex: index,
       jitter: new JitterBuffer<InputSample>(1, 3, 2),
       lastViewTick: 0,
+      lastPingTick: -MAP_PING_RATE_LIMIT_TICKS,
     };
     this.clients.set(index, record);
 
+    let token = NO_TOKEN;
+    if (this.mode === "match") {
+      token = generateToken();
+      this.slotTokens.set(index, token);
+    }
+
     transport.onMessage((data) => this.handleMessage(record, data));
     transport.onClose(() => this.disconnect(index));
+
+    // Start the match (team assignment happens inside startMatch()) BEFORE
+    // sending Welcome, so the player whose join tips connectedCount() over
+    // minPlayers sees their own real team immediately rather than TEAM_NONE.
+    // Every OTHER already-connected client had its Welcome sent before this
+    // point (with team still TEAM_NONE, since teams weren't assigned yet) —
+    // resend theirs now too, so no one is left waiting on the next Snapshot
+    // to learn which side they're on.
+    if (this.mode === "match" && this.state.matchPhase === PHASE_WAITING && this.connectedCount() >= this.minPlayers) {
+      this.state = startMatch(this.state);
+      this.ring.push(this.state);
+      for (const [otherIndex, otherRecord] of this.clients) {
+        if (otherIndex === index) continue;
+        otherRecord.transport.send(
+          encodeMessage({
+            type: MessageType.Welcome,
+            playerIndex: otherIndex,
+            seed: this.seed,
+            numPlayers: this.numPlayers,
+            serverTick: this.state.tick,
+            token: this.slotTokens.get(otherIndex) ?? NO_TOKEN,
+            team: this.state.team[otherIndex] ?? TEAM_NONE,
+            mode: this.state.mode,
+          }),
+        );
+      }
+    }
 
     transport.send(
       encodeMessage({
@@ -262,6 +430,9 @@ export class ServerHost {
         seed: this.seed,
         numPlayers: this.numPlayers,
         serverTick: this.state.tick,
+        token,
+        team: this.state.team[index] ?? TEAM_NONE,
+        mode: this.state.mode,
       }),
     );
 
@@ -269,15 +440,138 @@ export class ServerHost {
   }
 
   /**
-   * Deviation, stated plainly: disconnected slots free immediately rather
-   * than "freeze [for a grace period] then free" — a timed reconnect window
-   * is explicitly M3 scope (PLAN.md §2 "Refresh/crash reconnect"), out of
-   * scope here. The slot still *freezes* in the sense that once removed it
-   * receives no more input and tick() leaves its position untouched, right
-   * up until a new client claims the slot.
+   * DM mode: frees the slot immediately (M2 behavior — no reconnect grace).
+   * Match mode: holds the slot (marks it un-joinable by new clients, but
+   * doesn't touch its row in SimState — the player just sits frozen,
+   * matching a disconnected-but-still-alive-in-the-round player) for
+   * `reconnectHoldMs` of wall-clock time, then frees it. A matching Hello
+   * token arriving within that window reattaches via handleMessage's Hello
+   * branch (see tryReattach()) rather than through connect().
    */
   disconnect(playerIndex: number): void {
-    this.clients.delete(playerIndex);
+    if (this.mode === "match") {
+      const token = this.slotTokens.get(playerIndex);
+      this.clients.delete(playerIndex);
+      if (token) {
+        this.heldSlots.set(playerIndex, { token, freeAt: nowMs() + this.reconnectHoldMs });
+      }
+    } else {
+      this.clients.delete(playerIndex);
+    }
+  }
+
+  /**
+   * Reattaches `record`'s transport to a held slot matching `token`, if any.
+   * The transport had already been given a FRESH slot by connect() (the
+   * simplest way to keep connect()'s synchronous return-an-index contract
+   * intact) — on a successful reattach, that fresh slot is released back to
+   * the pool and a second Welcome is sent for the correct (held) slot/token.
+   * No-op if no held slot matches (client keeps its freshly-assigned slot).
+   */
+  private tryReattach(record: ClientRecord, token: Uint8Array): void {
+    this.expireHeldSlots();
+    let matchedIndex = -1;
+    for (const [index, held] of this.heldSlots) {
+      if (tokensEqual(held.token, token)) {
+        matchedIndex = index;
+        break;
+      }
+    }
+    if (matchedIndex === -1 || matchedIndex === record.playerIndex) return;
+
+    const staleIndex = record.playerIndex;
+    this.clients.delete(staleIndex);
+    this.slotTokens.delete(staleIndex);
+
+    this.heldSlots.delete(matchedIndex);
+    record.playerIndex = matchedIndex;
+    record.jitter = new JitterBuffer<InputSample>(1, 3, 2);
+    record.lastViewTick = this.state.tick;
+    this.clients.set(matchedIndex, record);
+    this.slotTokens.set(matchedIndex, token);
+
+    record.transport.send(
+      encodeMessage({
+        type: MessageType.Welcome,
+        playerIndex: matchedIndex,
+        seed: this.seed,
+        numPlayers: this.numPlayers,
+        serverTick: this.state.tick,
+        token,
+        team: this.state.team[matchedIndex] ?? TEAM_NONE,
+        mode: this.state.mode,
+      }),
+    );
+  }
+
+  /**
+   * Match mode, no free slot at connect() time: waits for this transport's
+   * first Hello to decide the outcome, without ever occupying a slot.
+   * A Hello carrying a token that matches a currently-held slot reattaches
+   * to it directly (no throwaway slot ever created — this is what makes
+   * reconnect work on a genuinely full match). Anything else (no token, a
+   * wrong/expired token, a version mismatch, or the connection being closed
+   * before any Hello arrives) rejects the connection — a full match can't
+   * admit a brand-new player. Any non-Hello message that arrives first is
+   * ignored (a well-behaved client always sends Hello first); malformed
+   * frames are dropped as usual.
+   */
+  private awaitReconnectOrReject(transport: Transport): void {
+    let settled = false;
+    transport.onMessage((data) => {
+      if (settled) return;
+      const msg = decodeMessageSafely(data);
+      if (msg === null) return;
+      if (msg.type !== MessageType.Hello) return;
+      settled = true;
+
+      if (msg.protocolVersion !== PROTOCOL_VERSION) {
+        transport.close();
+        return;
+      }
+      if (isZeroToken(msg.reconnectToken)) {
+        transport.close(); // full, and this is a fresh join attempt: reject
+        return;
+      }
+      this.expireHeldSlots();
+      let matchedIndex = -1;
+      for (const [index, held] of this.heldSlots) {
+        if (tokensEqual(held.token, msg.reconnectToken)) {
+          matchedIndex = index;
+          break;
+        }
+      }
+      if (matchedIndex === -1) {
+        transport.close(); // wrong/expired token, and full: reject
+        return;
+      }
+
+      this.heldSlots.delete(matchedIndex);
+      const token = msg.reconnectToken;
+      const record: ClientRecord = {
+        transport,
+        playerIndex: matchedIndex,
+        jitter: new JitterBuffer<InputSample>(1, 3, 2),
+        lastViewTick: this.state.tick,
+        lastPingTick: -MAP_PING_RATE_LIMIT_TICKS,
+      };
+      this.clients.set(matchedIndex, record);
+      this.slotTokens.set(matchedIndex, token);
+      transport.onMessage((data2) => this.handleMessage(record, data2));
+      transport.onClose(() => this.disconnect(matchedIndex));
+      transport.send(
+        encodeMessage({
+          type: MessageType.Welcome,
+          playerIndex: matchedIndex,
+          seed: this.seed,
+          numPlayers: this.numPlayers,
+          serverTick: this.state.tick,
+          token,
+          team: this.state.team[matchedIndex] ?? TEAM_NONE,
+          mode: this.state.mode,
+        }),
+      );
+    });
   }
 
   private handleMessage(record: ClientRecord, data: Uint8Array): void {
@@ -296,6 +590,10 @@ export class ServerHost {
       record.lastViewTick = msg.viewTick;
     } else if (msg.type === MessageType.BuyCmd) {
       this.handleBuy(record.playerIndex, msg);
+    } else if (msg.type === MessageType.SellCmd) {
+      this.handleSell(record.playerIndex, msg);
+    } else if (msg.type === MessageType.MapPing) {
+      this.handleMapPing(record.playerIndex, msg);
     } else if (msg.type === MessageType.Hello) {
       // Welcome is already sent unconditionally at connect() (before any
       // Hello could arrive), so this can't prevent that — but an incompatible
@@ -304,16 +602,48 @@ export class ServerHost {
       // silently desync against messages it can't correctly decode.
       if (msg.protocolVersion !== PROTOCOL_VERSION) {
         record.transport.close();
+        return;
+      }
+      if (this.mode === "match" && !isZeroToken(msg.reconnectToken)) {
+        this.tryReattach(record, msg.reconnectToken);
       }
     }
     // Other message types: no-op server-side.
   }
 
   private handleBuy(playerIndex: number, msg: BuyCmdMessage): void {
+    if (!this.canBuyOrSellNow()) return;
     // applyBuy() itself no-ops (returns state unchanged) for a dead player,
     // insufficient credits, or an unknown itemId — this call is always safe.
     if (this.state.alive[playerIndex] === 0) return;
     this.state = applyBuy(this.state, playerIndex, msg.itemId);
+  }
+
+  private handleSell(playerIndex: number, msg: SellCmdMessage): void {
+    if (!this.canBuyOrSellNow()) return;
+    if (this.state.alive[playerIndex] === 0) return;
+    this.state = applySell(this.state, playerIndex, msg.itemId);
+  }
+
+  /** DM: buy/sell allowed anytime (M2 behavior). Match: only during the buy phase. */
+  private canBuyOrSellNow(): boolean {
+    if (this.mode === "dm") return true;
+    return this.state.matchPhase === PHASE_BUY;
+  }
+
+  private handleMapPing(playerIndex: number, msg: MapPingMessage): void {
+    if (this.mode !== "match") return;
+    const record = this.clients.get(playerIndex);
+    if (!record) return;
+    if (this.state.tick - record.lastPingTick < MAP_PING_RATE_LIMIT_TICKS) return; // rate-limited
+    record.lastPingTick = this.state.tick;
+
+    const team = this.state.team[playerIndex];
+    const teamPing: TeamPingMessage = { type: MessageType.TeamPing, playerIndex, x: msg.x, z: msg.z };
+    const encoded = encodeMessage(teamPing);
+    for (const [otherIndex, otherRecord] of this.clients) {
+      if (this.state.team[otherIndex] === team) otherRecord.transport.send(encoded);
+    }
   }
 
   /** Advances the authoritative sim by exactly one 15.625 ms tick. */
@@ -337,9 +667,15 @@ export class ServerHost {
           reload: value.reload,
           slot1: value.slot1,
           slot2: value.slot2,
+          interact: value.interact,
+          ping: value.ping,
         };
       }
     }
+
+    const prevPhase = this.state.matchPhase;
+    const prevSpike = this.state.spikeState;
+    const prevRound = this.state.roundNumber;
 
     // tick() tolerates missing entries for unconnected slots (see tick.ts's
     // `if (!input) continue`); the declared parameter type doesn't spell
@@ -356,11 +692,123 @@ export class ServerHost {
     this.updatePickups();
     this.despawnOldDrops();
 
+    if (this.mode === "match") {
+      this.diffMatchEvents(prevPhase, prevSpike, prevRound);
+      if (prevPhase !== PHASE_BUY && this.state.matchPhase === PHASE_BUY) {
+        this.drops.length = 0; // drops cleared at round reset (spec)
+      }
+      if (this.state.tick % VISIBILITY_EVERY_N_TICKS === 0) {
+        this.updateVisibility();
+      }
+    }
+
     if (this.state.tick % this.snapshotEvery === 0) {
       this.broadcastSnapshot();
     }
+    this.broadcastPendingMatchEvents();
 
     this.stepDurationsMs.push(nowMs() - startedAt);
+  }
+
+  private diffMatchEvents(prevPhase: number, prevSpike: number, prevRound: number): void {
+    const s = this.state;
+    if (prevPhase !== PHASE_ROUND && s.matchPhase === PHASE_ROUND) {
+      this.pendingMatchEvents.push({ type: MessageType.MatchEvent, kind: 0, winnerTeam: NO_PLAYER, reason: NO_PLAYER, roundNumber: s.roundNumber });
+    }
+    if (prevPhase !== PHASE_ROUND_END && s.matchPhase === PHASE_ROUND_END) {
+      this.pendingMatchEvents.push({
+        type: MessageType.MatchEvent,
+        kind: 1,
+        winnerTeam: s.lastRoundWinnerTeam,
+        reason: s.lastRoundEndReason,
+        roundNumber: prevRound,
+      });
+    }
+    if (prevPhase !== PHASE_MATCH_END && s.matchPhase === PHASE_MATCH_END) {
+      this.pendingMatchEvents.push({
+        type: MessageType.MatchEvent,
+        kind: 2,
+        winnerTeam: s.lastRoundWinnerTeam,
+        reason: s.lastRoundEndReason,
+        roundNumber: prevRound,
+      });
+    }
+    if (prevSpike !== SPIKE_PLANTED && s.spikeState === SPIKE_PLANTED) {
+      this.pendingMatchEvents.push({ type: MessageType.MatchEvent, kind: 3, winnerTeam: NO_PLAYER, reason: NO_PLAYER, roundNumber: s.roundNumber });
+    }
+    if (prevSpike !== SPIKE_DEFUSED && s.spikeState === SPIKE_DEFUSED) {
+      this.pendingMatchEvents.push({ type: MessageType.MatchEvent, kind: 4, winnerTeam: NO_PLAYER, reason: NO_PLAYER, roundNumber: s.roundNumber });
+    }
+    if (prevSpike !== SPIKE_DETONATED && s.spikeState === SPIKE_DETONATED) {
+      this.pendingMatchEvents.push({ type: MessageType.MatchEvent, kind: 5, winnerTeam: NO_PLAYER, reason: NO_PLAYER, roundNumber: s.roundNumber });
+    }
+  }
+
+  private broadcastPendingMatchEvents(): void {
+    if (this.pendingMatchEvents.length === 0) return;
+    for (const evt of this.pendingMatchEvents) {
+      const encoded = encodeMessage(evt);
+      for (const [, client] of this.clients) client.transport.send(encoded);
+    }
+    this.pendingMatchEvents.length = 0;
+  }
+
+  /**
+   * Team-shared visibility (minimap fog of war): for each team, an enemy is
+   * visible if ANY living member of that team has an unobstructed raycast
+   * to the enemy's eye position AND the enemy falls within a 110-degree cone
+   * centered on that member's yaw. Deliberately amortized (every 4 ticks,
+   * not every tick) and O(numPlayers^2) — fine at MAX_PLAYERS=16. Full
+   * snapshot interest-culling/anti-wallhack is explicitly DEFERRED (see
+   * PLAN.md §3.2) — this only feeds the minimap, not what raw combat state
+   * a client's own SimState mirror actually contains.
+   */
+  private updateVisibility(): void {
+    const s = this.state;
+    let team0Mask = 0; // attackers' view of defenders
+    let team1Mask = 0; // defenders' view of attackers
+
+    for (let e = 0; e < this.numPlayers; e++) {
+      if (s.alive[e] === 0) continue;
+      const enemyTeam = s.team[e];
+      if (enemyTeam !== TEAM_ATTACKERS && enemyTeam !== TEAM_DEFENDERS) continue;
+      const viewerTeam = enemyTeam === TEAM_ATTACKERS ? TEAM_DEFENDERS : TEAM_ATTACKERS;
+
+      let visible = false;
+      for (let m = 0; m < this.numPlayers; m++) {
+        if (s.alive[m] === 0 || s.team[m] !== viewerTeam) continue;
+        const eyeM = eyePosition(s, m);
+        const eyeE = eyePosition(s, e);
+        const dx = eyeE.x - eyeM.x;
+        const dy = eyeE.y - eyeM.y;
+        const dz = eyeE.z - eyeM.z;
+        const dist = Math.hypot(dx, dy, dz);
+        if (dist < 1e-6) {
+          visible = true;
+          break;
+        }
+        const dirX = dx / dist;
+        const dirZ = dz / dist;
+        const toEnemyYaw = Math.atan2(dirX, dirZ); // matches movement.ts's yaw convention (0 = +Z)
+        let diff = toEnemyYaw - s.yaw[m]!;
+        while (diff > Math.PI) diff -= 2 * Math.PI;
+        while (diff < -Math.PI) diff += 2 * Math.PI;
+        if (Math.abs(diff) > VISIBILITY_HALF_FOV_RAD) continue;
+
+        const blocked = raycastBoxes(this.boxes, eyeM, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
+        if (blocked === null) {
+          visible = true;
+          break;
+        }
+      }
+
+      if (visible) {
+        if (viewerTeam === TEAM_ATTACKERS) team0Mask |= 1 << e;
+        else team1Mask |= 1 << e;
+      }
+    }
+
+    this.visibilityMasks = [team0Mask, team1Mask];
   }
 
   private resolveShot(shot: ShotEvent): void {
@@ -381,7 +829,10 @@ export class ServerHost {
 
     const targetState = this.lagComp ? (this.ring.get(clampedViewTick) ?? this.state) : this.state;
 
-    const hit = raycastPlayers(targetState, shooterIndex, origin, dir, this.fireMaxRange);
+    // M3: friendly fire is off in match mode — raycastPlayers skips
+    // teammates entirely (never a hit, never a blocker) so a teammate
+    // standing in the shot's path doesn't even absorb it.
+    const hit = raycastPlayers(targetState, shooterIndex, origin, dir, this.fireMaxRange, this.mode === "match");
     if (!hit) return;
 
     const wallDist = raycastBoxes(this.boxes, origin, dir, hit.dist);
@@ -426,7 +877,9 @@ export class ServerHost {
   }
 
   private handleKill(killerIndex: number, victimIndex: number, weaponId: number, headshot: boolean, assistIndex: number, currentTick: number): void {
-    // Kill reward, capped.
+    // Kill reward, capped. Match mode: kill credits still apply (spec: "Kill
+    // credits ... work in match mode"); no-respawn is handled entirely
+    // inside sim's scheduleDeath (see @vg/sim weapons/logic.ts).
     this.state.credits[killerIndex] = Math.min(MAX_CREDITS, this.state.credits[killerIndex]! + KILL_REWARD);
 
     // Drop the victim's primary weapon (if any) at the death spot, then clear it from their loadout.
@@ -522,6 +975,7 @@ export class ServerHost {
   }
 
   private broadcastSnapshot(): void {
+    const isMatch = this.mode === "match";
     const players: SnapshotPlayer[] = [];
     for (let i = 0; i < this.numPlayers; i++) {
       const activeSlot = this.state.activeSlot[i]!;
@@ -552,18 +1006,44 @@ export class ServerHost {
         tagTicksLeft: this.state.tagTicksLeft[i]!,
         credits: this.state.credits[i]!,
         respawnTicksLeft,
+        team: this.state.team[i]!,
       });
     }
 
     const droppedWeapons: SnapshotDroppedWeapon[] = this.drops.map((d) => ({ id: d.id, weaponId: d.weaponId, x: d.x, y: d.y, z: d.z, mag: d.mag }));
 
+    const phaseTicksLeft = isMatch && this.state.phaseEndTick >= 0 ? Math.max(0, this.state.phaseEndTick - this.state.tick) : 0;
+    const spikePlantedTicksLeft =
+      isMatch && this.state.spikeState === SPIKE_PLANTED
+        ? Math.max(0, this.state.spikePlantedTick + this.state.config.spikeTicks - this.state.tick)
+        : 0;
+
     for (const [, record] of this.clients) {
+      const recipientTeam = this.state.team[record.playerIndex]!;
+      const visibleEnemyMask = isMatch ? this.getVisibilityMask(recipientTeam) : 0;
       const msg: SnapshotMessage = {
         type: MessageType.Snapshot,
         serverTick: this.state.tick,
         lastProcessedSeq: Math.max(0, record.jitter.lastConsumedSeq),
         players,
         droppedWeapons,
+        mode: this.state.mode,
+        matchPhase: isMatch ? this.state.matchPhase : 0,
+        phaseTicksLeft,
+        roundNumber: isMatch ? this.state.roundNumber : 0,
+        scoreTeam0: isMatch ? this.state.scoreTeam0 : 0,
+        scoreTeam1: isMatch ? this.state.scoreTeam1 : 0,
+        spikeState: isMatch ? this.state.spikeState : 0,
+        spikeCarrier: isMatch ? this.state.spikeCarrier : NO_PLAYER,
+        spikeX: isMatch ? this.state.spikeX : 0,
+        spikeY: isMatch ? this.state.spikeY : 0,
+        spikeZ: isMatch ? this.state.spikeZ : 0,
+        spikePlantedTicksLeft,
+        activePlantProgress: isMatch ? this.state.plantProgress : 0,
+        planterIndex: isMatch ? this.state.planterIndex : NO_PLAYER,
+        activeDefuseProgress: isMatch ? this.state.defuseProgress : 0,
+        defuserIndex: isMatch ? this.state.defuserIndex : NO_PLAYER,
+        visibleEnemyMask,
       };
       record.transport.send(encodeMessage(msg));
     }
