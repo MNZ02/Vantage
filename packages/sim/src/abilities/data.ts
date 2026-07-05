@@ -96,6 +96,8 @@ export interface AbilityDef {
   readonly count?: number; // veil spheres / rail shots / wall segments
   readonly intervalTicks?: number; // recon pulse interval / rail between-shots interval
   readonly killsToRefresh?: number; // Zephyr dash: kills needed to re-earn a charge
+  /** Ult weapons only (Blades/Rail): does a kill while active refill `count` charges? Spec: ONLY Blades does — Rail's 3-shot/15s window is a hard cap, not refreshable by kills. */
+  readonly refreshOnKill?: boolean;
   readonly distance?: number; // dash/step travel distance, meters
   readonly healAmount?: number; // mend total HP
   readonly healDurationTicks?: number; // mend total duration
@@ -165,6 +167,7 @@ export const ABILITIES: readonly AbilityDef[] = [
     castDelayTicks: 0,
     ultCost: 7,
     count: 5, // starting/refresh-on-kill charge count
+    refreshOnKill: true,
   },
 
   // ---- Umbra (Controller) ----

@@ -247,10 +247,14 @@ export function autoAssignAgents(state: SimState): SimState {
  * Kill-driven ability bookkeeping the server applies alongside the existing
  * kill-reward/killfeed handling (see @vg/server serverHost.ts handleKill):
  * Zephyr's Dash re-earns a charge every 2 kills; Blades' charges refill to
- * max on any kill while active. Ult points themselves are awarded by the
- * caller via abilities/logic.ts's awardUltPoint (kill + death + plant +
- * defuse + orb, all capped at ultCost) — kept separate since those apply
- * uniformly to every agent, not just Zephyr.
+ * max on any kill while active. Rail does NOT refill on kill (spec: only
+ * Blades does — Rail's 3-shot/15s activation window is a hard cap) — gated
+ * by the ult-weapon's own `refreshOnKill` data flag rather than hardcoding
+ * an ability id here, so this stays correct if a future ult weapon is added.
+ * Ult points themselves are awarded by the caller via abilities/logic.ts's
+ * awardUltPoint (kill + death + plant + defuse + orb, all capped at
+ * ultCost) — kept separate since those apply uniformly to every agent, not
+ * just Zephyr.
  */
 export function applyKillAbilitySideEffects(state: SimState, killerIndex: number): SimState {
   const next = cloneState(state);
@@ -258,7 +262,7 @@ export function applyKillAbilitySideEffects(state: SimState, killerIndex: number
     const agentId = next.agentId[killerIndex]!;
     const ultAbilityId = agentId !== AGENT_NONE ? abilityIdForSlot(agentId, ABILITY_SLOT_ULT) : null;
     const def = ultAbilityId !== null ? getAbilityDef(ultAbilityId) : null;
-    if (def?.count) next.magUlt[killerIndex] = def.count;
+    if (def?.count && def.refreshOnKill) next.magUlt[killerIndex] = def.count;
   }
 
   const agentId = next.agentId[killerIndex]!;

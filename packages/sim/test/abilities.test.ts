@@ -44,6 +44,7 @@ import {
   abilityWeaponId,
   applyAbilityBuy,
   applyDamage,
+  applyKillAbilitySideEffects,
   applyRevive,
   applyWallDamage,
   autoAssignAgents,
@@ -229,7 +230,7 @@ describe("Zephyr", () => {
     expect(smokeSeen).toBe(true);
   });
 
-  it("Blades: hitscan kill damage, charges refresh on kill, and clears at round end", () => {
+  it("Blades: hitscan kill damage, and clears at round end", () => {
     let s = setup();
     grantUlt(s, 0, getAbilityDef(ABL_ZEPHYR_BLADES)!.ultCost);
     const { state: next } = runOne(s, allIdleInputs(s, { 0: { ult: true } }));
@@ -238,6 +239,17 @@ describe("Zephyr", () => {
     const def = getCombatWeaponDef(abilityWeaponId(ABL_ZEPHYR_BLADES))!;
     expect(def.damageBands[0]!.body).toBe(50);
     expect(def.damageBands[0]!.head).toBe(150);
+  });
+
+  it("Blades charges refill to max on a kill while active (refreshOnKill)", () => {
+    let s = setup();
+    grantUlt(s, 0, getAbilityDef(ABL_ZEPHYR_BLADES)!.ultCost);
+    let cur = runOne(s, allIdleInputs(s, { 0: { ult: true } })).state;
+    expect(cur.activeSlot[0]).toBe(2);
+    expect(cur.magUlt[0]).toBe(5);
+    cur.magUlt[0] = 2; // spent 3 of 5 charges
+    const afterKill = applyKillAbilitySideEffects(cur, 0);
+    expect(afterKill.magUlt[0]).toBe(5); // refilled to max
   });
 });
 
@@ -379,6 +391,17 @@ describe("Sonar", () => {
     expect(next.activeSlot[0]).toBe(2);
     expect(next.magUlt[0]).toBe(3);
     expect(next.ultWindowEndTick[0]).toBeGreaterThan(next.tick);
+  });
+
+  it("rail does NOT refill charges on a kill (spec: only Blades refreshes — Rail's 3-shot window is a hard cap)", () => {
+    let s = setup();
+    grantUlt(s, 0, getAbilityDef(ABL_SONAR_RAIL)!.ultCost);
+    let cur = runOne(s, allIdleInputs(s, { 0: { ult: true } })).state;
+    expect(cur.activeSlot[0]).toBe(2);
+    expect(cur.magUlt[0]).toBe(3);
+    cur.magUlt[0] = 1; // 2 of 3 shots spent
+    const afterKill = applyKillAbilitySideEffects(cur, 0);
+    expect(afterKill.magUlt[0]).toBe(1); // unchanged — no refill
   });
 });
 
