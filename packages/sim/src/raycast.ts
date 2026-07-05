@@ -3,7 +3,15 @@
 // package's own trig/PRNG approximations and no wall-clock access — same
 // purity constraints as the rest of sim/src (see test/purity.test.ts).
 
-import { CAPSULE_RADIUS, CROUCH_HEIGHT, EYE_HEIGHT_CROUCH, EYE_HEIGHT_STAND, STAND_HEIGHT } from "./constants.js";
+import {
+  CAPSULE_RADIUS,
+  CROUCH_HEIGHT,
+  EYE_HEIGHT_CROUCH,
+  EYE_HEIGHT_STAND,
+  HEAD_REGION_HEIGHT_M,
+  LEG_REGION_HEIGHT_FRACTION,
+  STAND_HEIGHT,
+} from "./constants.js";
 import { cosApprox, sinApprox } from "./math.js";
 import type { Box, SimState } from "./state.js";
 
@@ -185,12 +193,23 @@ function raycastCapsule(
   return best;
 }
 
+export type HitRegion = "head" | "body" | "legs";
+
 export interface PlayerHit {
   playerIndex: number;
   dist: number;
+  region: HitRegion;
 }
 
-/** Nearest player (excluding the shooter) the ray hits within maxDist, or null. */
+/** Region for a hit at world height `hitY` on a capsule whose feet are at `feetY` and whose total height is `height`. */
+export function regionForHitHeight(hitY: number, feetY: number, height: number): HitRegion {
+  const relative = hitY - feetY;
+  if (relative < height * LEG_REGION_HEIGHT_FRACTION) return "legs";
+  if (relative >= height - HEAD_REGION_HEIGHT_M) return "head";
+  return "body";
+}
+
+/** Nearest LIVING player (excluding the shooter) the ray hits within maxDist, or null. Dead players never block or receive hits. */
 export function raycastPlayers(
   state: SimState,
   shooterIndex: number,
@@ -201,22 +220,13 @@ export function raycastPlayers(
   let best: PlayerHit | null = null;
   for (let i = 0; i < state.numPlayers; i++) {
     if (i === shooterIndex) continue;
+    if (state.alive[i] === 0) continue;
     const height = state.crouching[i] === 1 ? CROUCH_HEIGHT : STAND_HEIGHT;
-    const hit = raycastCapsule(
-      state.posX[i]!,
-      state.posY[i]!,
-      state.posZ[i]!,
-      height,
-      origin.x,
-      origin.y,
-      origin.z,
-      dir.x,
-      dir.y,
-      dir.z,
-      maxDist,
-    );
+    const feetY = state.posY[i]!;
+    const hit = raycastCapsule(state.posX[i]!, feetY, state.posZ[i]!, height, origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, maxDist);
     if (hit !== null && (best === null || hit < best.dist)) {
-      best = { playerIndex: i, dist: hit };
+      const hitY = origin.y + dir.y * hit;
+      best = { playerIndex: i, dist: hit, region: regionForHitHeight(hitY, feetY, height) };
     }
   }
   return best;

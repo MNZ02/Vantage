@@ -81,3 +81,24 @@ export function spawnForIndex(index: number): { x: number; y: number; z: number 
     z: SPAWN_POSITION.z + sinApprox(angle) * radius,
   };
 }
+
+/**
+ * Deathmatch respawn points, spread over the graybox's open floor area, well
+ * clear of the interior wall (x in [5.75, 6.25]), crates, and the ramp
+ * (z >= 10). Selection at respawn time is `hash(seed, playerIndex, tick) %
+ * DM_SPAWNS.length` (see weapons/logic.ts respawnPlayer()) — deterministic
+ * in-sim so client prediction/replay of the local player's own respawn
+ * agrees with the server bit-for-bit.
+ */
+export const DM_SPAWNS: ReadonlyArray<{ x: number; y: number; z: number; yaw: number }> = [
+  { x: 0, y: 0, z: -10, yaw: 0 },
+  { x: 12, y: 0, z: -12, yaw: PI },
+  { x: -12, y: 0, z: -12, yaw: PI / 2 },
+  { x: 12, y: 0, z: 12, yaw: -PI / 2 },
+  { x: -12, y: 0, z: 6, yaw: PI / 4 },
+  { x: -14, y: 0, z: -6, yaw: -PI / 4 },
+  { x: 14, y: 0, z: 2, yaw: (3 * PI) / 4 },
+  { x: -2, y: 0, z: 16, yaw: -(3 * PI) / 4 },
+  { x: 8, y: 0, z: -16, yaw: PI / 3 },
+  { x: -8, y: 0, z: -16, yaw: -PI / 3 },
+];

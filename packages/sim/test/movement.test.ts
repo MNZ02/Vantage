@@ -20,7 +20,7 @@ function speed(state: SimState, i = 0): number {
 function stepMany(state: SimState, input: InputFrame, boxes: Box[], n: number): SimState {
   let s = state;
   for (let i = 0; i < n; i++) {
-    s = tick(s, [input], boxes);
+    s = tick(s, [input], boxes).state;
   }
   return s;
 }
@@ -35,7 +35,7 @@ describe("ground speed caps", () => {
 
     let maxSpeed = 0;
     for (let i = 0; i < 400; i++) {
-      state = tick(state, [input], boxes);
+      state = tick(state, [input], boxes).state;
       maxSpeed = Math.max(maxSpeed, speed(state));
     }
     expect(speed(state)).toBeGreaterThan(RUN_SPEED - 0.01);
@@ -51,7 +51,7 @@ describe("ground speed caps", () => {
 
     let maxSpeed = 0;
     for (let i = 0; i < 400; i++) {
-      state = tick(state, [input], boxes);
+      state = tick(state, [input], boxes).state;
       maxSpeed = Math.max(maxSpeed, speed(state));
     }
     expect(speed(state)).toBeGreaterThan(WALK_SPEED - 0.01);
@@ -68,7 +68,7 @@ describe("ground speed caps", () => {
 
     let maxSpeed = 0;
     for (let i = 0; i < 400; i++) {
-      state = tick(state, [input], boxes);
+      state = tick(state, [input], boxes).state;
       maxSpeed = Math.max(maxSpeed, speed(state));
     }
     expect(speed(state)).toBeGreaterThan(CROUCH_SPEED - 0.01);
@@ -87,13 +87,13 @@ describe("jump", () => {
     const groundY = state.posY[0]!;
 
     // one tick with jump pressed
-    state = tick(state, [{ ...defaultInput(0), jump: true }], boxes);
+    state = tick(state, [{ ...defaultInput(0), jump: true }], boxes).state;
     expect(state.grounded[0]).toBe(0);
 
     let apex = state.posY[0]!;
     let landedGrounded = false;
     for (let i = 0; i < 300; i++) {
-      state = tick(state, [defaultInput(0)], boxes);
+      state = tick(state, [defaultInput(0)], boxes).state;
       apex = Math.max(apex, state.posY[0]!);
       if (state.grounded[0] === 1) {
         landedGrounded = true;
@@ -124,7 +124,7 @@ describe("wall collision", () => {
     let maxX = -Infinity;
     let zAtStart = 0;
     for (let i = 0; i < 600; i++) {
-      state = tick(state, [input], boxes);
+      state = tick(state, [input], boxes).state;
       const x = state.posX[0]!;
       const y = state.posY[0]!;
       const z = state.posZ[0]!;
@@ -196,7 +196,7 @@ describe("grounded step-up (stairs)", () => {
     const input: InputFrame = { ...defaultInput(0), forward: 1 }; // jump stays false throughout
     let maxY = 0;
     for (let i = 0; i < 500; i++) {
-      state = tick(state, [input], boxes);
+      state = tick(state, [input], boxes).state;
       maxY = Math.max(maxY, state.posY[0]!);
     }
 
@@ -211,7 +211,7 @@ describe("grounded step-up (stairs)", () => {
 
     let maxSpeed = 0;
     for (let i = 0; i < 400; i++) {
-      state = tick(state, [input], boxes);
+      state = tick(state, [input], boxes).state;
       maxSpeed = Math.max(maxSpeed, speed(state));
     }
     expect(speed(state)).toBeGreaterThan(RUN_SPEED - 0.01);

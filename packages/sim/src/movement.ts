@@ -262,13 +262,16 @@ export interface MovementResult {
   penetration: number;
 }
 
-/** Advances a single player's capsule by one fixed timestep. Pure: reads only its arguments. */
+/** Advances a single player's capsule by one fixed timestep. Pure: reads only its arguments.
+ * `speedMultiplier` folds in gunplay-driven movement modifiers (tagging, ADS)
+ * computed by the caller from *last* tick's state — see tick.ts. */
 export function movePlayer(
   state: SimState,
   index: number,
   input: InputFrame,
   boxes: readonly Box[],
   dt: number,
+  speedMultiplier = 1,
 ): MovementResult {
   const wasGrounded = state.grounded[index] === 1;
   const height = capsuleHeight(input.crouch);
@@ -277,7 +280,7 @@ export function movePlayer(
   let velY = state.velY[index]!;
   let velZ = state.velZ[index]!;
 
-  const wishSpeed = wishSpeedFor(input);
+  const wishSpeed = wishSpeedFor(input) * speedMultiplier;
   const wish = wishDirection(input);
 
   if (wasGrounded) {

@@ -6,3 +6,6 @@ export * from "./movement.js";
 export * from "./tick.js";
 export * from "./raycast.js";
 export * from "./levels.js";
+export * from "./damage.js";
+export * from "./weapons/data.js";
+export * from "./weapons/logic.js";

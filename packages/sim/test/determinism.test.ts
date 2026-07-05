@@ -20,6 +20,10 @@ function scriptedInput(t: number): InputFrame {
     crouch: t % 150 < 40,
     walk: t % 200 < 30,
     fire: t % 61 === 0,
+    ads: t % 83 === 0,
+    reload: t % 173 < 3,
+    slot1: t % 211 === 0,
+    slot2: t % 233 === 0,
   };
 }
 
@@ -27,7 +31,7 @@ function runTicks(seed: number, count: number): string[] {
   let state = createState(seed, 1);
   const snapshots: string[] = [];
   for (let t = 0; t < count; t++) {
-    state = tick(state, [scriptedInput(t)], boxes);
+    state = tick(state, [scriptedInput(t)], boxes).state;
     if ((t + 1) % 500 === 0) {
       snapshots.push(serializeState(state));
     }
