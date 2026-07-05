@@ -9,12 +9,14 @@ import {
   ATTACKER_SPAWNS,
   BARRIERS,
   DEFENDER_SPAWNS,
+  ORB_SPOTS,
   SITE_ZONES,
 } from "./levels.js";
 import { length2D } from "./math.js";
 import {
   CHANNEL_STATIONARY_SPEED_MPS,
   DEFUSE_RADIUS_M,
+  ENT_ULT_ORB,
   MODE_MATCH,
   NO_PLAYER,
   PHASE_BUY,
@@ -38,6 +40,8 @@ import {
   WEAPON_NONE,
 } from "./constants.js";
 import { WEAPON_VIPER, getWeaponDef } from "./weapons/data.js";
+import { clearAllEntities, spawnEntity } from "./abilities/entities.js";
+import { autoAssignAgents } from "./abilities/effects.js";
 import { cloneState, type Box, type InputFrame, type SimState } from "./state.js";
 
 /** True if (x, z) falls inside any plant/defuse site zone (2D, ignores the box's Y extent). */
@@ -137,6 +141,53 @@ function resetLoadoutToDefault(next: SimState, i: number): void {
   next.activeSlot[i] = 1;
 }
 
+/**
+ * M4a round-reset ability bookkeeping: basics (slots 0/1) always reset to 0
+ * charges every round (must be rebought — like weapons, but unconditional on
+ * survival, since ability charges aren't loadout state); the signature
+ * (slot 2) keeps its current charge count and in-progress recharge timer
+ * uninterrupted across an ordinary round boundary (real Valorant: losing a
+ * round doesn't reset Omen's Shroud charges). `resetSignatureToo` is true
+ * only at a half swap (spec: "reset charges to defaults at half" while
+ * keeping ult points — see enterBuyPhase's call site). Blades/Rail (ult
+ * weapon override) is always cleared: forced back off activeSlot 2 if still
+ * active from a round that ended mid-ult.
+ */
+function resetAbilitiesForRound(next: SimState, i: number, resetSignatureToo: boolean): void {
+  next.abilityCharges[i * 4 + 0] = 0;
+  next.abilityCharges[i * 4 + 1] = 0;
+  next.dashKillCounter[i] = 0;
+  if (resetSignatureToo) {
+    next.abilityCharges[i * 4 + 2] = 0;
+    next.signatureRechargeEndTick[i] = -1;
+  }
+  if (next.activeSlot[i] === 2) {
+    next.activeSlot[i] = next.weaponPrimary[i] !== WEAPON_NONE ? 0 : 1;
+  }
+  next.magUlt[i] = 0;
+  next.ultWindowEndTick[i] = -1;
+  next.pendingAbilityId[i] = 255;
+  next.pendingReadyTick[i] = -1;
+}
+
+/** Clears every ability entity and respawns both fixed ult orbs (spec: "2 orbs at fixed positions ... respawn each round"). */
+function resetAbilityEntitiesForRound(next: SimState, currentTick: number): void {
+  clearAllEntities(next);
+  for (const spot of ORB_SPOTS) {
+    spawnEntity(next, {
+      entType: ENT_ULT_ORB,
+      owner: NO_PLAYER,
+      abilityId: 0,
+      x: spot.x,
+      y: spot.y,
+      z: spot.z,
+      spawnTick: currentTick,
+      endTick: -1,
+      param: 0,
+    });
+  }
+}
+
 function refillMagsForCurrentLoadout(next: SimState, i: number): void {
   const primaryId = next.weaponPrimary[i]!;
   if (primaryId !== WEAPON_NONE) {
@@ -214,7 +265,9 @@ function enterBuyPhase(next: SimState, currentTick: number): void {
     next.velZ[i] = 0;
     next.grounded[i] = 1;
     refillMagsForCurrentLoadout(next, i);
+    resetAbilitiesForRound(next, i, didHalfSwap);
   }
+  resetAbilityEntitiesForRound(next, currentTick + 1);
 
   // Teleport to team spawns, ranked by player index within team.
   const rankByTeam: Record<number, number> = { [TEAM_ATTACKERS]: 0, [TEAM_DEFENDERS]: 0 };
@@ -273,10 +326,14 @@ function enterBuyPhase(next: SimState, currentTick: number): void {
  */
 export function startMatch(state: SimState): SimState {
   if (state.mode !== MODE_MATCH || state.matchPhase !== PHASE_WAITING) return state;
-  const next = cloneState(state);
+  let next = cloneState(state);
   for (let i = 0; i < next.numPlayers; i++) {
     next.team[i] = i % 2 === 0 ? TEAM_ATTACKERS : TEAM_DEFENDERS;
   }
+  // M4a: fill any player who never picked an agent during the waiting phase
+  // with the lowest unused agentId on their team (spec: "default assignment
+  // at match start").
+  next = autoAssignAgents(next);
   enterBuyPhase(next, next.tick - 1);
   return next;
 }

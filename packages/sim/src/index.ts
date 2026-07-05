@@ -10,3 +10,7 @@ export * from "./damage.js";
 export * from "./weapons/data.js";
 export * from "./weapons/logic.js";
 export * from "./match.js";
+export * from "./abilities/data.js";
+export * from "./abilities/entities.js";
+export * from "./abilities/logic.js";
+export * from "./abilities/effects.js";

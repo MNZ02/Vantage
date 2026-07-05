@@ -223,6 +223,11 @@ export function regionForHitHeight(hitY: number, feetY: number, height: number):
  * no-op in DM (team arrays are all TEAM_NONE there). Callers must pass the
  * SAME value here for the server's authoritative resolution and the
  * client's cosmetic predicted-hit raycast, or hit-reg telemetry desyncs.
+ *
+ * `includePredicate` (M4a, e.g. Lumen's Mend "aimed living teammate"): when
+ * provided, a player index is only considered a candidate if the predicate
+ * also returns true for it, letting callers reuse this exact capsule-raycast
+ * math for "nearest teammate I'm aiming at" instead of "nearest enemy".
  */
 export function raycastPlayers(
   state: SimState,
@@ -231,6 +236,7 @@ export function raycastPlayers(
   dir: Vec3Like,
   maxDist: number,
   excludeTeammates = false,
+  includePredicate?: (playerIndex: number) => boolean,
 ): PlayerHit | null {
   const shooterTeam = state.team[shooterIndex];
   let best: PlayerHit | null = null;
@@ -238,6 +244,7 @@ export function raycastPlayers(
     if (i === shooterIndex) continue;
     if (state.alive[i] === 0) continue;
     if (excludeTeammates && shooterTeam !== TEAM_NONE && state.team[i] === shooterTeam) continue;
+    if (includePredicate && !includePredicate(i)) continue;
     const height = state.crouching[i] === 1 ? CROUCH_HEIGHT : STAND_HEIGHT;
     const feetY = state.posY[i]!;
     const hit = raycastCapsule(state.posX[i]!, feetY, state.posZ[i]!, height, origin.x, origin.y, origin.z, dir.x, dir.y, dir.z, maxDist);

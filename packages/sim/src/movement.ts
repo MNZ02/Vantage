@@ -238,8 +238,8 @@ function resolveHorizontal(
   return { x: px, z: pz, velX: vx, velZ: vz, penetration: maxPenetration };
 }
 
-/** Highest box top at or below `atOrBelowY` whose footprint contains (x, z), or null if none. */
-function findFloorBelow(x: number, z: number, atOrBelowY: number, boxes: readonly Box[]): number | null {
+/** Highest box top at or below `atOrBelowY` whose footprint contains (x, z), or null if none. Exported for abilities/logic.ts's Umbra Step (teleport lands on the floor below the target point). */
+export function findFloorBelow(x: number, z: number, atOrBelowY: number, boxes: readonly Box[]): number | null {
   let best: number | null = null;
   for (const box of boxes) {
     if (!columnCenterInsideFootprint(box, x, z)) continue;
@@ -248,6 +248,52 @@ function findFloorBelow(x: number, z: number, atOrBelowY: number, boxes: readonl
     }
   }
   return best;
+}
+
+/** True if a vertical cylinder of CAPSULE_RADIUS centered at (x, z), spanning [feetY, feetY+height], overlaps any box. Used by abilities/logic.ts to sweep self-mobility casts (dash/step) in small steps and stop at the last unblocked one — same collision shape as ordinary movement, without integrating velocity/gravity. */
+export function capsuleBlockedAt(x: number, z: number, feetY: number, height: number, boxes: readonly Box[]): boolean {
+  const headY = feetY + height;
+  for (const box of boxes) {
+    if (headY <= box.minY || feetY >= box.maxY) continue;
+    const closestX = Math.min(box.maxX, Math.max(box.minX, x));
+    const closestZ = Math.min(box.maxZ, Math.max(box.minZ, z));
+    const dx = x - closestX;
+    const dz = z - closestZ;
+    if (dx * dx + dz * dz < CAPSULE_RADIUS * CAPSULE_RADIUS) return true;
+  }
+  return false;
+}
+
+/**
+ * Sweeps a capsule from (x0, z0) toward (x0 + dirX*distance, z0 + dirZ*distance)
+ * in small fixed steps, stopping at the last step that doesn't overlap any
+ * box (capsuleBlockedAt) — used for dash/step self-mobility abilities, which
+ * need "stop at walls" collision but aren't velocity-integrated like normal
+ * movement. `dirX`/`dirZ` must already be a unit (or zero) vector. Pure.
+ */
+export function sweepCapsule(
+  x0: number,
+  z0: number,
+  feetY: number,
+  height: number,
+  dirX: number,
+  dirZ: number,
+  distance: number,
+  boxes: readonly Box[],
+): { x: number; z: number } {
+  const STEP = 0.05; // meters
+  const steps = Math.max(1, Math.ceil(distance / STEP));
+  let x = x0;
+  let z = z0;
+  for (let i = 1; i <= steps; i++) {
+    const t = Math.min(distance, i * STEP);
+    const nx = x0 + dirX * t;
+    const nz = z0 + dirZ * t;
+    if (capsuleBlockedAt(nx, nz, feetY, height, boxes)) break;
+    x = nx;
+    z = nz;
+  }
+  return { x, z };
 }
 
 export interface MovementResult {
