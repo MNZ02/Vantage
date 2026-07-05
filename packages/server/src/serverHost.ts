@@ -31,6 +31,7 @@ import {
 } from "@vg/sim";
 import {
   MessageType,
+  PROTOCOL_VERSION,
   decodeMessageSafely,
   encodeMessage,
   type BuyCmdMessage,
@@ -135,6 +136,18 @@ export class ServerHost {
   private nextDropId = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
 
+  /**
+   * Per-player edge-gate for walk-over pickup: the id of the drop this
+   * player was standing inside PICKUP_RADIUS_M of on the *previous*
+   * updatePickups() call, or null if none. A drop's id survives a swap (only
+   * its weaponId/mag/spawnTick change), so a player who just swapped stays
+   * "on" the same id afterward and won't re-trigger — they must leave the
+   * radius (any drop found there resets to null) and re-enter before that
+   * id can fire again. Without this, standing still on a drop while holding
+   * a different weapon oscillates the swap every single tick.
+   */
+  private readonly lastOverlappingDropId: (number | null)[];
+
   /** p95-friendly per-tick timing samples (wall-clock ms spent inside step()), for the soak test. */
   readonly stepDurationsMs: number[] = [];
 
@@ -157,6 +170,7 @@ export class ServerHost {
       this.state.posZ[i] = spawn.z;
     }
     this.ring.push(this.state);
+    this.lastOverlappingDropId = new Array(this.numPlayers).fill(null);
   }
 
   getState(): SimState {
@@ -282,8 +296,17 @@ export class ServerHost {
       record.lastViewTick = msg.viewTick;
     } else if (msg.type === MessageType.BuyCmd) {
       this.handleBuy(record.playerIndex, msg);
+    } else if (msg.type === MessageType.Hello) {
+      // Welcome is already sent unconditionally at connect() (before any
+      // Hello could arrive), so this can't prevent that — but an incompatible
+      // client announcing itself is still a real signal we shouldn't ignore:
+      // drop the connection outright rather than let a stale/future client
+      // silently desync against messages it can't correctly decode.
+      if (msg.protocolVersion !== PROTOCOL_VERSION) {
+        record.transport.close();
+      }
     }
-    // Hello / other message types: no-op server-side (Welcome already sent on connect).
+    // Other message types: no-op server-side.
   }
 
   private handleBuy(playerIndex: number, msg: BuyCmdMessage): void {
@@ -447,30 +470,53 @@ export class ServerHost {
     }
   }
 
-  /** Walk-over pickup: alive players within PICKUP_RADIUS_M of a drop swap it for their current primary (if any). */
+  /**
+   * Walk-over pickup: alive players within PICKUP_RADIUS_M of a drop swap it
+   * for their current primary (if any). Edge-gated per player via
+   * lastOverlappingDropId (see its doc comment) so standing still on a drop
+   * swaps exactly once, not every tick.
+   */
   private updatePickups(): void {
     for (let i = 0; i < this.numPlayers; i++) {
-      if (this.state.alive[i] === 0) continue;
-      for (let d = 0; d < this.drops.length; d++) {
-        const drop = this.drops[d]!;
+      if (this.state.alive[i] === 0) {
+        this.lastOverlappingDropId[i] = null;
+        continue;
+      }
+
+      let overlapping: DroppedWeaponEntity | null = null;
+      for (const drop of this.drops) {
         const dx = this.state.posX[i]! - drop.x;
         const dz = this.state.posZ[i]! - drop.z;
-        const dist = Math.hypot(dx, dz);
-        if (dist > PICKUP_RADIUS_M) continue;
-
-        const currentPrimary = this.state.weaponPrimary[i]!;
-        const currentMag = this.state.magPrimary[i]!;
-        this.state = pickupWeapon(this.state, i, drop.weaponId, drop.mag);
-
-        if (currentPrimary !== WEAPON_NONE) {
-          // The drop entity now holds the player's previously-equipped weapon.
-          drop.weaponId = currentPrimary;
-          drop.mag = currentMag;
-          drop.spawnTick = this.state.tick;
-        } else {
-          this.drops.splice(d, 1);
+        if (Math.hypot(dx, dz) <= PICKUP_RADIUS_M) {
+          overlapping = drop;
+          break;
         }
-        break; // one pickup per player per tick is plenty
+      }
+
+      if (!overlapping) {
+        this.lastOverlappingDropId[i] = null;
+        continue;
+      }
+      if (this.lastOverlappingDropId[i] === overlapping.id) {
+        continue; // still on the same drop id since the last time it fired — must leave and re-enter
+      }
+
+      const currentPrimary = this.state.weaponPrimary[i]!;
+      const currentMag = this.state.magPrimary[i]!;
+      this.state = pickupWeapon(this.state, i, overlapping.weaponId, overlapping.mag);
+
+      if (currentPrimary !== WEAPON_NONE) {
+        // The drop entity now holds the player's previously-equipped weapon,
+        // keeping the same id — the gate above stops this player from
+        // re-triggering on it again until they leave and re-enter.
+        overlapping.weaponId = currentPrimary;
+        overlapping.mag = currentMag;
+        overlapping.spawnTick = this.state.tick;
+        this.lastOverlappingDropId[i] = overlapping.id;
+      } else {
+        const idx = this.drops.indexOf(overlapping);
+        if (idx !== -1) this.drops.splice(idx, 1);
+        this.lastOverlappingDropId[i] = null;
       }
     }
   }

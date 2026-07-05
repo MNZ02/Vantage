@@ -44,7 +44,13 @@ const combatHud = createCombatHud();
 
 let netClient: NetClient | null = null;
 const remoteProxies = new Map<number, RemotePlayerProxy>();
-const remoteLastMagActive = new Map<number, number>();
+interface RemoteWeaponSnapshot {
+  magActive: number;
+  activeSlot: number;
+  weaponPrimary: number;
+  weaponSecondary: number;
+}
+const remoteLastWeapon = new Map<number, RemoteWeaponSnapshot>();
 
 const buyMenu = createBuyMenu((itemId) => {
   netClient?.buy(itemId);
@@ -139,7 +145,7 @@ function syncRemoteProxies(): void {
         proxy.dispose(scene);
         remoteProxies.delete(i);
       }
-      remoteLastMagActive.delete(i);
+      remoteLastWeapon.delete(i);
       continue;
     }
     if (!proxy) {
@@ -151,14 +157,25 @@ function syncRemoteProxies(): void {
     // Remote shot tracer heuristic: active-slot ammo decreased since the
     // last check -> they fired (see interpolation.ts's RemotePose.magActive
     // doc comment for why this proxies shotCounter, which isn't on the wire).
-    const prevMag = remoteLastMagActive.get(i);
-    if (prevMag !== undefined && pose.magActive < prevMag && pose.alive) {
+    // Gated on activeSlot/weaponPrimary/weaponSecondary all being unchanged
+    // too: magActive refers to whichever slot is active, so a weapon switch
+    // (e.g. primary mag 25 -> secondary mag 12) is a magActive *decrease*
+    // that is not a shot and must not spawn a stray tracer.
+    const prev = remoteLastWeapon.get(i);
+    const weaponUnchanged =
+      !!prev && prev.activeSlot === pose.activeSlot && prev.weaponPrimary === pose.weaponPrimary && prev.weaponSecondary === pose.weaponSecondary;
+    if (prev && weaponUnchanged && pose.magActive < prev.magActive && pose.alive) {
       const from = new THREE.Vector3(pose.posX, pose.posY + EYE_HEIGHT_STAND, pose.posZ);
       const dir = viewDirection(pose.yaw, pose.pitch);
       const to = from.clone().add(new THREE.Vector3(dir.x, dir.y, dir.z).multiplyScalar(50));
       spawnTracer(scene, from, to, 100);
     }
-    remoteLastMagActive.set(i, pose.magActive);
+    remoteLastWeapon.set(i, {
+      magActive: pose.magActive,
+      activeSlot: pose.activeSlot,
+      weaponPrimary: pose.weaponPrimary,
+      weaponSecondary: pose.weaponSecondary,
+    });
   }
 }
 

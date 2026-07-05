@@ -159,6 +159,70 @@ describe("kill/respawn/drop/pickup (acceptance criterion 10)", () => {
     void targetIndex;
   });
 
+  it("standing stationary on a drop swaps exactly once across >=64 ticks; moving away and returning allows exactly one more swap", () => {
+    const { host, shooterIndex, sendShooter } = setupTwoPlayerFight();
+    for (let i = 0; i < 5; i++) {
+      sendShooter({ ...idleInput(), fire: true });
+      host.step();
+      if (host.getDrops().length > 0) break;
+    }
+    expect(host.getDrops().length).toBe(1);
+    const drop = host.getDrops()[0]!;
+    const droppedWeaponId = drop.weaponId; // Kestrel
+
+    const wasp = WEAPONS.find((w) => w.name === "Wasp")!;
+    let state = host.getState();
+    state.weaponPrimary[shooterIndex] = wasp.id;
+    state.magPrimary[shooterIndex] = 7;
+    state.reservePrimary[shooterIndex] = wasp.reserveAmmo;
+    state.posX[shooterIndex] = drop.x;
+    state.posY[shooterIndex] = drop.y;
+    state.posZ[shooterIndex] = drop.z;
+    state.velX[shooterIndex] = 0;
+    state.velZ[shooterIndex] = 0;
+
+    function countSwaps(ticks: number): number {
+      let swaps = 0;
+      let lastPrimary = host.getState().weaponPrimary[shooterIndex];
+      for (let i = 0; i < ticks; i++) {
+        sendShooter(idleInput());
+        host.step();
+        const primaryNow = host.getState().weaponPrimary[shooterIndex];
+        if (primaryNow !== lastPrimary) {
+          swaps++;
+          lastPrimary = primaryNow;
+        }
+      }
+      return swaps;
+    }
+
+    // Stand still directly on the drop for >=64 ticks: exactly one swap, not
+    // an oscillation every tick (the bug this test guards against).
+    expect(countSwaps(64)).toBe(1);
+    expect(host.getState().weaponPrimary[shooterIndex]).toBe(droppedWeaponId);
+    expect(host.getDrops().length).toBe(1);
+    expect(host.getDrops()[0]!.weaponId).toBe(wasp.id); // the drop now holds the swapped-out Wasp
+
+    // Move well outside PICKUP_RADIUS_M (0.8m) for a few ticks.
+    state = host.getState();
+    state.posZ[shooterIndex] = drop.z + 5;
+    state.velX[shooterIndex] = 0;
+    state.velZ[shooterIndex] = 0;
+    for (let i = 0; i < 5; i++) {
+      sendShooter(idleInput());
+      host.step();
+    }
+    expect(host.getState().weaponPrimary[shooterIndex]).toBe(droppedWeaponId); // unchanged while away
+
+    // Return to the same drop location: exactly one more swap (back to Wasp).
+    state = host.getState();
+    state.posZ[shooterIndex] = drop.z;
+    state.velX[shooterIndex] = 0;
+    state.velZ[shooterIndex] = 0;
+    expect(countSwaps(10)).toBe(1);
+    expect(host.getState().weaponPrimary[shooterIndex]).toBe(wasp.id);
+  });
+
   it("drops despawn after 30s (DROP_DESPAWN_TICKS)", () => {
     const { host, sendShooter } = setupTwoPlayerFight();
     for (let i = 0; i < 5; i++) {
