@@ -158,8 +158,14 @@ export function applyAbilityBuy(state: SimState, playerIndex: number, slot: numb
 function wishDirFromInput(input: InputFrame): { x: number; z: number } {
   const fx = sinApprox(input.yaw);
   const fz = cosApprox(input.yaw);
-  const rx = cosApprox(input.yaw);
-  const rz = -sinApprox(input.yaw);
+  // right = forward x up in this right-handed Y-up world; must match
+  // movement.ts's wishDirection() exactly (see 055434f: input.right=+1 moves
+  // screen-right, matching the camera's rotation.y = yaw + PI convention) —
+  // Zephyr's Dash decomposes forward/right the same way ordinary movement
+  // does, so a strafing dash must travel the same direction strafing alone
+  // would.
+  const rx = -cosApprox(input.yaw);
+  const rz = sinApprox(input.yaw);
   let x = fx * input.forward + rx * input.right;
   let z = fz * input.forward + rz * input.right;
   const len = Math.hypot(x, z);
