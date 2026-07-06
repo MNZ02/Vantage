@@ -48,6 +48,8 @@ const WEAPON_CLASS_TUNING: Record<WeaponClass, { durationSec: number; noiseDecay
   smg: { durationSec: 0.16, noiseDecay: 16, bodyFreq: 200, tailDecay: 11 },
   rifle: { durationSec: 0.22, noiseDecay: 10, bodyFreq: 160, tailDecay: 7 },
   sniper: { durationSec: 0.45, noiseDecay: 5, bodyFreq: 90, tailDecay: 3 },
+  // Blades ult "shot": a short airy whoosh — brief, high decay, thin body.
+  knife: { durationSec: 0.12, noiseDecay: 18, bodyFreq: 320, tailDecay: 14 },
 };
 
 /** Gunshot = noise burst (crack) + a low body thump + a decaying tail. Sniper is boomier (lower freq, longer decay); pistol is snappier (short, high decay rate). */

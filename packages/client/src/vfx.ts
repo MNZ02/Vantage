@@ -3,7 +3,8 @@
 // and reused frame to frame — no per-frame allocations in the hot path
 // (spec: "no per-frame allocations in the new animation/audio paths").
 import * as THREE from "three";
-import { SPIKE_PLANTED, type SimState } from "@vg/sim";
+import { SPIKE_DROPPED, SPIKE_PLANTED, type SimState } from "@vg/sim";
+import { cloneModel, loadModel } from "./assets.js";
 
 // ---- Muzzle flash: a brief point light + small sprite-like quad at the shot origin. ----
 export interface MuzzleFlashPool {
@@ -138,7 +139,10 @@ export function createDeathMarkerPool(scene: THREE.Scene): DeathMarkerPool {
   };
 }
 
-// ---- Spike beacon: pulsing red light + emissive marker while planted. ----
+// ---- Spike world object: the authored prop_spike.glb (octahedron until it
+// loads), shown while DROPPED on the ground or PLANTED, plus a pulsing red
+// point light while planted. Dropped shows the model without the alarm
+// light — you can find it by sight, matching the minimap's dropped marker. ----
 export interface SpikeBeacon {
   sync(state: SimState, nowSeconds: number): void;
 }
@@ -146,21 +150,35 @@ export interface SpikeBeacon {
 export function createSpikeBeacon(scene: THREE.Scene): SpikeBeacon {
   const light = new THREE.PointLight(0xff3b3b, 0, 8);
   scene.add(light);
+  const holder = new THREE.Group();
   const material = new THREE.MeshStandardMaterial({ color: 0x3a0d0d, emissive: 0xff2020, emissiveIntensity: 1 });
-  const mesh = new THREE.Mesh(new THREE.OctahedronGeometry(0.18, 0), material);
-  mesh.visible = false;
-  scene.add(mesh);
+  const placeholder = new THREE.Mesh(new THREE.OctahedronGeometry(0.18, 0), material);
+  placeholder.position.y = 0.2;
+  holder.add(placeholder);
+  holder.visible = false;
+  scene.add(holder);
+
+  void loadModel("prop_spike").then((master) => {
+    if (!master) return;
+    holder.clear(); // .glb origin is at the floor — no lift needed
+    holder.add(cloneModel(master).group);
+  });
 
   return {
     sync(state: SimState, nowSeconds: number) {
       const planted = state.spikeState === SPIKE_PLANTED;
-      mesh.visible = planted;
+      const dropped = state.spikeState === SPIKE_DROPPED;
+      holder.visible = planted || dropped;
+      if (!holder.visible) {
+        light.intensity = 0;
+        return;
+      }
+      holder.position.set(state.spikeX, state.spikeY, state.spikeZ);
       if (!planted) {
         light.intensity = 0;
         return;
       }
-      mesh.position.set(state.spikeX, state.spikeY + 0.2, state.spikeZ);
-      light.position.copy(mesh.position);
+      light.position.set(state.spikeX, state.spikeY + 0.3, state.spikeZ);
       const pulse = 0.5 + 0.5 * Math.sin(nowSeconds * 6);
       light.intensity = 1.5 + pulse * 2.5;
       material.emissiveIntensity = 0.6 + pulse * 1.2;

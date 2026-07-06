@@ -1,22 +1,32 @@
-// M5: procedural first-person viewmodels, replacing render.ts's placeholder
-// barrel+body proxy. Real weapon art (baked models/textures) is explicitly
-// out of scope for this milestone — REAL-ASSET SWAP POINT: a future pass
-// with commissioned weapon models would replace buildWeaponMesh() below
-// wholesale, keeping the same WeaponVisualHandle contract (setVisible,
-// playRecoilKick, playReload, setAds) so main.ts/render.ts don't need to
-// change at the call site.
+// M5: first-person viewmodels. Real weapon models (assets/models/*.glb, see
+// assets/README.md) are loaded async via assets.ts and swapped in over the
+// procedural box silhouettes below, which remain as the instant placeholder
+// and the fallback if a .glb fails to load. The WeaponVisualHandle contract
+// (setVisible, fireKick, update, scope) is unchanged, so main.ts/render.ts
+// call sites don't care which representation is currently showing.
 import * as THREE from "three";
-import { WEAPON_LONGBOW, WEAPON_MARSHAL6, WEAPON_VIPER, WEAPON_WASP, getWeaponDef } from "@vg/sim";
+import { ABL_ZEPHYR_BLADES, WEAPON_LONGBOW, WEAPON_MARSHAL6, WEAPON_VIPER, WEAPON_WASP, abilityWeaponId, getWeaponDef } from "@vg/sim";
+import { cloneModel, loadModel, type ModelName } from "./assets.js";
 
-export type WeaponClass = "pistol" | "smg" | "rifle" | "sniper";
+export type WeaponClass = "pistol" | "smg" | "rifle" | "sniper" | "knife";
 
 /** Buckets a weapon id (including the 100+abilityId ult-weapon space) into a silhouette class for viewmodel purposes. */
 export function weaponClassFor(weaponId: number): WeaponClass {
   if (weaponId === WEAPON_VIPER || weaponId === WEAPON_MARSHAL6) return "pistol";
   if (weaponId === WEAPON_WASP) return "smg";
   if (weaponId === WEAPON_LONGBOW) return "sniper";
-  return "rifle"; // Falcon/Kestrel, and both ult "weapons" (Blades/Rail) default to a rifle-ish silhouette
+  if (weaponId === abilityWeaponId(ABL_ZEPHYR_BLADES)) return "knife"; // Zephyr's Blades ult throws knives, not bullets
+  return "rifle"; // Falcon/Kestrel and the Rail ult "weapon" default to a rifle-ish silhouette
 }
+
+/** Which authored .glb represents each silhouette class (no SMG model authored — the rifle, scaled down, reads correctly). */
+export const MODEL_FOR_CLASS: Record<WeaponClass, { name: ModelName; scale: number }> = {
+  pistol: { name: "weapon_pistol", scale: 1 },
+  smg: { name: "weapon_rifle", scale: 0.72 },
+  rifle: { name: "weapon_rifle", scale: 1 },
+  sniper: { name: "weapon_sniper", scale: 1 },
+  knife: { name: "weapon_knife", scale: 1 },
+};
 
 // ---- Recoil spring (pure, testable — spec acceptance criterion: "recoil
 // spring returns to rest within 500 ms simulated"). A critically-damped-ish
@@ -128,6 +138,14 @@ function buildWeaponMesh(cls: WeaponClass): THREE.Group {
       group.add(body, barrel, scope, stock, bolt);
       break;
     }
+    case "knife": {
+      const handle = boxMesh(0.03, 0.035, 0.12, bodyColor);
+      handle.position.set(0, 0, 0.03);
+      const blade = boxMesh(0.008, 0.03, 0.18, metalColor);
+      blade.position.set(0, 0.005, -0.12);
+      group.add(handle, blade);
+      break;
+    }
   }
   return group;
 }
@@ -192,7 +210,7 @@ function createScopeOverlay(): ScopeOverlay {
   };
 }
 
-const WEAPON_CLASSES: readonly WeaponClass[] = ["pistol", "smg", "rifle", "sniper"];
+const WEAPON_CLASSES: readonly WeaponClass[] = ["pistol", "smg", "rifle", "sniper", "knife"];
 
 export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandle {
   const anchor = new THREE.Group();
@@ -206,6 +224,16 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
     mesh.visible = false;
     anchor.add(mesh);
     meshes.set(cls, mesh);
+    // Swap in the authored .glb when it arrives (procedural boxes remain
+    // until then, and forever if the load fails — loadModel resolves null).
+    const { name, scale } = MODEL_FOR_CLASS[cls];
+    void loadModel(name).then((master) => {
+      if (!master) return;
+      const { group } = cloneModel(master);
+      group.scale.setScalar(scale);
+      mesh.clear();
+      mesh.add(group);
+    });
   }
   let currentClass: WeaponClass = "rifle";
   meshes.get(currentClass)!.visible = true;
@@ -221,7 +249,7 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
     },
     fireKick(weaponId: number) {
       const cls = weaponClassFor(weaponId);
-      const kickByClass: Record<WeaponClass, number> = { pistol: 6, smg: 5, rifle: 7, sniper: 14 };
+      const kickByClass: Record<WeaponClass, number> = { pistol: 6, smg: 5, rifle: 7, sniper: 14, knife: 3 };
       kickRecoilSpring(recoil, kickByClass[cls]);
     },
     update(info) {

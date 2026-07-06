@@ -6,7 +6,8 @@
 // proxy exposed, so render.ts/main.ts don't need to change at the call site.
 import * as THREE from "three";
 import { CROUCH_HEIGHT, STAND_HEIGHT, CAPSULE_RADIUS } from "@vg/sim";
-import { weaponClassFor, type WeaponClass } from "./viewmodel.js";
+import { MODEL_FOR_CLASS, weaponClassFor, type WeaponClass } from "./viewmodel.js";
+import { cloneModel, getLoadedModel, loadModel } from "./assets.js";
 
 // ---- Pure rig-height math (spec acceptance criterion: "standing/crouch
 // model bounds within 10% of capsule dims" — verified directly here, and
@@ -110,7 +111,9 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
   const bodyMat = new THREE.MeshStandardMaterial({ color: NEUTRAL_BASE, roughness: 0.8, transparent: true });
   const limbMat = new THREE.MeshStandardMaterial({ color: darken(NEUTRAL_BASE, 0.35), roughness: 0.8, transparent: true });
   const weaponMat = new THREE.MeshStandardMaterial({ color: 0x2b2f36, roughness: 0.6, transparent: true });
-  const materials = [bodyMat, limbMat, weaponMat];
+  // Mutable: the held weapon's .glb materials are appended per class swap so
+  // the death fade below dims them along with the body/limb materials.
+  const materials: THREE.Material[] = [bodyMat, limbMat, weaponMat];
 
   function mesh(geo: THREE.BufferGeometry, mat: THREE.Material): THREE.Mesh {
     const m = new THREE.Mesh(geo, mat);
@@ -132,14 +135,25 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
   const upperLegR = mesh(new THREE.BoxGeometry(0.16, 0.01, 0.16), limbMat);
   const lowerLegR = mesh(new THREE.BoxGeometry(0.14, 0.01, 0.14), limbMat);
 
-  const weaponBox = mesh(new THREE.BoxGeometry(0.06, 0.06, 0.3), weaponMat);
+  // Held weapon: a holder group positioned at the right hand. Starts as the
+  // procedural box; swaps to the authored .glb (assets/models) once loaded —
+  // getLoadedModel is probed on class change and per-frame until it hits, so
+  // the swap happens whenever the async load lands. The .glb's materials are
+  // cloned per player (cloneModel(…, true)) and appended to `materials` so
+  // the death fade dims the gun with the body.
+  const weaponHolder = new THREE.Group();
+  group.add(weaponHolder);
+  const weaponBox = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.3), weaponMat);
+  weaponHolder.add(weaponBox);
+  let weaponIsGlb = false;
+  let weaponGlbMaterials: THREE.Material[] = [];
 
   scene.add(group);
 
   let deathStartSeconds: number | null = null;
   let currentWeaponClass: WeaponClass | null = null;
 
-  const weaponLengthByClass: Record<WeaponClass, number> = { pistol: 0.16, smg: 0.28, rifle: 0.42, sniper: 0.55 };
+  const weaponLengthByClass: Record<WeaponClass, number> = { pistol: 0.16, smg: 0.28, rifle: 0.42, sniper: 0.55, knife: 0.2 };
 
   function setLegGeometry(legMesh: THREE.Mesh, length: number, width: number, depth: number): void {
     legMesh.geometry.dispose();
@@ -212,14 +226,37 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
       upperArmL.rotation.x = swingOpp * 0.5;
       upperArmR.rotation.x = swing * 0.5;
 
-      // ---- Weapon box in right hand, sized per weapon class ----
+      // ---- Weapon in right hand: .glb when loaded, sized box until then ----
       const cls = weaponClassFor(pose.weaponId);
-      if (cls !== currentWeaponClass) {
-        weaponBox.geometry.dispose();
-        weaponBox.geometry = new THREE.BoxGeometry(0.06, 0.06, weaponLengthByClass[cls]);
+      const model = MODEL_FOR_CLASS[cls];
+      const master = getLoadedModel(model.name);
+      if (cls !== currentWeaponClass || (!weaponIsGlb && master !== null)) {
+        for (const m of weaponGlbMaterials) {
+          const idx = materials.indexOf(m);
+          if (idx >= 0) materials.splice(idx, 1);
+          m.dispose();
+        }
+        weaponGlbMaterials = [];
+        weaponHolder.clear();
+        if (master) {
+          const clone = cloneModel(master, true);
+          clone.group.scale.setScalar(model.scale);
+          weaponHolder.add(clone.group);
+          materials.push(...clone.materials);
+          weaponGlbMaterials = clone.materials;
+          weaponIsGlb = true;
+        } else {
+          void loadModel(model.name); // fire the async load; the per-frame probe above swaps it in when ready
+          weaponBox.geometry.dispose();
+          weaponBox.geometry = new THREE.BoxGeometry(0.06, 0.06, weaponLengthByClass[cls]);
+          weaponBox.position.set(0, 0, -weaponLengthByClass[cls] / 2);
+          weaponHolder.add(weaponBox);
+          weaponIsGlb = false;
+        }
         currentWeaponClass = cls;
       }
-      weaponBox.position.set(ARM_X_OFFSET + 0.05, shoulderY - 0.14 - 0.3, -weaponLengthByClass[cls] / 2 + 0.05);
+      // Holder origin = grip position (the .glb origin is at the grip; the box offsets itself to match).
+      weaponHolder.position.set(ARM_X_OFFSET + 0.05, shoulderY - 0.14 - 0.3, 0.05);
     },
     dispose(targetScene: THREE.Scene) {
       targetScene.remove(group);
@@ -229,6 +266,7 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
       bodyMat.dispose();
       limbMat.dispose();
       weaponMat.dispose();
+      for (const m of weaponGlbMaterials) m.dispose(); // .glb geometry is shared with the cached master — never disposed here
     },
   };
 }

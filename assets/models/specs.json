@@ -1,0 +1,1495 @@
+{
+ "materials": {
+  "gunmetal": {
+   "color": "#2B2F3A",
+   "metallic": 0.8,
+   "roughness": 0.45
+  },
+  "steel": {
+   "color": "#A9B2BD",
+   "metallic": 0.9,
+   "roughness": 0.35
+  },
+  "teal": {
+   "color": "#33C6B5",
+   "metallic": 0.2,
+   "roughness": 0.6
+  },
+  "orange": {
+   "color": "#E1523D",
+   "metallic": 0.1,
+   "roughness": 0.7
+  },
+  "grip": {
+   "color": "#1B1E26",
+   "metallic": 0.0,
+   "roughness": 0.9
+  },
+  "wood": {
+   "color": "#8A6A45",
+   "metallic": 0.0,
+   "roughness": 0.85
+  },
+  "wood_dark": {
+   "color": "#4A3826",
+   "metallic": 0.0,
+   "roughness": 0.85
+  },
+  "drum": {
+   "color": "#5A6B7A",
+   "metallic": 0.6,
+   "roughness": 0.5
+  },
+  "drum_rim": {
+   "color": "#39434E",
+   "metallic": 0.7,
+   "roughness": 0.45
+  },
+  "wall": {
+   "color": "#B8B2A6",
+   "metallic": 0.0,
+   "roughness": 0.95
+  },
+  "wall_trim": {
+   "color": "#6E6659",
+   "metallic": 0.0,
+   "roughness": 0.9
+  },
+  "spike": {
+   "color": "#23262E",
+   "metallic": 0.5,
+   "roughness": 0.5
+  },
+  "glow_red": {
+   "color": "#FF3B30",
+   "emissive": "#FF3B30",
+   "metallic": 0.0,
+   "roughness": 0.4
+  },
+  "glow_teal": {
+   "color": "#33C6B5",
+   "emissive": "#1EA897",
+   "metallic": 0.0,
+   "roughness": 0.4
+  }
+ },
+ "models": {
+  "weapon_rifle": [
+   {
+    "type": "box",
+    "name": "receiver",
+    "size": [
+     0.062,
+     0.085,
+     0.34
+    ],
+    "pos": [
+     0,
+     0.02,
+     0.02
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "rail",
+    "size": [
+     0.03,
+     0.018,
+     0.3
+    ],
+    "pos": [
+     0,
+     0.072,
+     0.0
+    ],
+    "mat": "grip"
+   },
+   {
+    "type": "box",
+    "name": "handguard",
+    "size": [
+     0.055,
+     0.055,
+     0.24
+    ],
+    "pos": [
+     0,
+     0.025,
+     -0.27
+    ],
+    "mat": "grip"
+   },
+   {
+    "type": "cyl",
+    "name": "barrel",
+    "size": [
+     0.013,
+     0.26
+    ],
+    "pos": [
+     0,
+     0.03,
+     -0.5
+    ],
+    "mat": "steel",
+    "sections": 12,
+    "rot": [
+     90,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "cyl",
+    "name": "muzzle",
+    "size": [
+     0.019,
+     0.055
+    ],
+    "pos": [
+     0,
+     0.03,
+     -0.615
+    ],
+    "mat": "gunmetal",
+    "sections": 8,
+    "rot": [
+     90,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "front_sight",
+    "size": [
+     0.012,
+     0.045,
+     0.02
+    ],
+    "pos": [
+     0,
+     0.075,
+     -0.36
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "rear_sight",
+    "size": [
+     0.03,
+     0.025,
+     0.02
+    ],
+    "pos": [
+     0,
+     0.09,
+     0.1
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "mag",
+    "size": [
+     0.032,
+     0.15,
+     0.065
+    ],
+    "pos": [
+     0,
+     -0.09,
+     -0.045
+    ],
+    "mat": "teal",
+    "rot": [
+     -12,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "grip",
+    "size": [
+     0.032,
+     0.1,
+     0.045
+    ],
+    "pos": [
+     0,
+     -0.075,
+     0.115
+    ],
+    "mat": "grip",
+    "rot": [
+     15,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "stock",
+    "size": [
+     0.045,
+     0.062,
+     0.2
+    ],
+    "pos": [
+     0,
+     0.005,
+     0.28
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "buttplate",
+    "size": [
+     0.05,
+     0.1,
+     0.03
+    ],
+    "pos": [
+     0,
+     -0.005,
+     0.385
+    ],
+    "mat": "grip"
+   },
+   {
+    "type": "box",
+    "name": "accent",
+    "size": [
+     0.064,
+     0.02,
+     0.12
+    ],
+    "pos": [
+     0,
+     0.045,
+     -0.05
+    ],
+    "mat": "teal"
+   },
+   {
+    "type": "box",
+    "name": "eject",
+    "size": [
+     0.066,
+     0.03,
+     0.07
+    ],
+    "pos": [
+     0,
+     0.03,
+     0.05
+    ],
+    "mat": "steel"
+   }
+  ],
+  "weapon_pistol": [
+   {
+    "type": "box",
+    "name": "slide",
+    "size": [
+     0.028,
+     0.034,
+     0.185
+    ],
+    "pos": [
+     0,
+     0.055,
+     -0.03
+    ],
+    "mat": "steel"
+   },
+   {
+    "type": "box",
+    "name": "slide_top",
+    "size": [
+     0.02,
+     0.012,
+     0.185
+    ],
+    "pos": [
+     0,
+     0.078,
+     -0.03
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "cyl",
+    "name": "barrel",
+    "size": [
+     0.008,
+     0.02
+    ],
+    "pos": [
+     0,
+     0.055,
+     -0.132
+    ],
+    "mat": "gunmetal",
+    "sections": 8,
+    "rot": [
+     90,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "frame",
+    "size": [
+     0.026,
+     0.022,
+     0.15
+    ],
+    "pos": [
+     0,
+     0.028,
+     -0.02
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "grip",
+    "size": [
+     0.028,
+     0.095,
+     0.042
+    ],
+    "pos": [
+     0,
+     -0.028,
+     0.035
+    ],
+    "mat": "grip",
+    "rot": [
+     18,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "guard_f",
+    "size": [
+     0.008,
+     0.032,
+     0.006
+    ],
+    "pos": [
+     0,
+     -0.002,
+     -0.052
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "guard_b",
+    "size": [
+     0.008,
+     0.006,
+     0.05
+    ],
+    "pos": [
+     0,
+     -0.016,
+     -0.028
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "trigger",
+    "size": [
+     0.006,
+     0.022,
+     0.008
+    ],
+    "pos": [
+     0,
+     0.002,
+     -0.022
+    ],
+    "mat": "teal",
+    "rot": [
+     10,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "front_sight",
+    "size": [
+     0.006,
+     0.012,
+     0.012
+    ],
+    "pos": [
+     0,
+     0.088,
+     -0.115
+    ],
+    "mat": "teal"
+   },
+   {
+    "type": "box",
+    "name": "rear_sight",
+    "size": [
+     0.02,
+     0.012,
+     0.012
+    ],
+    "pos": [
+     0,
+     0.088,
+     0.055
+    ],
+    "mat": "gunmetal"
+   }
+  ],
+  "weapon_sniper": [
+   {
+    "type": "box",
+    "name": "receiver",
+    "size": [
+     0.075,
+     0.095,
+     0.42
+    ],
+    "pos": [
+     0,
+     0.02,
+     0.03
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "cyl",
+    "name": "barrel",
+    "size": [
+     0.016,
+     0.52
+    ],
+    "pos": [
+     0,
+     0.035,
+     -0.48
+    ],
+    "mat": "gunmetal",
+    "sections": 12,
+    "rot": [
+     90,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "muzzle",
+    "size": [
+     0.05,
+     0.05,
+     0.09
+    ],
+    "pos": [
+     0,
+     0.035,
+     -0.75
+    ],
+    "mat": "steel"
+   },
+   {
+    "type": "box",
+    "name": "shroud",
+    "size": [
+     0.065,
+     0.065,
+     0.18
+    ],
+    "pos": [
+     0,
+     0.03,
+     -0.3
+    ],
+    "mat": "grip"
+   },
+   {
+    "type": "cyl",
+    "name": "scope",
+    "size": [
+     0.028,
+     0.28
+    ],
+    "pos": [
+     0,
+     0.125,
+     -0.02
+    ],
+    "mat": "grip",
+    "sections": 12,
+    "rot": [
+     90,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "cyl",
+    "name": "scope_obj",
+    "size": [
+     0.034,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.125,
+     -0.15
+    ],
+    "mat": "teal",
+    "sections": 10,
+    "rot": [
+     90,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "cyl",
+    "name": "scope_eye",
+    "size": [
+     0.032,
+     0.04
+    ],
+    "pos": [
+     0,
+     0.125,
+     0.12
+    ],
+    "mat": "gunmetal",
+    "sections": 10,
+    "rot": [
+     90,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "mount_f",
+    "size": [
+     0.02,
+     0.045,
+     0.025
+    ],
+    "pos": [
+     0,
+     0.085,
+     -0.08
+    ],
+    "mat": "steel"
+   },
+   {
+    "type": "box",
+    "name": "mount_b",
+    "size": [
+     0.02,
+     0.045,
+     0.025
+    ],
+    "pos": [
+     0,
+     0.085,
+     0.05
+    ],
+    "mat": "steel"
+   },
+   {
+    "type": "box",
+    "name": "mag",
+    "size": [
+     0.04,
+     0.11,
+     0.09
+    ],
+    "pos": [
+     0,
+     -0.075,
+     -0.02
+    ],
+    "mat": "teal",
+    "rot": [
+     -8,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "grip",
+    "size": [
+     0.034,
+     0.105,
+     0.05
+    ],
+    "pos": [
+     0,
+     -0.075,
+     0.14
+    ],
+    "mat": "grip",
+    "rot": [
+     16,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "stock",
+    "size": [
+     0.05,
+     0.075,
+     0.26
+    ],
+    "pos": [
+     0,
+     0.0,
+     0.36
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "cheek",
+    "size": [
+     0.052,
+     0.03,
+     0.14
+    ],
+    "pos": [
+     0,
+     0.06,
+     0.37
+    ],
+    "mat": "orange"
+   },
+   {
+    "type": "box",
+    "name": "buttplate",
+    "size": [
+     0.055,
+     0.12,
+     0.03
+    ],
+    "pos": [
+     0,
+     -0.01,
+     0.5
+    ],
+    "mat": "grip"
+   },
+   {
+    "type": "cyl",
+    "name": "bipod_l",
+    "size": [
+     0.006,
+     0.16
+    ],
+    "pos": [
+     -0.045,
+     -0.06,
+     -0.55
+    ],
+    "mat": "steel",
+    "sections": 12,
+    "rot": [
+     0,
+     0,
+     25
+    ]
+   },
+   {
+    "type": "cyl",
+    "name": "bipod_r",
+    "size": [
+     0.006,
+     0.16
+    ],
+    "pos": [
+     0.045,
+     -0.06,
+     -0.55
+    ],
+    "mat": "steel",
+    "sections": 12,
+    "rot": [
+     0,
+     0,
+     -25
+    ]
+   },
+   {
+    "type": "box",
+    "name": "bolt",
+    "size": [
+     0.05,
+     0.014,
+     0.014
+    ],
+    "pos": [
+     0.05,
+     0.055,
+     0.12
+    ],
+    "mat": "steel",
+    "rot": [
+     0,
+     0,
+     -30
+    ]
+   }
+  ],
+  "weapon_knife": [
+   {
+    "type": "box",
+    "name": "blade",
+    "size": [
+     0.005,
+     0.032,
+     0.13
+    ],
+    "pos": [
+     0,
+     0.004,
+     -0.115
+    ],
+    "mat": "steel"
+   },
+   {
+    "type": "cone",
+    "name": "blade_tip",
+    "size": [
+     0.016,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.004,
+     -0.205
+    ],
+    "mat": "steel",
+    "sections": 4,
+    "rot": [
+     90,
+     0,
+     0
+    ],
+    "scale": [
+     0.16,
+     1.0,
+     1.0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "edge",
+    "size": [
+     0.003,
+     0.008,
+     0.13
+    ],
+    "pos": [
+     0,
+     -0.014,
+     -0.115
+    ],
+    "mat": "teal"
+   },
+   {
+    "type": "box",
+    "name": "guard",
+    "size": [
+     0.014,
+     0.05,
+     0.012
+    ],
+    "pos": [
+     0,
+     0.0,
+     -0.048
+    ],
+    "mat": "gunmetal"
+   },
+   {
+    "type": "box",
+    "name": "handle",
+    "size": [
+     0.018,
+     0.028,
+     0.105
+    ],
+    "pos": [
+     0,
+     -0.002,
+     0.012
+    ],
+    "mat": "grip",
+    "rot": [
+     -4,
+     0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "pommel",
+    "size": [
+     0.02,
+     0.032,
+     0.018
+    ],
+    "pos": [
+     0,
+     -0.006,
+     0.07
+    ],
+    "mat": "gunmetal"
+   }
+  ],
+  "prop_crate": [
+   {
+    "type": "box",
+    "name": "body",
+    "size": [
+     0.96,
+     0.96,
+     0.96
+    ],
+    "pos": [
+     0,
+     0.5,
+     0
+    ],
+    "mat": "wood"
+   },
+   {
+    "type": "box",
+    "name": "cross_f",
+    "size": [
+     1.22,
+     0.07,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.5,
+     0.475
+    ],
+    "mat": "wood_dark",
+    "rot": [
+     0,
+     0,
+     45
+    ]
+   },
+   {
+    "type": "box",
+    "name": "cross_b",
+    "size": [
+     1.22,
+     0.07,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.5,
+     -0.475
+    ],
+    "mat": "wood_dark",
+    "rot": [
+     0,
+     0,
+     -45
+    ]
+   },
+   {
+    "type": "box",
+    "name": "edge_z0",
+    "size": [
+     0.09,
+     0.09,
+     1.0
+    ],
+    "pos": [
+     -0.455,
+     0.044999999999999984,
+     0
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_x0",
+    "size": [
+     1.0,
+     0.09,
+     0.09
+    ],
+    "pos": [
+     0,
+     0.044999999999999984,
+     -0.455
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_y0",
+    "size": [
+     0.09,
+     1.0,
+     0.09
+    ],
+    "pos": [
+     -0.455,
+     0.5,
+     -0.455
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_z1",
+    "size": [
+     0.09,
+     0.09,
+     1.0
+    ],
+    "pos": [
+     -0.455,
+     0.9550000000000001,
+     0
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_x1",
+    "size": [
+     1.0,
+     0.09,
+     0.09
+    ],
+    "pos": [
+     0,
+     0.9550000000000001,
+     -0.455
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_y1",
+    "size": [
+     0.09,
+     1.0,
+     0.09
+    ],
+    "pos": [
+     -0.455,
+     0.5,
+     0.455
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_z2",
+    "size": [
+     0.09,
+     0.09,
+     1.0
+    ],
+    "pos": [
+     0.455,
+     0.044999999999999984,
+     0
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_x2",
+    "size": [
+     1.0,
+     0.09,
+     0.09
+    ],
+    "pos": [
+     0,
+     0.044999999999999984,
+     0.455
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_y2",
+    "size": [
+     0.09,
+     1.0,
+     0.09
+    ],
+    "pos": [
+     0.455,
+     0.5,
+     -0.455
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_z3",
+    "size": [
+     0.09,
+     0.09,
+     1.0
+    ],
+    "pos": [
+     0.455,
+     0.9550000000000001,
+     0
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_x3",
+    "size": [
+     1.0,
+     0.09,
+     0.09
+    ],
+    "pos": [
+     0,
+     0.9550000000000001,
+     0.455
+    ],
+    "mat": "wood_dark"
+   },
+   {
+    "type": "box",
+    "name": "edge_y3",
+    "size": [
+     0.09,
+     1.0,
+     0.09
+    ],
+    "pos": [
+     0.455,
+     0.5,
+     0.455
+    ],
+    "mat": "wood_dark"
+   }
+  ],
+  "prop_barrel": [
+   {
+    "type": "cyl",
+    "name": "body",
+    "size": [
+     0.3,
+     0.86
+    ],
+    "pos": [
+     0,
+     0.45,
+     0
+    ],
+    "mat": "drum",
+    "sections": 14
+   },
+   {
+    "type": "cyl",
+    "name": "rim_t",
+    "size": [
+     0.315,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.82,
+     0
+    ],
+    "mat": "drum_rim",
+    "sections": 14
+   },
+   {
+    "type": "cyl",
+    "name": "rim_m",
+    "size": [
+     0.315,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.45,
+     0
+    ],
+    "mat": "drum_rim",
+    "sections": 14
+   },
+   {
+    "type": "cyl",
+    "name": "rim_b",
+    "size": [
+     0.315,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.08,
+     0
+    ],
+    "mat": "drum_rim",
+    "sections": 14
+   },
+   {
+    "type": "cyl",
+    "name": "lid",
+    "size": [
+     0.26,
+     0.03
+    ],
+    "pos": [
+     0,
+     0.885,
+     0
+    ],
+    "mat": "drum_rim",
+    "sections": 14
+   },
+   {
+    "type": "box",
+    "name": "hazard",
+    "size": [
+     0.46,
+     0.14,
+     0.46
+    ],
+    "pos": [
+     0,
+     0.62,
+     0
+    ],
+    "mat": "orange",
+    "rot": [
+     0,
+     22.5,
+     0
+    ]
+   }
+  ],
+  "prop_wall": [
+   {
+    "type": "box",
+    "name": "body",
+    "size": [
+     3.0,
+     2.5,
+     0.2
+    ],
+    "pos": [
+     0,
+     1.25,
+     0
+    ],
+    "mat": "wall"
+   },
+   {
+    "type": "box",
+    "name": "base",
+    "size": [
+     3.0,
+     0.22,
+     0.26
+    ],
+    "pos": [
+     0,
+     0.11,
+     0
+    ],
+    "mat": "wall_trim"
+   },
+   {
+    "type": "box",
+    "name": "cap",
+    "size": [
+     3.0,
+     0.12,
+     0.26
+    ],
+    "pos": [
+     0,
+     2.44,
+     0
+    ],
+    "mat": "wall_trim"
+   },
+   {
+    "type": "box",
+    "name": "stripe",
+    "size": [
+     3.0,
+     0.1,
+     0.21
+    ],
+    "pos": [
+     0,
+     1.9,
+     0
+    ],
+    "mat": "teal"
+   },
+   {
+    "type": "box",
+    "name": "pill_l",
+    "size": [
+     0.18,
+     2.5,
+     0.26
+    ],
+    "pos": [
+     -1.41,
+     1.25,
+     0
+    ],
+    "mat": "wall_trim"
+   },
+   {
+    "type": "box",
+    "name": "pill_r",
+    "size": [
+     0.18,
+     2.5,
+     0.26
+    ],
+    "pos": [
+     1.41,
+     1.25,
+     0
+    ],
+    "mat": "wall_trim"
+   }
+  ],
+  "prop_spike": [
+   {
+    "type": "cyl",
+    "name": "core",
+    "size": [
+     0.085,
+     0.3
+    ],
+    "pos": [
+     0,
+     0.17,
+     0
+    ],
+    "mat": "spike",
+    "sections": 10
+   },
+   {
+    "type": "sphere",
+    "name": "dome",
+    "size": [
+     0.085
+    ],
+    "pos": [
+     0,
+     0.32,
+     0
+    ],
+    "mat": "spike",
+    "scale": [
+     1,
+     0.7,
+     1
+    ]
+   },
+   {
+    "type": "cyl",
+    "name": "base",
+    "size": [
+     0.11,
+     0.05
+    ],
+    "pos": [
+     0,
+     0.025,
+     0
+    ],
+    "mat": "spike",
+    "sections": 10
+   },
+   {
+    "type": "cyl",
+    "name": "ring",
+    "size": [
+     0.092,
+     0.03
+    ],
+    "pos": [
+     0,
+     0.3,
+     0
+    ],
+    "mat": "glow_red",
+    "sections": 10
+   },
+   {
+    "type": "sphere",
+    "name": "beacon",
+    "size": [
+     0.028
+    ],
+    "pos": [
+     0,
+     0.4,
+     0
+    ],
+    "mat": "glow_red"
+   },
+   {
+    "type": "box",
+    "name": "fin_0",
+    "size": [
+     0.016,
+     0.36,
+     0.055
+    ],
+    "pos": [
+     0.0,
+     0.19,
+     0.125
+    ],
+    "mat": "spike",
+    "rot": [
+     0,
+     0.0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "fin_glow_0",
+    "size": [
+     0.02,
+     0.18,
+     0.022
+    ],
+    "pos": [
+     0.0,
+     0.17,
+     0.125
+    ],
+    "mat": "glow_teal",
+    "rot": [
+     0,
+     0.0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "fin_1",
+    "size": [
+     0.016,
+     0.36,
+     0.055
+    ],
+    "pos": [
+     0.10825317547305484,
+     0.19,
+     -0.06249999999999997
+    ],
+    "mat": "spike",
+    "rot": [
+     0,
+     120.0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "fin_glow_1",
+    "size": [
+     0.02,
+     0.18,
+     0.022
+    ],
+    "pos": [
+     0.10825317547305484,
+     0.17,
+     -0.06249999999999997
+    ],
+    "mat": "glow_teal",
+    "rot": [
+     0,
+     120.0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "fin_2",
+    "size": [
+     0.016,
+     0.36,
+     0.055
+    ],
+    "pos": [
+     -0.1082531754730548,
+     0.19,
+     -0.06250000000000006
+    ],
+    "mat": "spike",
+    "rot": [
+     0,
+     240.0,
+     0
+    ]
+   },
+   {
+    "type": "box",
+    "name": "fin_glow_2",
+    "size": [
+     0.02,
+     0.18,
+     0.022
+    ],
+    "pos": [
+     -0.1082531754730548,
+     0.17,
+     -0.06250000000000006
+    ],
+    "mat": "glow_teal",
+    "rot": [
+     0,
+     240.0,
+     0
+    ]
+   }
+  ]
+ }
+}

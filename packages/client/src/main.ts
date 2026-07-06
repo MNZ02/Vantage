@@ -29,6 +29,8 @@ import {
   WEAPON_NONE,
   createState,
   eyePosition,
+  getActiveWeaponId,
+  getCombatWeaponDef,
   getWeaponDef,
   livingTeammates,
   raycastBoxes,
@@ -430,7 +432,40 @@ function fireLocalTracersAndHitmarkers(): void {
     const from = new THREE.Vector3(origin.x, origin.y, origin.z);
     const to = from.clone().add(new THREE.Vector3(dir.x, dir.y, dir.z).multiplyScalar(50));
     spawnTracer(scene, from, to, 80);
+    viewmodel.fireKick(shot.weaponId);
+    muzzleFlashPool.spawn(from.clone().add(new THREE.Vector3(dir.x, dir.y, dir.z).multiplyScalar(0.6)));
   }
+}
+
+/** Accumulated horizontal distance, meters — drives the viewmodel's walk-bob phase. */
+let viewmodelDistanceTraveled = 0;
+
+/** Drives viewmodel.update() once per rendered frame (weapon class swap, sway/bob, reload/ADS pose, scope overlay). */
+function updateViewmodel(state: SimState, localIndex: number, nowSeconds: number, frameSeconds: number): void {
+  const weaponId = getActiveWeaponId(state, localIndex);
+  const speed = Math.hypot(state.velX[localIndex]!, state.velZ[localIndex]!);
+  viewmodelDistanceTraveled += speed * frameSeconds;
+
+  let reloadProgress01: number | null = null;
+  const reloadEnd = state.reloadEndTick[localIndex]!;
+  const weapon = getCombatWeaponDef(weaponId);
+  if (weapon && reloadEnd !== -1 && weapon.reloadTicks > 0) {
+    reloadProgress01 = 1 - Math.max(0, reloadEnd - state.tick) / weapon.reloadTicks;
+  }
+
+  const adsStage = state.adsStage[localIndex]!;
+  viewmodel.update({
+    timeSeconds: nowSeconds,
+    dtSeconds: frameSeconds,
+    weaponId,
+    horizontalSpeed: speed,
+    maxSpeed: RUN_SPEED,
+    distanceTraveled: viewmodelDistanceTraveled,
+    ads: adsStage > 0,
+    adsZoom: weaponId === WEAPON_NONE ? 1 : zoomForStage(weaponId, adsStage),
+    reloadProgress01,
+    castPulse01: null,
+  });
 }
 
 /** M3: casts a map ping — raycasts from the local player's eye/view through the world and pings the hit (x, z). */
@@ -641,6 +676,7 @@ function frame(now: number): void {
     // livingTeammates()'s team filter, used to populate spectateIndex).
     const localIndex = netClient.getLocalIndex();
     const state = netClient.getPredictedState();
+    if (localIndex !== null && state) updateViewmodel(state, localIndex, now / 1000, frameSeconds);
     if (localIndex !== null && state && state.alive[localIndex] === 0 && spectateIndex !== null) {
       const poses = netClient.getRemotePoses();
       const target = poses?.[spectateIndex];
@@ -666,6 +702,7 @@ function frame(now: number): void {
     renderY = lerp(offlinePreviousState.posY[0]!, offlineState.posY[0]!, alpha);
     renderZ = lerp(offlinePreviousState.posZ[0]!, offlineState.posZ[0]!, alpha);
     eyeHeight = offlineState.crouching[0] === 1 ? EYE_HEIGHT_CROUCH : EYE_HEIGHT_STAND;
+    updateViewmodel(offlineState, 0, now / 1000, frameSeconds);
   }
 
   camera.rotation.order = "YXZ";
