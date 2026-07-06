@@ -494,14 +494,22 @@ export function connectNetClient(): Promise<NetClient | null> {
             resolve(client);
           } else {
             // A second Welcome (reconnect reattach, possibly a different
-            // playerIndex than a provisional/original one): local prediction
-            // state (position/loadout/etc.) is refreshed from the very next
-            // Snapshot's reconcile() call regardless, so nothing needs to be
-            // rebuilt here beyond bookkeeping — the sim tick gap between
-            // disconnect and reattach is exactly what reconcile()'s existing
-            // tick-offset rebase handles (see prediction.ts).
+            // playerIndex than a provisional/original one — e.g. a restarted
+            // server that treats us as a fresh join). PredictedClient bakes
+            // localIndex in at construction (stepLocalOnly feeds the local
+            // input into that slot; getRenderPosition reads it), so it MUST
+            // be rebuilt whenever a Welcome arrives — otherwise prediction
+            // keeps simulating the OLD slot: the camera renders from a stale
+            // position, the local input is applied to a ghost, and every
+            // fired shot resolves from the wrong origin (shots visibly "miss"
+            // despite perfect aim). Position/loadout for the new slot are
+            // refreshed by the very next Snapshot's reconcile() — the sim
+            // tick gap between disconnect and reattach is exactly what
+            // reconcile()'s existing tick-offset rebase handles.
             localIndex = msg.playerIndex;
             numPlayers = msg.numPlayers;
+            predicted = new PredictedClient(msg.seed, msg.numPlayers, msg.playerIndex, LEVEL_BOXES, msg.mode);
+            inputHistory.length = 0; // input seqs restart at 0 with the fresh PredictedClient
             reconnecting = false;
           }
           mode = msg.mode;
@@ -598,6 +606,17 @@ export function connectNetClient(): Promise<NetClient | null> {
           localIndex = msg.playerIndex;
           numPlayers = msg.numPlayers;
           mode = msg.mode;
+          // The reattach may land on a DIFFERENT player slot (e.g. a
+          // restarted server treats us as a fresh join). PredictedClient
+          // bakes localIndex in at construction — stepLocalOnly feeds the
+          // local input into that slot, getRenderPosition reads it — so it
+          // MUST be rebuilt or prediction keeps simulating the OLD slot:
+          // the camera renders from a stale position, inputs are applied to
+          // a ghost, and every fired shot resolves from the wrong origin
+          // ("perfectly aimed" shots visibly miss). Position/loadout for
+          // the new slot are refreshed by the next Snapshot's reconcile().
+          predicted = new PredictedClient(msg.seed, msg.numPlayers, msg.playerIndex, LEVEL_BOXES, msg.mode);
+          inputHistory.length = 0; // input seqs restart at 0 with the fresh PredictedClient
           reconnecting = false;
           if (msg.mode === MODE_MATCH && msg.token.some((b) => b !== 0)) {
             currentToken = msg.token;
