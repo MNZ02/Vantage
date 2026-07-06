@@ -147,24 +147,24 @@ describe("match mode: visibility masks (minimap fog of war)", () => {
     state.team[attacker] = TEAM_ATTACKERS;
     state.team[defender] = TEAM_DEFENDERS;
 
-    // Defender directly behind the interior wall (x=6, spans z in [-4,4]) from the attacker's viewpoint.
-    state.posX[attacker] = -10;
+    // Defender directly behind the west lane-divider wall (x=-12, spans z in [-1,8]) from the attacker's viewpoint.
+    state.posX[attacker] = -16;
     state.posY[attacker] = 0;
-    state.posZ[attacker] = 0;
+    state.posZ[attacker] = 4;
     state.yaw[attacker] = Math.atan2(1, 0); // facing +X, toward the wall/defender
-    state.posX[defender] = 10;
+    state.posX[defender] = -8;
     state.posY[defender] = 0;
-    state.posZ[defender] = 0;
+    state.posZ[defender] = 4;
 
     for (let i = 0; i < 5; i++) host.step();
     expect(host.getVisibilityMask(TEAM_ATTACKERS) & (1 << defender)).toBe(0);
 
-    // Move the defender into the open (no wall between them) and re-check.
+    // Move the defender into the open (same side of the divider, no wall between them) and re-check.
     // host.getState() returns a FRESH cloned object each tick, so we must
     // re-fetch it after the steps above before mutating again.
     const state2 = host.getState();
-    state2.posX[defender] = -5;
-    state2.posZ[defender] = 0;
+    state2.posX[defender] = -14;
+    state2.posZ[defender] = 4;
     for (let i = 0; i < 5; i++) host.step();
     expect(host.getVisibilityMask(TEAM_ATTACKERS) & (1 << defender)).not.toBe(0);
   });

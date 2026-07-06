@@ -18,6 +18,7 @@ import {
   MAX_ABILITY_ENTITIES,
   WALL_BOX_MAX_HP,
   LEVEL_BOXES,
+  LEVEL_HALF_EXTENT,
   RUN_SPEED,
   WEAPONS,
   type Box,
@@ -824,12 +825,12 @@ const MINIMAP_PING_LIFETIME_MS = 5000;
  * visible enemies (red dots, per the server's team-shared visibility mask —
  * see @vg/server ServerHost.updateVisibility()), the spike marker, and
  * fading TeamPing markers. World (x, z) maps to canvas space by centering
- * on the level's bounding box — LEVEL_BOXES span roughly [-20, 20] on both
+ * on the level's bounding box — LEVEL_BOXES span ±LEVEL_HALF_EXTENT on both
  * axes (see @vg/sim levels.ts), so a fixed world-half-extent works for our
  * single graybox map without needing per-map calibration.
  */
 export function createMinimap(boxes: readonly Box[] = LEVEL_BOXES): Minimap {
-  const WORLD_HALF_EXTENT = 22;
+  const WORLD_HALF_EXTENT = LEVEL_HALF_EXTENT + 1; // small margin so perimeter walls don't touch the canvas edge
 
   const canvas = document.createElement("canvas");
   canvas.width = MINIMAP_SIZE_PX;

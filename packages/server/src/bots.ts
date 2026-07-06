@@ -7,9 +7,12 @@ import {
   CROUCH_HEIGHT,
   EYE_HEIGHT_STAND,
   MODE_MATCH,
+  NORTH_WALL_Z,
   PHASE_BUY,
   PHASE_ROUND,
+  SITE_LINE_Z,
   SITE_ZONES,
+  SOUTH_WALL_Z,
   SPIKE_CARRIED,
   SPIKE_PLANTED,
   STAND_HEIGHT,
@@ -26,12 +29,16 @@ import { MessageType, decodeMessageSafely, encodeMessage, type InputSample, type
 // other client, so the exact same class works in-process (loopback
 // Transport, used by tests) and over a real WebSocket (used by the `bots`
 // CLI, see botsCli.ts).
+// DM wander loop: one stop per district (both mains, mid lane, both sites,
+// mid courtyard), each in open floor with straight-line reachability to its
+// neighbors in list order (bots steer straight — no pathfinding).
 const WAYPOINTS: ReadonlyArray<{ x: number; z: number }> = [
-  { x: 12, z: 12 },
-  { x: -12, z: 12 },
-  { x: -12, z: -12 },
-  { x: 12, z: -12 },
-  { x: 0, z: 0 },
+  { x: -30, z: 0 }, // A main
+  { x: -24, z: 18 }, // A site
+  { x: 0, z: 24 }, // mid courtyard
+  { x: 24, z: 18 }, // B site
+  { x: 30, z: 0 }, // B main
+  { x: 0, z: 0 }, // mid lane
 ];
 
 const WAYPOINT_ARRIVE_RADIUS = 1.5;
@@ -47,6 +54,66 @@ const SITE_CENTERS: ReadonlyArray<{ x: number; z: number }> = SITE_ZONES.map((zo
   x: (zone.box.minX + zone.box.maxX) / 2,
   z: (zone.box.minZ + zone.box.maxZ) / 2,
 }));
+
+// ---- Corridor router for the "Crossing" v2 layout (see @vg/sim levels.ts's
+// map diagram). Bots steer in straight lines, so crossing the map's walled
+// z-bands (spawn strips / lanes / sites) needs waypoints through the wall
+// gaps. nextNavPoint() is STATELESS — recomputed every tick from the current
+// position — so there's no route-leg bookkeeping to desync: each call just
+// answers "which gap (or the goal itself) should I walk toward right now?".
+// Gap x-centers per boundary wall, west/mid/east (must match levels.ts's
+// wall-segment gaps).
+const SOUTH_GAP_X = [-24, 0, 24] as const;
+const SITE_LINE_GAP_X = [-25, 0, 25] as const;
+const NORTH_GAP_X = [-22, 0, 22] as const;
+/** Cross-lane link gap through the lane dividers (x=±12), z in [-6,-1]. */
+const LANE_LINK_Z = -3.5;
+/** Site link gap through the site inner walls (x=±10), z in [14,20]. */
+const SITE_LINK_Z = 17;
+/** How far past a wall to place the through-gap waypoint (so "almost there" hands off to the next leg naturally). */
+const GAP_OVERSHOOT = 1.5;
+
+/** 0=S spawn strip, 1=lanes, 2=sites/courtyard, 3=N spawn strip. */
+function bandOf(z: number): 0 | 1 | 2 | 3 {
+  if (z < SOUTH_WALL_Z) return 0;
+  if (z < SITE_LINE_Z) return 1;
+  if (z < NORTH_WALL_Z) return 2;
+  return 3;
+}
+
+/** -1=west, 0=mid, 1=east. Divider walls sit at x=±12 (band 1) / ±10 (band 2); ±11 splits both safely. */
+function laneOf(x: number): -1 | 0 | 1 {
+  return x < -11 ? -1 : x > 11 ? 1 : 0;
+}
+
+/** The point to steer toward RIGHT NOW to eventually reach `goal` — either the goal itself or the next wall gap en route. */
+function nextNavPoint(pos: { x: number; z: number }, goal: { x: number; z: number }): { x: number; z: number } {
+  const posBand = bandOf(pos.z);
+  const goalBand = bandOf(goal.z);
+  const goalLane = laneOf(goal.x);
+
+  if (posBand === goalBand) {
+    const posLane = laneOf(pos.x);
+    if (posLane === goalLane || posBand === 0 || posBand === 3) return goal; // spawn strips are open east-west
+    // Cross-lane hop within a walled band: through the divider link gap toward the goal's side.
+    const dividerX = posLane === -1 || goalLane === -1 ? (posBand === 1 ? -12 : -10) : posBand === 1 ? 12 : 10;
+    const towardGoal = goal.x > dividerX ? GAP_OVERSHOOT : -GAP_OVERSHOOT;
+    return { x: dividerX + towardGoal, z: posBand === 1 ? LANE_LINK_Z : SITE_LINK_Z };
+  }
+
+  // Different band: cross the nearest boundary wall in the goal's direction,
+  // through the gap of the CURRENT lane (band 1/2 lanes are walled off from
+  // each other — lane changes happen via the same-band branch above once the
+  // lane mismatch is what remains).
+  const dir = goalBand > posBand ? 1 : -1;
+  const boundaryBand = dir === 1 ? posBand : posBand - 1; // 0=south wall, 1=site line, 2=north wall
+  const boundaryZ = boundaryBand === 0 ? SOUTH_WALL_Z : boundaryBand === 1 ? SITE_LINE_Z : NORTH_WALL_Z;
+  const gapXs = boundaryBand === 0 ? SOUTH_GAP_X : boundaryBand === 1 ? SITE_LINE_GAP_X : NORTH_GAP_X;
+  // From the open spawn strips any gap is reachable — pick the goal's lane;
+  // inside the walled bands, stay in the current lane.
+  const laneForGap = posBand === 0 || posBand === 3 ? goalLane : laneOf(pos.x);
+  return { x: gapXs[laneForGap + 1]!, z: boundaryZ + dir * GAP_OVERSHOOT };
+}
 
 interface KnownOther {
   x: number;
@@ -326,6 +393,14 @@ export class Bot {
     const dist = Math.hypot(dx, dz);
     const arrived = dist <= arriveRadius;
 
+    // Steer toward the corridor router's next gap waypoint (which is `target`
+    // itself once no walls remain between here and there); arrival/interact
+    // distances above stay measured against the FINAL objective.
+    const nav = nextNavPoint(pos, target);
+    const navDx = nav.x - pos.x;
+    const navDz = nav.z - pos.z;
+    const navDist = Math.hypot(navDx, navDz);
+
     this.maybeBuy();
 
     const enemy = shouldInteract ? null : this.nearestEnemy(pos); // don't get distracted mid-channel
@@ -335,7 +410,7 @@ export class Bot {
     // bot needs forward/right computed relative to the AIM yaw (not the
     // objective's raw heading), or firing at a target off to the side would
     // otherwise drag it off-course from the site/spike/defuse position.
-    let yaw = Math.atan2(dx, dz); // no enemy: look the way we're walking
+    let yaw = Math.atan2(navDx, navDz); // no enemy: look the way we're walking
     let pitch = 0;
     let fire = false;
     if (enemy) {
@@ -352,12 +427,12 @@ export class Bot {
 
     let forward = 0;
     let right = 0;
-    if (!shouldInteract && !arrived && dist > 1e-6) {
-      // Decompose the world-space wish direction (toward `target`) into
-      // forward/right components relative to `yaw` (see movement.ts's
+    if (!shouldInteract && !arrived && navDist > 1e-6) {
+      // Decompose the world-space wish direction (toward the nav waypoint)
+      // into forward/right components relative to `yaw` (see movement.ts's
       // wishDirection(): forward = (sin(yaw), cos(yaw)), right = (-cos(yaw), sin(yaw))).
-      const wishX = dx / dist;
-      const wishZ = dz / dist;
+      const wishX = navDx / navDist;
+      const wishZ = navDz / navDist;
       forward = wishX * Math.sin(yaw) + wishZ * Math.cos(yaw);
       right = -wishX * Math.cos(yaw) + wishZ * Math.sin(yaw);
     }

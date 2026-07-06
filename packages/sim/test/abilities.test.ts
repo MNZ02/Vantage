@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ABL_LUMEN_MEND,
   ABL_LUMEN_RES,
+  ORB_SPOTS,
   ABL_LUMEN_SLOW,
   ABL_LUMEN_WALL,
   ABL_SONAR_PULSE,
@@ -281,17 +282,17 @@ describe("Umbra", () => {
   it("step teleports forward, clamped short of a wall", () => {
     let s = setup();
     grantCharge(s, 0, 1, 1); // basic2
-    s.posX[0] = 5.0;
+    s.posX[0] = 8.0;
     s.posY[0] = 0;
     s.posZ[0] = 0;
-    s.yaw[0] = Math.PI / 2; // facing +X into the interior wall (x=6)
+    s.yaw[0] = Math.PI / 2; // facing +X into the east lane-divider wall (x=12, z in [-1,8])
     let cur = runOne(s, allIdleInputs(s, { 0: { ability2: true, yaw: Math.PI / 2 } })).state;
     const def = getAbilityDef(ABL_UMBRA_STEP)!;
     for (let t = 0; t < def.castDelayTicks + 2; t++) {
       cur = runOne(cur, allIdleInputs(cur)).state;
     }
-    expect(cur.posX[0]!).toBeLessThan(6);
-    expect(cur.posX[0]!).toBeGreaterThan(5.0);
+    expect(cur.posX[0]!).toBeLessThan(12);
+    expect(cur.posX[0]!).toBeGreaterThan(8.0);
   });
 
   it("shroud lands a smoke with the tuned radius/duration data", () => {
@@ -617,7 +618,7 @@ describe("ult economy", () => {
     s = advanceToRound(s);
     let count = 0;
     for (let e = 0; e < s.entType.length; e++) if (s.entType[e] === ENT_ULT_ORB) count++;
-    expect(count).toBe(2);
+    expect(count).toBe(ORB_SPOTS.length);
   });
 });
 

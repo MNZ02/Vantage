@@ -12,7 +12,22 @@
 // (see test/level-dressing-budget.test.ts, which passes in plain
 // MeshBasicMaterials instead of the real canvas-textured ones).
 import * as THREE from "three";
-import { ATTACKER_SPAWNS, DEFENDER_SPAWNS, LEVEL_BOXES, SITE_ZONES, SPAWN_POSITION as SIM_SPAWN_POSITION, type Box } from "@vg/sim";
+import {
+  ATTACKER_SPAWNS,
+  COVER_END,
+  COVER_START,
+  DEFENDER_SPAWNS,
+  LEVEL_BOXES,
+  LEVEL_HALF_EXTENT,
+  PERIMETER_END,
+  PERIMETER_START,
+  SITE_LINE_Z,
+  SITE_ZONES,
+  SPAWN_POSITION as SIM_SPAWN_POSITION,
+  WALLS_END,
+  type Box,
+} from "@vg/sim";
+import { cloneModel, loadModel } from "./assets.js";
 import type { MaterialSet } from "./materials.js";
 import { PROPS, type PropSpec } from "./propPlacement.js";
 import { classifyZone, type Zone } from "./zones.js";
@@ -31,19 +46,14 @@ export interface GrayboxSurface extends Box {
   zone: Zone;
 }
 
-/** Which base material "kind" a LEVEL_BOXES index uses — a small, stable, index-range mapping (5 cases) alongside the position-derived zone tint; not the kind of hand-authored per-box list the spec cautions against, since it just names the 4 structural categories the graybox has always had (floor/wall/crate/ramp). */
+/** Which base material "kind" a LEVEL_BOXES index uses — derived from the index ranges @vg/sim's levels.ts exports alongside the box array itself (floor/walls/cover/stairs), so this mapping can never drift when the layout changes. */
 export type SurfaceKind = "floor" | "wall" | "crate" | "ramp";
-
-const PERIMETER_WALLS_END = 5; // indices 1-4
-const INTERIOR_WALL_INDEX = 5;
-const CRATES_END = 9; // indices 6-8
 
 export function surfaceKindForIndex(index: number): SurfaceKind {
   if (index === 0) return "floor";
-  if (index < PERIMETER_WALLS_END) return "wall";
-  if (index === INTERIOR_WALL_INDEX) return "wall";
-  if (index < CRATES_END) return "crate";
-  return "ramp";
+  if (index >= PERIMETER_START && index < WALLS_END) return "wall"; // perimeter + all interior structural walls
+  if (index >= COVER_START && index < COVER_END) return "crate";
+  return "ramp"; // stairs + heaven platform
 }
 
 // Flat fallback tint per zone (used only if a caller renders a GrayboxSurface
@@ -127,6 +137,17 @@ function buildPropMesh(prop: PropSpec, materials: MaterialSet): THREE.Object3D {
   if (prop.kind === "barrel") {
     const barrel = new THREE.Mesh(new THREE.CylinderGeometry(prop.radius, prop.radius, prop.height, 14), materials.metalPanel);
     group.add(barrel);
+    // Swap in the authored barrel (assets/models/prop_barrel.glb, ~0.63 m ⌀ ×
+    // 0.9 m tall, origin at floor) once loaded, scaled to this prop's spec
+    // dims. The cylinder above stays as placeholder/fallback until then.
+    void loadModel("prop_barrel").then((master) => {
+      if (!master) return;
+      const { group: glb } = cloneModel(master);
+      glb.scale.set(prop.radius / 0.315, prop.height / 0.9, prop.radius / 0.315);
+      glb.position.y = -prop.height / 2; // group origin is the prop's center; .glb origin is its base
+      group.clear();
+      group.add(glb);
+    });
   } else {
     const rim = new THREE.Mesh(new THREE.TorusGeometry(prop.radius * 0.85, prop.radius * 0.18, 8, 16), materials.woodCrate);
     rim.rotation.x = Math.PI / 2;
@@ -155,11 +176,12 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
     group.add(obj);
   }
 
-  // ---- Trim strips along wall tops (perimeter walls instanced, interior wall separate — different length). ----
-  const perimeterWalls = boxes.slice(1, PERIMETER_WALLS_END);
-  const trimInstanced = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 0.08, 1), materials.metalPanel, perimeterWalls.length);
+  // ---- Trim strips along every structural wall top (perimeter + interior segments, one InstancedMesh). ----
+  const perimeterWalls = boxes.slice(PERIMETER_START, PERIMETER_END);
+  const structuralWalls = boxes.slice(PERIMETER_START, WALLS_END);
+  const trimInstanced = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 0.08, 1), materials.metalPanel, structuralWalls.length);
   const m = new THREE.Matrix4();
-  perimeterWalls.forEach((wallBox, i) => {
+  structuralWalls.forEach((wallBox, i) => {
     const sx = wallBox.maxX - wallBox.minX;
     const sz = wallBox.maxZ - wallBox.minZ;
     m.compose(
@@ -170,12 +192,6 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
     trimInstanced.setMatrixAt(i, m);
   });
   add(trimInstanced);
-  meshCount++;
-
-  const interiorWall = boxes[INTERIOR_WALL_INDEX]!;
-  const interiorTrim = box(interiorWall.maxX - interiorWall.minX, 0.08, interiorWall.maxZ - interiorWall.minZ, materials.metalPanel);
-  interiorTrim.position.set((interiorWall.minX + interiorWall.maxX) / 2, interiorWall.maxY + 0.04, (interiorWall.minZ + interiorWall.maxZ) / 2);
-  add(interiorTrim);
   meshCount++;
 
   // ---- Corner pillars at the 4 map corners (perimeter wall intersections). ----
@@ -195,11 +211,19 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
   add(pillarInstanced);
   meshCount++;
 
-  // ---- Door-frame accents at the interior wall's chokepoint ends. ----
-  const frameHeight = interiorWall.maxY - interiorWall.minY + 0.3;
-  const doorFrames = new THREE.InstancedMesh(new THREE.BoxGeometry(0.2, frameHeight, 0.2), materials.hazardStripe, 2);
-  [interiorWall.minZ, interiorWall.maxZ].forEach((z, i) => {
-    m.compose(new THREE.Vector3((interiorWall.minX + interiorWall.maxX) / 2, frameHeight / 2, z), new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
+  // ---- Door-frame accents at the site-line chokepoint gap edges (A main / mid doors / B main). ----
+  // Derived from the site-line wall segments themselves: each gap edge is a
+  // segment end that isn't the map perimeter, so the posts track the layout.
+  const siteLineSegments = structuralWalls.filter((w) => w.maxZ - w.minZ <= 1 && Math.abs((w.minZ + w.maxZ) / 2 - SITE_LINE_Z) < 1);
+  const gapEdgeXs: number[] = [];
+  for (const seg of siteLineSegments) {
+    if (Math.abs(seg.minX) < LEVEL_HALF_EXTENT - 0.6) gapEdgeXs.push(seg.minX);
+    if (Math.abs(seg.maxX) < LEVEL_HALF_EXTENT - 0.6) gapEdgeXs.push(seg.maxX);
+  }
+  const frameHeight = (siteLineSegments[0]?.maxY ?? 3) + 0.3;
+  const doorFrames = new THREE.InstancedMesh(new THREE.BoxGeometry(0.2, frameHeight, 0.2), materials.hazardStripe, Math.max(1, gapEdgeXs.length));
+  gapEdgeXs.forEach((x, i) => {
+    m.compose(new THREE.Vector3(x, frameHeight / 2, SITE_LINE_Z), new THREE.Quaternion(), new THREE.Vector3(1, 1, 1));
     doorFrames.setMatrixAt(i, m);
   });
   add(doorFrames);

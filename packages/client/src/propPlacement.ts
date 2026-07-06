@@ -6,14 +6,10 @@
 // any collision list), so this check exists purely to keep them from
 // visually poking into open floor a player can actually stand on.
 //
-// LEVEL_BOXES index reference (see @vg/sim levels.ts, fixed authoring order):
-//   0        floor
-//   1-4      perimeter walls (south z=-20, north z=+20, west x=-20, east x=+20)
-//   5        interior wall (x=6, z in [-4,4])
-//   6-8      crates
-//   9-18     ramp steps
-//   19       ramp top
-import { LEVEL_BOXES, type Box } from "@vg/sim";
+// Anchors are looked up by NAME via @vg/sim levels.ts's LEVEL_INDEX export
+// (not hand-counted indices), so a layout change that reorders LEVEL_BOXES
+// cannot silently strand a prop on the wrong support box.
+import { LEVEL_BOXES, LEVEL_INDEX, type Box } from "@vg/sim";
 
 export type PropKind = "barrel" | "cableSpool";
 
@@ -34,27 +30,28 @@ export interface PropSpec {
 /** Spec: "props don't overlap walkable floor beyond 0.15 m". */
 export const MAX_PROP_OVERHANG_M = 0.15;
 
-const CRATE_A = 6; // box([-6, 0.4, 4], [1.2, 0.8, 1.2]) — low ledge, top y=0.8
-const CRATE_B = 7; // box([-4, 0.6, 4], [1.2, 1.2, 1.2]) — top y=1.2
-const CRATE_C = 8; // box([-8, 0.6, -4], [1.2, 1.2, 1.2]) — top y=1.2
-const RAMP_TOP = 19;
-const INTERIOR_WALL = 5;
-const SOUTH_PERIMETER_WALL = 1;
+function idx(name: string): number {
+  const i = LEVEL_INDEX[name];
+  if (i === undefined) throw new Error(`propPlacement: no LEVEL_BOXES entry named "${name}"`);
+  return i;
+}
 
 /**
- * The level's props: two crates each hold one prop on top (fully contained,
- * zero overhang), the ramp top holds one, and two more sit flush against
- * flat wall faces (interior wall, south perimeter wall) centered on the
- * wall's own centerline so they protrude symmetrically only
- * radius-halfThickness into the room — comfortably under the 0.15 m budget.
+ * The level's props (prop.y is the prop's CENTER height): crate/block tops
+ * hold barrels and spools (fully contained, zero overhang), and two more sit
+ * flush against wall faces, centered on the wall's own centerline so they
+ * protrude symmetrically only radius-halfThickness (0.1 m) into the room —
+ * comfortably under the 0.15 m budget.
  */
 export const PROPS: readonly PropSpec[] = [
-  { id: "barrel-crateA", kind: "barrel", supportBoxIndex: CRATE_A, x: -6, y: 0.8, z: 4, radius: 0.35, height: 0.6 },
-  { id: "spool-crateB", kind: "cableSpool", supportBoxIndex: CRATE_B, x: -4, y: 1.2, z: 4, radius: 0.4, height: 0.3 },
-  { id: "barrel-crateC", kind: "barrel", supportBoxIndex: CRATE_C, x: -8, y: 1.2, z: -4, radius: 0.35, height: 0.6 },
-  { id: "spool-rampTop", kind: "cableSpool", supportBoxIndex: RAMP_TOP, x: 0.5, y: 2, z: 20.5, radius: 0.4, height: 0.3 },
-  { id: "barrel-interiorWall", kind: "barrel", supportBoxIndex: INTERIOR_WALL, x: 6, y: 0.3, z: 2, radius: 0.35, height: 0.6 },
-  { id: "spool-southWall", kind: "cableSpool", supportBoxIndex: SOUTH_PERIMETER_WALL, x: -15, y: 0.15, z: -20, radius: 0.35, height: 0.3 },
+  // On top of site cover (crate top y=1.2, generator top y=1.5, B-default top y=2, mid-court block top y=2, B low box top y=1.1).
+  { id: "barrel-siteA-crate", kind: "barrel", supportBoxIndex: idx("siteACrateWest"), x: -26, y: 1.5, z: 13, radius: 0.35, height: 0.6 },
+  { id: "spool-siteA-generator", kind: "cableSpool", supportBoxIndex: idx("siteAGenerator"), x: -19, y: 1.65, z: 20, radius: 0.4, height: 0.3 },
+  { id: "spool-siteB-default", kind: "cableSpool", supportBoxIndex: idx("siteBDefault"), x: 22, y: 2.15, z: 13, radius: 0.4, height: 0.3 },
+  { id: "barrel-midcourt-block", kind: "barrel", supportBoxIndex: idx("midCourtBlock"), x: 0, y: 2.3, z: 17, radius: 0.35, height: 0.6 },
+  { id: "spool-siteB-lowbox", kind: "cableSpool", supportBoxIndex: idx("siteBLowBox"), x: 17, y: 1.25, z: 17, radius: 0.35, height: 0.3 },
+  // Flush against a wall face (wall half-thickness 0.25; radius 0.35 → 0.1 m overhang). Spec caps total props at 6.
+  { id: "barrel-divider-west", kind: "barrel", supportBoxIndex: idx("dividerWestNorth"), x: -12, y: 0.3, z: 4, radius: 0.35, height: 0.6 },
 ];
 
 /** How far (m) a prop's horizontal footprint circle extends beyond its support box's own footprint. 0 = fully contained. */

@@ -8,7 +8,7 @@ import { createScriptedInputSender, idleInput, toAuthoritative } from "./testUti
 const FIXED_DT_MS = FIXED_DT * 1000;
 
 describe("prediction exactness in match mode (acceptance criterion 13, match-mode variant)", () => {
-  it("reconciliation stays exact (<1e-6) while pushing against a buy-phase barrier and while channeling a plant in the round phase", () => {
+  it("reconciliation stays exact (<4e-6, f32 wire ULP at map scale) while pushing against a buy-phase barrier and while channeling a plant in the round phase", () => {
     const host = new ServerHost({
       numPlayers: 2,
       mode: "match",
@@ -93,7 +93,7 @@ describe("prediction exactness in match mode (acceptance criterion 13, match-mod
     // later reconciliation — through the barrier push AND the interact
     // channel — must stay within the same exactness bound as DM mode.
     for (const d of diffs.slice(10)) {
-      expect(d).toBeLessThan(1e-6);
+      expect(d).toBeLessThan(4e-6); // f32 ULP is ~3.8e-6 at |coord| up to 36 m (Crossing v2 map half-extent), so wire quantization alone can produce ~1e-6 diffs
     }
   });
 });

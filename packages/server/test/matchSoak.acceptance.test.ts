@@ -85,7 +85,10 @@ describe("match soak (acceptance criterion 14)", () => {
       matchConfig: {
         buyTicks: 80,
         firstRoundBuyTicks: 80,
-        roundTicks: 700,
+        // ~17s rounds: the Crossing v2 layout's spawn→site run is ~7.5s
+        // (72 m map), so the old 700-tick value left no time to fight AND
+        // plant; still far shrunk from the real 100 s round.
+        roundTicks: 1100,
         spikeTicks: 150,
         plantTicks: 48,
         defuseTicks: 96,
