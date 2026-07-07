@@ -5,3 +5,4 @@ dist/
 .claude/
 .playwright-mcp/
 __pycache__/
+assets/blender/vendor/
