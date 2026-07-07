@@ -25,6 +25,7 @@ import {
   type SimState,
 } from "@vg/sim";
 import type { RemotePose } from "./interpolation.js";
+import { cloneModel, loadModel } from "./assets.js";
 import { surfaceKindForIndex, type GrayboxSurface } from "./graybox.js";
 import type { MaterialSet } from "./materials.js";
 import { createPlayerModel } from "./playerModel.js";
@@ -95,6 +96,7 @@ export function createScene(canvas: HTMLCanvasElement): SceneHandle {
  * still render something sane).
  */
 export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSurface[], materials?: MaterialSet): void {
+  const placeholders: THREE.Mesh[] = [];
   boxes.forEach((b, index) => {
     const sizeX = b.maxX - b.minX;
     const sizeY = b.maxY - b.minY;
@@ -104,6 +106,22 @@ export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSu
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, (b.minZ + b.maxZ) / 2);
     scene.add(mesh);
+    placeholders.push(mesh);
+  });
+  // Baked-lighting swap (same placeholder/fallback contract as every other
+  // .glb in assets.ts): map_crossing.glb is generated from the SAME
+  // LEVEL_BOXES by tools/mapgen/build_map.py, with AO baked into vertex
+  // colors (COLOR_0). On load it visually replaces the procedural boxes; on
+  // failure the graybox stays. Collision is unaffected either way — it
+  // lives in @vg/sim and never reads render meshes.
+  void loadModel("map_crossing").then((master) => {
+    if (!master) return;
+    const { group } = cloneModel(master);
+    scene.add(group);
+    for (const mesh of placeholders) {
+      scene.remove(mesh);
+      mesh.geometry.dispose();
+    }
   });
 }
 
@@ -201,6 +219,7 @@ export function createRemotePlayerProxy(scene: THREE.Scene): RemotePlayerProxy {
         alive: pose.alive,
         team: pose.team,
         isAlly: localTeam !== 255 && pose.team === localTeam,
+        agentId: pose.agentId,
         weaponId: pose.activeSlot === 0 ? pose.weaponPrimary : pose.weaponSecondary,
         horizontalSpeed,
         distanceTraveled,
