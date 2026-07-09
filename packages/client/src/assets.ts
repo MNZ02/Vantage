@@ -52,11 +52,13 @@ const MODEL_URLS: Record<ModelName, string> = {
 const loader = new GLTFLoader();
 const pending = new Map<ModelName, Promise<THREE.Group | null>>();
 const loaded = new Map<ModelName, THREE.Group>();
+const loadedAnimations = new Map<ModelName, THREE.AnimationClip[]>();
 
 /**
  * Loads (once, cached) the named model's master scene graph. Resolves null on
  * failure — callers keep their procedural fallback. Callers must NOT mutate
  * or re-parent the resolved group directly; clone it (cloneModel below).
+ * Animation clips (if any) are cached separately — see getModelAnimations.
  */
 export function loadModel(name: ModelName): Promise<THREE.Group | null> {
   const existing = pending.get(name);
@@ -65,7 +67,12 @@ export function loadModel(name: ModelName): Promise<THREE.Group | null> {
     loader.load(
       MODEL_URLS[name],
       (gltf) => {
+        // Ensure baked COLOR_0 actually multiplies into the shaded color.
+        // GLTFLoader usually sets this when present, but map/agent AO is
+        // load-bearing visually — force it whenever a color attribute exists.
+        enableVertexColors(gltf.scene);
         loaded.set(name, gltf.scene);
+        loadedAnimations.set(name, gltf.animations.slice());
         resolve(gltf.scene);
       },
       undefined,
@@ -83,6 +90,30 @@ export function loadModel(name: ModelName): Promise<THREE.Group | null> {
 /** Synchronous cache probe: the master group if loadModel(name) has already resolved, else null. */
 export function getLoadedModel(name: ModelName): THREE.Group | null {
   return loaded.get(name) ?? null;
+}
+
+/** Animation clips from the last successful loadModel(name); empty if none / not loaded. */
+export function getModelAnimations(name: ModelName): readonly THREE.AnimationClip[] {
+  return loadedAnimations.get(name) ?? [];
+}
+
+/**
+ * Turns on `vertexColors` for any material whose mesh has a COLOR_0 / color
+ * attribute (baked AO on map_crossing + agent_zephyr). Safe to call on a
+ * master or a clone; mutates materials in place.
+ */
+export function enableVertexColors(root: THREE.Object3D): void {
+  root.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return;
+    if (!obj.geometry?.attributes?.color) return;
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    for (const m of mats) {
+      if (m && "vertexColors" in m && !(m as THREE.Material & { vertexColors: boolean }).vertexColors) {
+        (m as THREE.Material & { vertexColors: boolean }).vertexColors = true;
+        m.needsUpdate = true;
+      }
+    }
+  });
 }
 
 /**
@@ -105,6 +136,10 @@ export function cloneModel(master: THREE.Group, cloneMaterials = false): { group
       }
     });
   }
+  // Cloned materials copy vertexColors; re-apply in case the master was
+  // loaded before enableVertexColors ran (shouldn't happen) or cloneMaterials
+  // path dropped the flag somehow.
+  enableVertexColors(group);
   return { group, materials };
 }
 
@@ -131,5 +166,7 @@ export function cloneSkinnedModel(master: THREE.Object3D): { root: THREE.Object3
       }
     }
   });
+  // Re-apply after material clone so agent_zephyr COLOR_0 AO still multiplies.
+  enableVertexColors(root);
   return { root, materials };
 }

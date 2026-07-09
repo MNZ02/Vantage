@@ -352,6 +352,7 @@ export function connectNetClient(): Promise<NetClient | null> {
             activeSlot: p.activeSlot,
             magActive: p.magActive,
             team: p.team,
+            agentId: p.agentId,
           }),
         ),
       );

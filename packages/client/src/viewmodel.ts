@@ -5,8 +5,8 @@
 // (setVisible, fireKick, update, scope) is unchanged, so main.ts/render.ts
 // call sites don't care which representation is currently showing.
 import * as THREE from "three";
-import { ABL_ZEPHYR_BLADES, WEAPON_LONGBOW, WEAPON_MARSHAL6, WEAPON_VIPER, WEAPON_WASP, abilityWeaponId, getWeaponDef } from "@vg/sim";
-import { cloneModel, loadModel, type ModelName } from "./assets.js";
+import { ABL_ZEPHYR_BLADES, AGENT_ZEPHYR, WEAPON_LONGBOW, WEAPON_MARSHAL6, WEAPON_VIPER, WEAPON_WASP, abilityWeaponId, getWeaponDef } from "@vg/sim";
+import { cloneModel, cloneSkinnedModel, getModelAnimations, loadModel, type ModelName } from "./assets.js";
 
 export type WeaponClass = "pistol" | "smg" | "rifle" | "sniper" | "knife";
 
@@ -157,6 +157,7 @@ export interface ViewmodelHandle {
     timeSeconds: number;
     dtSeconds: number;
     weaponId: number;
+    agentId: number;
     horizontalSpeed: number;
     maxSpeed: number;
     distanceTraveled: number;
@@ -218,6 +219,93 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
   anchor.rotation.y = 0.06;
   camera.add(anchor);
 
+  // First-person arms: a CHILD of the weapon anchor (not the camera), so the
+  // hands grip the weapon and inherit all of its motion (sway, bob, recoil,
+  // reload drop/twist, ADS pull) as one rigid unit. The arms glb is authored
+  // in camera space with -Z forward and its grip at the origin, matching the
+  // weapon glbs (origin at grip), so at the anchor it lands on the weapon; the
+  // small offset below nudges the hands onto the grip. Model is chosen by the
+  // local agent (Zephyr's gauntlets vs generic arms) and swapped when it
+  // changes. Async — no placeholder, so nothing shows until the .glb lands;
+  // culling is off (arms sit on the near plane).
+  //
+  // viewmodel_zephyr ships skinned + equip/reload/inspect clips — cloned with
+  // SkeletonUtils and driven by AnimationMixer when present; procedural
+  // reloadPoseAt remains the fallback when clips aren't available.
+  const armsGroup = new THREE.Group();
+  // Anchor-local offset placing the arms' authored hand-convergence point onto
+  // the weapon grip (anchor origin), tuned live against the real gun geometry:
+  // grip(0,-0.05,0) − handConvergence(0.286,-0.347,-0.092), then nudged up so
+  // the wrist clears the ability HUD bar.
+  armsGroup.position.set(-0.286, 0.32, 0.08);
+  anchor.add(armsGroup);
+  let currentArmsModel: ModelName | null = null;
+  let armsMixer: THREE.AnimationMixer | null = null;
+  let equipAction: THREE.AnimationAction | null = null;
+  let reloadAction: THREE.AnimationAction | null = null;
+  /** True when the active arms glb has a reload clip — skip procedural reloadPoseAt. */
+  let armsHasReloadClip = false;
+
+  function findClip(clips: readonly THREE.AnimationClip[], name: string): THREE.AnimationClip | undefined {
+    return clips.find((c) => c.name === name || c.name.startsWith(`${name}.`));
+  }
+
+  function clearArmsMixer(): void {
+    if (armsMixer) {
+      armsMixer.stopAllAction();
+      armsMixer = null;
+    }
+    equipAction = null;
+    reloadAction = null;
+    armsHasReloadClip = false;
+  }
+
+  function setArmsForAgent(agentId: number): void {
+    const desired: ModelName = agentId === AGENT_ZEPHYR ? "viewmodel_zephyr" : "viewmodel_arms";
+    if (desired === currentArmsModel) return;
+    currentArmsModel = desired;
+    void loadModel(desired).then((master) => {
+      if (currentArmsModel !== desired || !master) return; // superseded by a later agent, or load failed
+      clearArmsMixer();
+      const clips = getModelAnimations(desired);
+      // Skinned clone when the glb has a skeleton (zephyr arms) so mixer bones
+      // rebind correctly; plain clone for the generic box arms.
+      const hasSkin = (() => {
+        let skinned = false;
+        master.traverse((o) => {
+          if ((o as THREE.SkinnedMesh).isSkinnedMesh) skinned = true;
+        });
+        return skinned;
+      })();
+      let root: THREE.Object3D;
+      if (hasSkin) {
+        root = cloneSkinnedModel(master).root;
+      } else {
+        root = cloneModel(master).group;
+        root.traverse((o) => (o.frustumCulled = false));
+      }
+      armsGroup.clear();
+      armsGroup.add(root);
+
+      if (clips.length > 0) {
+        armsMixer = new THREE.AnimationMixer(root);
+        const equipClip = findClip(clips, "equip");
+        const reloadClip = findClip(clips, "reload");
+        if (equipClip) {
+          equipAction = armsMixer.clipAction(equipClip);
+          equipAction.setLoop(THREE.LoopOnce, 1);
+          equipAction.clampWhenFinished = true;
+        }
+        if (reloadClip) {
+          reloadAction = armsMixer.clipAction(reloadClip);
+          reloadAction.setLoop(THREE.LoopOnce, 1);
+          reloadAction.clampWhenFinished = true;
+          armsHasReloadClip = true;
+        }
+      }
+    });
+  }
+
   const meshes = new Map<WeaponClass, THREE.Group>();
   for (const cls of WEAPON_CLASSES) {
     const mesh = buildWeaponMesh(cls);
@@ -246,6 +334,7 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
   return {
     setVisible(v: boolean) {
       anchor.visible = v;
+      armsGroup.visible = v;
     },
     fireKick(weaponId: number) {
       const cls = weaponClassFor(weaponId);
@@ -253,12 +342,19 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
       kickRecoilSpring(recoil, kickByClass[cls]);
     },
     update(info) {
+      setArmsForAgent(info.agentId);
       const cls = weaponClassFor(info.weaponId);
       if (cls !== currentClass) {
         meshes.get(currentClass)!.visible = false;
         meshes.get(cls)!.visible = true;
         currentClass = cls;
+        // Authored equip clip on weapon switch (Zephyr arms); no-op if missing.
+        if (equipAction && armsMixer) {
+          equipAction.reset().fadeIn(0.05).play();
+        }
       }
+
+      if (armsMixer) armsMixer.update(Math.max(0, info.dtSeconds));
 
       stepRecoilSpring(recoil, Math.max(0, info.dtSeconds));
 
@@ -269,9 +365,17 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
       let reloadDropY = 0;
       let reloadTwist = 0;
       if (info.reloadProgress01 !== null) {
-        const pose = reloadPoseAt(info.reloadProgress01);
-        reloadDropY = pose.dropY;
-        reloadTwist = pose.twist;
+        // Rising edge: start the authored reload clip once per reload cycle.
+        if (lastReloadProgress === null && reloadAction && armsMixer) {
+          reloadAction.reset().fadeIn(0.05).play();
+        }
+        // Procedural gun drop/twist only when the arms glb has no reload clip
+        // (generic arms / failed load) — keeps the weapon motion readable.
+        if (!armsHasReloadClip) {
+          const pose = reloadPoseAt(info.reloadProgress01);
+          reloadDropY = pose.dropY;
+          reloadTwist = pose.twist;
+        }
         lastReloadProgress = info.reloadProgress01;
         castPulseHandled = false;
       } else {

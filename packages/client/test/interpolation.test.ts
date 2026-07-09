@@ -53,6 +53,8 @@ function groundTruthAt(path: Map<number, RemotePose>, targetTick: number): Remot
     weaponSecondary: 0,
     activeSlot: 0,
     magActive: 0,
+    team: 255,
+    agentId: 255,
   };
 }
 
@@ -104,6 +106,8 @@ describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
             weaponSecondary: p.weaponSecondary,
             activeSlot: p.activeSlot,
             magActive: p.magActive,
+            team: p.team,
+            agentId: p.agentId,
           })),
         );
       }
@@ -161,6 +165,8 @@ describe("interpolation under jitter+loss (acceptance criterion 5)", () => {
             weaponSecondary: s.weaponSecondary[straferIndex]!,
             activeSlot: s.activeSlot[straferIndex]!,
             magActive: s.activeSlot[straferIndex] === 0 ? s.magPrimary[straferIndex]! : s.magSecondary[straferIndex]!,
+            team: s.team[straferIndex]!,
+            agentId: s.agentId[straferIndex]!,
           });
         }
 

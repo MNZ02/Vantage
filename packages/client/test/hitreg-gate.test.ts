@@ -122,6 +122,8 @@ function runScenario(shooterLatency: { delayMs: number; jitterMs: number; lossRa
             weaponSecondary: p.weaponSecondary,
             activeSlot: p.activeSlot,
             magActive: p.magActive,
+            team: p.team,
+            agentId: p.agentId,
           }),
         ),
       );

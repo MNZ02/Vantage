@@ -6,3 +6,5 @@ dist/
 .playwright-mcp/
 __pycache__/
 assets/blender/vendor/
+_tmp_*
+

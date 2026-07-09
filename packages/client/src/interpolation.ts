@@ -48,6 +48,8 @@ export interface RemotePose {
   magActive: number;
   /** M3: 0 attackers, 1 defenders, 255 unassigned (TEAM_NONE) — used by the minimap to color dots. */
   team: number;
+  /** M5: AGENT_ZEPHYR(0)/…/AGENT_NONE(255) — selects which authored character model the remote player renders with. */
+  agentId: number;
 }
 
 export interface RemoteInterpolatorOptions {
@@ -81,6 +83,7 @@ function lerpPose(a: RemotePose, b: RemotePose, t: number): RemotePose {
     activeSlot: t < 1 ? a.activeSlot : b.activeSlot,
     magActive: t < 1 ? a.magActive : b.magActive,
     team: t < 1 ? a.team : b.team,
+    agentId: t < 1 ? a.agentId : b.agentId,
   };
 }
 

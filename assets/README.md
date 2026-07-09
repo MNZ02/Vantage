@@ -17,16 +17,21 @@ Valorant-style original designs (see PLAN.md IP note). Source of truth:
 | prop_spike.glb | Spike — opened petals, emissive red core/beacon | 1.4k | 71 KB |
 | agent_placeholder.glb | Humanoid, 18-bone rig, rigid-skinned, armor + glow visor | 3.3k | 370 KB |
 | viewmodel_arms.glb | FP arms in camera space (origin = camera, -Z forward) | 0.9k | 62 KB |
+| agent_zephyr.glb | **Zephyr** (Duelist, agentId 0) hero model — organic body, vest, scarf, mask + glow visor; 18-bone rig, vertex-AO (COLOR_0) | ~15k | 1.3 MB |
+| viewmodel_zephyr.glb | Zephyr FP arms — wraps, teal cuffs; clips: equip / reload / inspect | 2.6k | 307 KB |
+| map_crossing.glb | Crossing visual mesh from sim `LEVEL_BOXES` + baked vertex AO (collision stays in sim) | — | 826 KB |
 
-Total ~1.5 MB / ~21k tris — well inside the <60 MB budget.
+Total still well inside the <60 MB budget. Client loads these via `packages/client/src/assets.ts`
+(async swap over procedural placeholders; `vertexColors: true` forced for COLOR_0 AO).
 
 Conventions: meters, Y-up, weapons point down **-Z** (muzzle -Z), weapon origin ≈ grip,
-prop origin at floor, character faces -Z. PBR flat-color materials (`v2_*`), no textures;
-emissive parts (spike core, visor, scope lens, knife edge) use `emissiveFactor` — add
-Three.js bloom for the glow. Retint `v2_teal` per team in-engine.
+prop origin at floor, character faces -Z. PBR flat-color materials (`v2_*` / `ag_zephyr_*`),
+no external textures in-game (atlas bake abandoned for vertex AO). Emissive parts (spike core,
+visor, scope lens, knife edge) use `emissiveFactor`. Retint accent materials per team IFF.
 
 Agent rig: root → hips → spine → chest → neck → head; upper_arm/forearm/hand,
-thigh/shin/foot with .L/.R suffixes (Mixamo-style for retargeting). No animations yet.
+thigh/shin/foot with .L/.R suffixes (Mixamo-style). Body walk is client procedural bone pose;
+viewmodel_zephyr carries equip/reload/inspect clips.
 
 Previews: `assets/models/previews/` (`contact_sheet.png` shows everything).
 

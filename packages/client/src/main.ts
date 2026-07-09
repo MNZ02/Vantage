@@ -458,6 +458,7 @@ function updateViewmodel(state: SimState, localIndex: number, nowSeconds: number
     timeSeconds: nowSeconds,
     dtSeconds: frameSeconds,
     weaponId,
+    agentId: state.agentId[localIndex]!,
     horizontalSpeed: speed,
     maxSpeed: RUN_SPEED,
     distanceTraveled: viewmodelDistanceTraveled,

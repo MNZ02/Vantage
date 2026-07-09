@@ -114,6 +114,9 @@ export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSu
   // colors (COLOR_0). On load it visually replaces the procedural boxes; on
   // failure the graybox stays. Collision is unaffected either way — it
   // lives in @vg/sim and never reads render meshes.
+  //
+  // vertexColors is forced in loadModel/enableVertexColors so the baked AO
+  // actually multiplies into MeshStandardMaterial base color.
   void loadModel("map_crossing").then((master) => {
     if (!master) return;
     const { group } = cloneModel(master);
@@ -121,6 +124,8 @@ export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSu
     for (const mesh of placeholders) {
       scene.remove(mesh);
       mesh.geometry.dispose();
+      // Shared MaterialSet materials are reused across placeholders — do NOT
+      // dispose materials here (only the per-placeholder BoxGeometry).
     }
   });
 }

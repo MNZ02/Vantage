@@ -132,6 +132,49 @@ function zoneLightColor(zone: Zone): number {
   return 0xffffff;
 }
 
+/** One placed copy of an instanced glb (world transform relative to the scene). */
+interface Placement {
+  position: THREE.Vector3;
+  quaternion: THREE.Quaternion;
+  scale: THREE.Vector3;
+}
+
+/**
+ * Async-loads `model` and stamps it at every `placement` as InstancedMeshes —
+ * one per glb primitive (each has its own material), so an N-primitive model
+ * across M placements costs N draw calls total, not N×M. The model's own
+ * per-primitive local transform is folded into each instance matrix. Nothing
+ * appears until the .glb resolves (the underlying textured boxes are the
+ * placeholder/fallback); a failed load simply leaves them bare.
+ */
+function instanceGlb(group: THREE.Group, model: Parameters<typeof loadModel>[0], placements: readonly Placement[]): void {
+  if (placements.length === 0) return;
+  void loadModel(model).then((master) => {
+    if (!master) return;
+    master.updateMatrixWorld(true);
+    const placementMats = placements.map((p) => new THREE.Matrix4().compose(p.position, p.quaternion, p.scale));
+    master.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      const inst = new THREE.InstancedMesh(obj.geometry, obj.material, placements.length);
+      const primLocal = obj.matrixWorld; // relative to the (identity-rooted) master
+      const m = new THREE.Matrix4();
+      placementMats.forEach((pm, i) => inst.setMatrixAt(i, m.multiplyMatrices(pm, primLocal)));
+      inst.instanceMatrix.needsUpdate = true;
+      inst.frustumCulled = false;
+      group.add(inst);
+    });
+  });
+}
+
+// Authored prop primitive counts (assets/models/*.glb) — how many draw calls
+// each instanced prop adds, for the mesh-budget tally in buildLevelDressing.
+const CRATE_PRIMS = 4;
+const WALL_PRIMS = 5;
+// prop_wall.glb rest dims (m): 3 wide (local X) × 2.5 tall (Y) × 0.26 thick (Z).
+const WALL_PANEL_W = 3;
+const WALL_PANEL_H = 2.5;
+const WALL_PANEL_HALF_THICK = 0.13;
+
 function buildPropMesh(prop: PropSpec, materials: MaterialSet): THREE.Object3D {
   const group = new THREE.Group();
   if (prop.kind === "barrel") {
@@ -270,6 +313,59 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
     add(propObj);
     meshCount += prop.kind === "barrel" ? 1 : 2;
   }
+
+  // ---- Cover crates: skin every cover box (COVER_START..COVER_END) with the
+  // authored 1 m unit-cube crate (prop_crate.glb), scaled to the box's dims.
+  // A hair oversized (1.02×) so it fully cloaks the underlying textured box
+  // without z-fighting on the shared faces. Instanced → CRATE_PRIMS draw calls. ----
+  const cratePlacements: Placement[] = [];
+  for (let i = COVER_START; i < COVER_END; i++) {
+    const cb = boxes[i];
+    if (!cb) continue;
+    cratePlacements.push({
+      position: new THREE.Vector3((cb.minX + cb.maxX) / 2, (cb.minY + cb.maxY) / 2, (cb.minZ + cb.maxZ) / 2),
+      quaternion: new THREE.Quaternion(),
+      scale: new THREE.Vector3((cb.maxX - cb.minX) * 1.02, (cb.maxY - cb.minY) * 1.02, (cb.maxZ - cb.minZ) * 1.02),
+    });
+  }
+  instanceGlb(group, "prop_crate", cratePlacements);
+  meshCount += CRATE_PRIMS;
+
+  // ---- Wall paneling: tile prop_wall.glb across each structural wall's long
+  // face (both sides), scaling only height + per-tile width so the panel detail
+  // never stretches. Instanced → WALL_PRIMS draw calls for the whole map. ----
+  const wallPlacements: Placement[] = [];
+  const yUp = new THREE.Vector3(0, 1, 0);
+  for (let i = PERIMETER_START; i < WALLS_END; i++) {
+    const wb = boxes[i];
+    if (!wb) continue;
+    const sizeX = wb.maxX - wb.minX;
+    const sizeZ = wb.maxZ - wb.minZ;
+    const height = wb.maxY - wb.minY;
+    const cx = (wb.minX + wb.maxX) / 2;
+    const cy = (wb.minY + wb.maxY) / 2;
+    const cz = (wb.minZ + wb.maxZ) / 2;
+    const alongX = sizeX >= sizeZ;
+    const length = alongX ? sizeX : sizeZ;
+    const halfThick = (alongX ? sizeZ : sizeX) / 2;
+    const faceOffset = Math.max(0, halfThick - WALL_PANEL_HALF_THICK); // panel outer face ~flush with the wall face
+    const nTiles = Math.max(1, Math.round(length / WALL_PANEL_W));
+    const tileLen = length / nTiles;
+    const scale = new THREE.Vector3(tileLen / WALL_PANEL_W, height / WALL_PANEL_H, 1);
+    for (let t = 0; t < nTiles; t++) {
+      const along = -length / 2 + (t + 0.5) * tileLen;
+      for (const side of [1, -1] as const) {
+        // side +1 faces +axis, -1 faces the opposite; a Y-rotation aims the panel's +Z normal outward.
+        const quaternion = new THREE.Quaternion().setFromAxisAngle(yUp, alongX ? (side === 1 ? 0 : Math.PI) : side * (Math.PI / 2));
+        const position = alongX
+          ? new THREE.Vector3(cx + along, cy, cz + side * faceOffset)
+          : new THREE.Vector3(cx + side * faceOffset, cy, cz + along);
+        wallPlacements.push({ position, quaternion, scale: scale.clone() });
+      }
+    }
+  }
+  instanceGlb(group, "prop_wall", wallPlacements);
+  meshCount += WALL_PRIMS;
 
   // ---- Contact shading: dark gradient strips at wall bases (cheap fake AO). ----
   const contactMaterial = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25, depthWrite: false });
