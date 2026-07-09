@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "pnpm --filter @vg/client dev",
     "dev:server": "pnpm --filter @vg/server dev",
+    "dev:solo": "pnpm --filter @vg/server dev:solo",
     "build:libs": "pnpm --filter @vg/sim build && pnpm --filter @vg/protocol build && pnpm --filter @vg/server build",
     "build": "pnpm run build:libs && pnpm --filter @vg/client build",
     "test": "pnpm run build:libs && pnpm --filter @vg/sim test && pnpm --filter @vg/protocol test && pnpm --filter @vg/server test && pnpm --filter @vg/client test",

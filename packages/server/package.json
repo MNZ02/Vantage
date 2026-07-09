@@ -13,7 +13,9 @@
   },
   "scripts": {
     "dev": "tsx watch src/devServer.ts",
+    "dev:solo": "SOLO=1 BOTS=9 tsx watch src/devServer.ts",
     "start": "tsx src/devServer.ts",
+    "start:solo": "SOLO=1 BOTS=9 tsx src/devServer.ts",
     "bots": "tsx src/botsCli.ts",
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
