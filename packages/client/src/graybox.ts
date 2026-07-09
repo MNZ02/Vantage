@@ -27,7 +27,7 @@ import {
   WALLS_END,
   type Box,
 } from "@vg/sim";
-import { cloneModel, loadModel } from "./assets.js";
+import { cloneModel, getLoadedModel, loadModel } from "./assets.js";
 import type { MaterialSet } from "./materials.js";
 import { PROPS, type PropSpec } from "./propPlacement.js";
 import { classifyZone, type Zone } from "./zones.js";
@@ -146,13 +146,24 @@ interface Placement {
  * per-primitive local transform is folded into each instance matrix. Nothing
  * appears until the .glb resolves (the underlying textured boxes are the
  * placeholder/fallback); a failed load simply leaves them bare.
+ *
+ * `mapCoplanar`: skins that sit on the same faces as map_crossing.glb (wall
+ * panels, cover crates). Hidden once the baked map is live so they don't
+ * z-fight; still drawn over the procedural graybox if the map fails to load.
  */
-function instanceGlb(group: THREE.Group, model: Parameters<typeof loadModel>[0], placements: readonly Placement[]): void {
+function instanceGlb(
+  group: THREE.Group,
+  model: Parameters<typeof loadModel>[0],
+  placements: readonly Placement[],
+  opts: { mapCoplanar?: boolean } = {},
+): void {
   if (placements.length === 0) return;
   void loadModel(model).then((master) => {
     if (!master) return;
     master.updateMatrixWorld(true);
     const placementMats = placements.map((p) => new THREE.Matrix4().compose(p.position, p.quaternion, p.scale));
+    // Map already owns these surfaces — skip coplanar skins entirely when it's up.
+    const hideForMap = !!opts.mapCoplanar && !!getLoadedModel("map_crossing");
     master.traverse((obj) => {
       if (!(obj instanceof THREE.Mesh)) return;
       const inst = new THREE.InstancedMesh(obj.geometry, obj.material, placements.length);
@@ -161,6 +172,8 @@ function instanceGlb(group: THREE.Group, model: Parameters<typeof loadModel>[0],
       placementMats.forEach((pm, i) => inst.setMatrixAt(i, m.multiplyMatrices(pm, primLocal)));
       inst.instanceMatrix.needsUpdate = true;
       inst.frustumCulled = false;
+      if (opts.mapCoplanar) inst.userData.mapCoplanarDressing = true;
+      if (hideForMap) inst.visible = false;
       group.add(inst);
     });
   });
@@ -278,7 +291,15 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
     const size = Math.min(site.box.maxX - site.box.minX, site.box.maxZ - site.box.minZ) * 0.8;
     const decal = new THREE.Mesh(new THREE.PlaneGeometry(size, size), material);
     decal.rotation.x = -Math.PI / 2;
-    decal.position.set((site.box.minX + site.box.maxX) / 2, floorBox.maxY + 0.01, (site.box.minZ + site.box.maxZ) / 2);
+    decal.position.set((site.box.minX + site.box.maxX) / 2, floorBox.maxY + 0.02, (site.box.minZ + site.box.maxZ) / 2);
+    // Site markers share materials across frames; enable polygonOffset on the
+    // shared mat once so they don't shimmer against the floor.
+    if (material instanceof THREE.Material) {
+      material.polygonOffset = true;
+      material.polygonOffsetFactor = -1;
+      material.polygonOffsetUnits = -2;
+      material.depthWrite = false;
+    }
     add(decal);
     meshCount++;
   }
@@ -296,14 +317,23 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
   }
   const attackerBand = spawnBandCenter(ATTACKER_SPAWNS);
   const defenderBand = spawnBandCenter(DEFENDER_SPAWNS);
-  const attackerBandMesh = new THREE.Mesh(new THREE.PlaneGeometry(attackerBand.spanX, attackerBand.spanZ), materials.floorByZone.attackerSide);
+  // Slightly above the floor + polygonOffset so bands don't z-fight map/graybox floors.
+  function floorDecalMaterial(base: THREE.Material): THREE.Material {
+    const m = base.clone();
+    m.polygonOffset = true;
+    m.polygonOffsetFactor = -1;
+    m.polygonOffsetUnits = -2;
+    m.depthWrite = false;
+    return m;
+  }
+  const attackerBandMesh = new THREE.Mesh(new THREE.PlaneGeometry(attackerBand.spanX, attackerBand.spanZ), floorDecalMaterial(materials.floorByZone.attackerSide));
   attackerBandMesh.rotation.x = -Math.PI / 2;
-  attackerBandMesh.position.set(attackerBand.x, floorBox.maxY + 0.005, attackerBand.z);
+  attackerBandMesh.position.set(attackerBand.x, floorBox.maxY + 0.02, attackerBand.z);
   add(attackerBandMesh);
   meshCount++;
-  const defenderBandMesh = new THREE.Mesh(new THREE.PlaneGeometry(defenderBand.spanX, defenderBand.spanZ), materials.floorByZone.defenderSide);
+  const defenderBandMesh = new THREE.Mesh(new THREE.PlaneGeometry(defenderBand.spanX, defenderBand.spanZ), floorDecalMaterial(materials.floorByZone.defenderSide));
   defenderBandMesh.rotation.x = -Math.PI / 2;
-  defenderBandMesh.position.set(defenderBand.x, floorBox.maxY + 0.005, defenderBand.z);
+  defenderBandMesh.position.set(defenderBand.x, floorBox.maxY + 0.02, defenderBand.z);
   add(defenderBandMesh);
   meshCount++;
 
@@ -328,14 +358,17 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
       scale: new THREE.Vector3((cb.maxX - cb.minX) * 1.02, (cb.maxY - cb.minY) * 1.02, (cb.maxZ - cb.minZ) * 1.02),
     });
   }
-  instanceGlb(group, "prop_crate", cratePlacements);
+  instanceGlb(group, "prop_crate", cratePlacements, { mapCoplanar: true });
   meshCount += CRATE_PRIMS;
 
   // ---- Wall paneling: tile prop_wall.glb across each structural wall's long
   // face (both sides), scaling only height + per-tile width so the panel detail
-  // never stretches. Instanced → WALL_PRIMS draw calls for the whole map. ----
+  // never stretches. Instanced → WALL_PRIMS draw calls for the whole map.
+  // Hidden when map_crossing is live (same faces → z-fight). When shown over
+  // the graybox, sit 3 cm outside the wall face so flush coplanars don't shimmer. ----
   const wallPlacements: Placement[] = [];
   const yUp = new THREE.Vector3(0, 1, 0);
+  const PANEL_OUTSET_M = 0.03;
   for (let i = PERIMETER_START; i < WALLS_END; i++) {
     const wb = boxes[i];
     if (!wb) continue;
@@ -348,7 +381,8 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
     const alongX = sizeX >= sizeZ;
     const length = alongX ? sizeX : sizeZ;
     const halfThick = (alongX ? sizeZ : sizeX) / 2;
-    const faceOffset = Math.max(0, halfThick - WALL_PANEL_HALF_THICK); // panel outer face ~flush with the wall face
+    // Outer face of panel sits just outside the wall face (not flush).
+    const faceOffset = Math.max(0, halfThick - WALL_PANEL_HALF_THICK) + PANEL_OUTSET_M;
     const nTiles = Math.max(1, Math.round(length / WALL_PANEL_W));
     const tileLen = length / nTiles;
     const scale = new THREE.Vector3(tileLen / WALL_PANEL_W, height / WALL_PANEL_H, 1);
@@ -364,11 +398,20 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
       }
     }
   }
-  instanceGlb(group, "prop_wall", wallPlacements);
+  instanceGlb(group, "prop_wall", wallPlacements, { mapCoplanar: true });
   meshCount += WALL_PRIMS;
 
   // ---- Contact shading: dark gradient strips at wall bases (cheap fake AO). ----
-  const contactMaterial = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.25, depthWrite: false });
+  // polygonOffset so the strip doesn't z-fight the floor / map_crossing top.
+  const contactMaterial = new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    transparent: true,
+    opacity: 0.25,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -2,
+  });
   const contactInstanced = new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 0.3), contactMaterial, perimeterWalls.length);
   perimeterWalls.forEach((wallBox, i) => {
     const sx = wallBox.maxX - wallBox.minX;
@@ -383,32 +426,169 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
   add(contactInstanced);
   meshCount++;
 
-  // ---- Skybox: inverted gradient sphere + a few billboard clouds. ----
-  const skyGeometry = new THREE.SphereGeometry(150, 24, 16);
+  // ---- Skybox: multi-band dusk dome (zenith → warm horizon → ground haze)
+  // with a soft sun disc aligned to the scene's directional light, plus soft
+  // layered cloud billboards. Visual-only; does not affect collision. ----
+  const sunDir = new THREE.Vector3(20, 30, 10).normalize();
+  const skyGeometry = new THREE.SphereGeometry(180, 48, 32);
   const skyMaterial = new THREE.ShaderMaterial({
-    uniforms: { topColor: { value: new THREE.Color(0x1a1d3a) }, bottomColor: { value: new THREE.Color(0xff9a5a) } },
-    vertexShader: `varying vec3 vWorldPos; void main() { vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-    fragmentShader: `uniform vec3 topColor; uniform vec3 bottomColor; varying vec3 vWorldPos; void main() { float h = normalize(vWorldPos).y * 0.5 + 0.5; gl_FragColor = vec4(mix(bottomColor, topColor, h), 1.0); }`,
+    uniforms: {
+      zenithColor: { value: new THREE.Color(0x0c1028) },
+      midColor: { value: new THREE.Color(0x2a3560) },
+      horizonColor: { value: new THREE.Color(0xff8a5c) },
+      groundColor: { value: new THREE.Color(0x3a2838) },
+      sunColor: { value: new THREE.Color(0xffe6b0) },
+      sunDir: { value: sunDir.clone() },
+      sunSize: { value: 0.035 },
+      sunBloom: { value: 0.22 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec3 vWorldDir;
+      void main() {
+        vec4 worldPos = modelMatrix * vec4(position, 1.0);
+        vWorldDir = worldPos.xyz - cameraPosition;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        // Force sky to the far plane so nothing clips through it.
+        gl_Position.z = gl_Position.w;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 zenithColor;
+      uniform vec3 midColor;
+      uniform vec3 horizonColor;
+      uniform vec3 groundColor;
+      uniform vec3 sunColor;
+      uniform vec3 sunDir;
+      uniform float sunSize;
+      uniform float sunBloom;
+      varying vec3 vWorldDir;
+
+      // Tiny hash for soft atmospheric grain (not sim PRNG — cosmetic only).
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+
+      void main() {
+        vec3 dir = normalize(vWorldDir);
+        float elev = dir.y; // -1..1
+
+        // Elevation remap: ground band below horizon, sky above.
+        float skyT = clamp(elev * 0.5 + 0.5, 0.0, 1.0);
+        // Bias so the warm band sits near the horizon (Valorant-style dusk).
+        float h = pow(skyT, 0.72);
+
+        vec3 col;
+        if (elev < 0.0) {
+          // Below horizon: quick fade into ground haze (map walls occlude most of this).
+          float g = clamp(-elev * 2.5, 0.0, 1.0);
+          col = mix(horizonColor * 0.55, groundColor, g);
+        } else {
+          // Three-stop sky: horizon → mid → zenith.
+          float toMid = smoothstep(0.0, 0.35, elev);
+          float toZenith = smoothstep(0.25, 0.95, elev);
+          col = mix(horizonColor, midColor, toMid);
+          col = mix(col, zenithColor, toZenith);
+          // Slight azimuth warm bias toward the sun so the lit side of the sky is richer.
+          float sunAz = max(0.0, dot(normalize(vec3(dir.x, 0.0, dir.z)), normalize(vec3(sunDir.x, 0.0, sunDir.z))));
+          col = mix(col, col * vec3(1.08, 1.0, 0.95), sunAz * (1.0 - elev) * 0.35);
+        }
+
+        // Soft sun disc + bloom (matches createScene sun direction).
+        float sunDot = max(0.0, dot(dir, normalize(sunDir)));
+        float disc = smoothstep(1.0 - sunSize, 1.0 - sunSize * 0.35, sunDot);
+        float bloom = pow(sunDot, 24.0) * sunBloom;
+        float corona = pow(sunDot, 6.0) * 0.12;
+        col += sunColor * (disc * 1.4 + bloom + corona);
+
+        // Horizon glow strip.
+        float hz = exp(-abs(elev) * 8.0);
+        col += horizonColor * hz * 0.18;
+
+        // Subtle film grain so the dome doesn't read as a flat shader ball.
+        float grain = (hash(dir.xz * 40.0 + dir.y * 11.0) - 0.5) * 0.025;
+        col += grain;
+
+        // Cheap dither against large-area banding on the gradient.
+        col += (hash(gl_FragCoord.xy) - 0.5) * 0.012;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `,
     side: THREE.BackSide,
     depthWrite: false,
+    fog: false,
   });
   const sky = new THREE.Mesh(skyGeometry, skyMaterial);
+  sky.frustumCulled = false;
+  sky.renderOrder = -1000;
   add(sky);
   meshCount++;
 
-  const cloudMaterial = new THREE.MeshBasicMaterial({ color: 0xfff2e0, transparent: true, opacity: 0.35, depthWrite: false, side: THREE.DoubleSide });
-  const cloudCount = 5;
-  const clouds = new THREE.InstancedMesh(new THREE.PlaneGeometry(18, 6), cloudMaterial, cloudCount);
+  // Soft multi-lobe cloud billboards (shader-tinted, horizon-hugging).
+  const cloudMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      cloudColor: { value: new THREE.Color(0xffd4b8) },
+      opacity: { value: 0.42 },
+    },
+    vertexShader: /* glsl */ `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 cloudColor;
+      uniform float opacity;
+      varying vec2 vUv;
+
+      float blob(vec2 uv, vec2 c, vec2 s) {
+        vec2 d = (uv - c) / s;
+        return exp(-dot(d, d));
+      }
+
+      void main() {
+        // Layered soft ellipses → cumulus-ish silhouette without textures.
+        float a = 0.0;
+        a += blob(vUv, vec2(0.50, 0.48), vec2(0.38, 0.28));
+        a += blob(vUv, vec2(0.32, 0.52), vec2(0.22, 0.20));
+        a += blob(vUv, vec2(0.68, 0.50), vec2(0.24, 0.18));
+        a += blob(vUv, vec2(0.45, 0.62), vec2(0.18, 0.14));
+        a += blob(vUv, vec2(0.58, 0.38), vec2(0.20, 0.12));
+        a = smoothstep(0.15, 0.75, a);
+        // Soft edge fade so billboard rects don't show.
+        float edge = smoothstep(0.0, 0.12, vUv.x) * smoothstep(1.0, 0.88, vUv.x)
+                   * smoothstep(0.0, 0.18, vUv.y) * smoothstep(1.0, 0.75, vUv.y);
+        a *= edge;
+        if (a < 0.02) discard;
+        // Slight undershadow so clouds read volume against the bright horizon.
+        float shade = mix(0.75, 1.05, smoothstep(0.3, 0.7, vUv.y));
+        gl_FragColor = vec4(cloudColor * shade, a * opacity);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    fog: false,
+  });
+  const cloudCount = 8;
+  const clouds = new THREE.InstancedMesh(new THREE.PlaneGeometry(28, 10), cloudMaterial, cloudCount);
   for (let i = 0; i < cloudCount; i++) {
-    const angle = (i / cloudCount) * Math.PI * 2;
-    const radius = 90;
+    const angle = (i / cloudCount) * Math.PI * 2 + i * 0.35;
+    const radius = 95 + (i % 3) * 12;
+    const elev = 18 + (i % 4) * 7 + (i % 2) * 3;
+    const scale = 0.75 + (i % 3) * 0.35;
     m.compose(
-      new THREE.Vector3(Math.cos(angle) * radius, 40 + i * 4, Math.sin(angle) * radius),
-      new THREE.Quaternion().setFromEuler(new THREE.Euler(0, -angle, 0)),
-      new THREE.Vector3(1, 1, 1),
+      new THREE.Vector3(Math.cos(angle) * radius, elev, Math.sin(angle) * radius),
+      // Face roughly toward map center so billboards read as a ring.
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(0, -angle + Math.PI, 0)),
+      new THREE.Vector3(scale, scale * (0.55 + (i % 2) * 0.15), 1),
     );
     clouds.setMatrixAt(i, m);
   }
+  clouds.instanceMatrix.needsUpdate = true;
+  clouds.frustumCulled = false;
+  clouds.renderOrder = -999;
   add(clouds);
   meshCount++;
 

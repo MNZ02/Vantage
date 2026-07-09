@@ -47,27 +47,27 @@ export interface SceneHandle {
 }
 
 export function createScene(canvas: HTMLCanvasElement): SceneHandle {
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  // logarithmicDepthBuffer: large outdoor extents (map ~72 m, far=200) + a
+  // tight near plane for the viewmodel otherwise chew z-precision and make
+  // coplanar/flush surfaces (floor decals, joined box edges) shimmer.
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
 
   const scene = new THREE.Scene();
-  // M5: retuned to a dusk tone matching graybox.ts's inverted-gradient skybox
-  // (see buildLevelDressing()'s sky mesh) instead of the old flat dark-gray —
-  // fog now reads as atmospheric haze under a dusk sky rather than "runs out
-  // of level and hits a wall of gray".
-  scene.background = new THREE.Color(0x2a2438);
-  scene.fog = new THREE.Fog(0x3a3040, 25, 60);
+  // Dusk palette locked to graybox.ts's sky dome (zenith 0x0c1028 → horizon
+  // 0xff8a5c). Fog is a soft mid-horizon haze so distant walls fall off into
+  // the sky instead of a flat gray wall.
+  scene.background = new THREE.Color(0x1a1830);
+  scene.fog = new THREE.Fog(0x4a3a48, 35, 95);
 
-  const camera = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.05, 200);
+  const camera = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.05, 250);
 
-  // Brightened for M2 (user feedback: the graybox read too dark to make out
-  // geometry clearly at a glance) — one tasteful change, no post-processing:
-  // raise both the hemisphere fill and the sun a step so floors/walls/props
-  // separate visually without blowing out highlights.
-  const hemi = new THREE.HemisphereLight(0xdfe8ff, 0x40403a, 1.3);
+  // Warm key from the sky sun direction + cool fill so verticals read against
+  // the dusk dome without washing out the baked map AO.
+  const hemi = new THREE.HemisphereLight(0xc8d4ff, 0x4a3828, 1.15);
   scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+  const sun = new THREE.DirectionalLight(0xffe2c0, 1.45);
   sun.position.set(20, 30, 10);
   scene.add(sun);
 
@@ -119,7 +119,24 @@ export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSu
   // actually multiplies into MeshStandardMaterial base color.
   void loadModel("map_crossing").then((master) => {
     if (!master) return;
-    const { group } = cloneModel(master);
+    // Clone materials so we can fix doubleSided (exporter marks every map
+    // material double-sided → front/back coplanars shimmer at grazing angles)
+    // without mutating the cached master.
+    const { group } = cloneModel(master, true);
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      for (const m of mats) {
+        if (!m) continue;
+        m.side = THREE.FrontSide;
+        // Keep vertex AO; cloneModel(…, true) only forced transparent for
+        // death-fade paths — map surfaces should be opaque (depth-stable).
+        m.transparent = false;
+        m.opacity = 1;
+        m.depthWrite = true;
+        m.needsUpdate = true;
+      }
+    });
     scene.add(group);
     for (const mesh of placeholders) {
       scene.remove(mesh);
@@ -127,6 +144,12 @@ export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSu
       // Shared MaterialSet materials are reused across placeholders — do NOT
       // dispose materials here (only the per-placeholder BoxGeometry).
     }
+    // Wall panels + cover-crate skins sit on the same faces as this mesh.
+    // Hide them so they don't z-fight the baked map (they stay for graybox
+    // fallback when this load fails).
+    scene.traverse((obj) => {
+      if (obj.userData?.mapCoplanarDressing) obj.visible = false;
+    });
   });
 }
 

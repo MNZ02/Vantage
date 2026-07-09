@@ -523,11 +523,14 @@ function updateHud(): void {
   abilityEntities.sync(state);
 
   const inWaitingPhase = state.mode === MODE_MATCH && state.matchPhase === PHASE_WAITING;
-  agentSelect.setOpen(inWaitingPhase);
+  const myAgentId = state.agentId[localIndex]!;
+  // Close once the local player has picked — staying open for the whole
+  // waiting phase blocked the view after selection (reopen only if unpicked).
+  agentSelect.setOpen(inWaitingPhase && myAgentId === AGENT_NONE);
   if (inWaitingPhase) {
     const picks = Array.from(state.agentId);
     const teams = Array.from(state.team);
-    agentSelect.setPicks(picks, teams, localIndex, state.agentId[localIndex]!);
+    agentSelect.setPicks(picks, teams, localIndex, myAgentId);
   }
 
   if (state.mode !== MODE_MATCH) {
