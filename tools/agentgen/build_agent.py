@@ -53,7 +53,7 @@ def mat(agent, key, spec):
     return m
 
 
-def normalize_base(height, head_scale):
+def normalize_base(height, head_scale, curl=True):
     # always re-append fresh so the normalize transforms are applied exactly once
     o = bpy.data.objects.get(BASE_OBJ)
     if o:
@@ -98,7 +98,8 @@ def normalize_base(height, head_scale):
     for v in me.vertices:
         if v.co.y > 0.045 and 1.45 < v.co.z < 1.70 and abs(v.co.x) < 0.10:
             v.co.y = 0.045
-    curl_fingers(me)
+    if curl:
+        curl_fingers(me)
     me.update()
     return o
 

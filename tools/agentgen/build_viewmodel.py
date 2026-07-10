@@ -63,7 +63,7 @@ def mat(key):
     return m
 
 
-def plate(name, dims, loc, rot, material, taper=None, taper_axis="y", bevel=0.0025):
+def plate(name, dims, loc, rot, material, taper=None, taper_axis="y", bevel=0.0025, subsurf=0):
     bpy.ops.mesh.primitive_cube_add(size=1)
     o = bpy.context.object
     o.name = name
@@ -89,6 +89,11 @@ def plate(name, dims, loc, rot, material, taper=None, taper_axis="y", bevel=0.00
         md.angle_limit = math.radians(40)
         bpy.context.view_layer.objects.active = o
         bpy.ops.object.modifier_apply(modifier="bv")
+    if subsurf:
+        md = o.modifiers.new("ss", "SUBSURF")
+        md.levels = subsurf
+        bpy.context.view_layer.objects.active = o
+        bpy.ops.object.modifier_apply(modifier="ss")
     o.data.materials.append(material)
     try:
         bpy.ops.object.shade_smooth_by_angle(angle=math.radians(45))
@@ -108,35 +113,92 @@ def _lerp(a, b, t):
     return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
 
 
-def build_fist(side_key, parts_out, scale=1.25):
-    """Curled fist: palm, 4 two-segment fingers, wrapped thumb, knuckle plate.
-    Built palm-forward (-Y), then scaled, oriented and placed at the wrist."""
+def build_fist(side_key, parts_out, scale=1.15, roll_deg=0.0):
+    """Organic fist: the sculpted hand region is extracted from the CC0 base
+    body (via build_agent's normalize + fist-strength finger curl), oriented
+    from its hanging-arm frame onto the viewmodel wrist, with a glove
+    material and a teal knuckle plate."""
+    from mathutils import Matrix
+    import build_agent  # committed sibling module
+
     cfg = ARMS[side_key]
     s = cfg["side"]
-    local = []
-    local.append(plate(f"vmh_palm.{side_key}", (0.075, 0.085, 0.058), (0, 0, 0), None, mat("dark"), bevel=0.004))
-    for i in range(4):
-        x = (-0.026 + i * 0.0175) * s
-        local.append(plate(f"vmh_prox{i}.{side_key}", (0.0155, 0.042, 0.019),
-                           (x, -0.05, -0.006), (55, 0, 0), mat("dark")))
-        local.append(plate(f"vmh_dist{i}.{side_key}", (0.0145, 0.038, 0.017),
-                           (x, -0.061, -0.037), (115, 0, 0), mat("dark")))
-    local.append(plate(f"vmh_thumb1.{side_key}", (0.017, 0.05, 0.019),
-                       (0.042 * s, -0.016, -0.008), (35, 0, -55 * s), mat("dark")))
-    local.append(plate(f"vmh_thumb2.{side_key}", (0.015, 0.038, 0.017),
-                       (0.054 * s, -0.048, -0.022), (85, 0, -30 * s), mat("dark")))
-    local.append(plate(f"vmh_knuckle.{side_key}", (0.058, 0.022, 0.028),
-                       (0, -0.04, 0.033), (18, 0, 0), mat("teal"), bevel=0.002))
-    # scale about origin, orient by the wrist euler, translate to the wrist —
-    # nudged slightly along the arm so the palm overlaps the tapered wrist end
-    from mathutils import Matrix
-    e = Euler([math.radians(d) for d in cfg["hand_rot"]], "XYZ").to_matrix().to_4x4()
-    d = (Vector(cfg["wrist"]) - Vector(cfg["elbow"])).normalized()
-    t = Matrix.Translation(Vector(cfg["wrist"]) + d * 0.035)
-    sc = Matrix.Scale(scale, 4)
-    for o in local:
-        o.matrix_world = t @ e @ sc @ o.matrix_world
-    parts_out += local
+    b = -s  # FP right arm uses the BODY's right hand (body x < 0), and vice versa
+    body = build_agent.normalize_base(1.72, 0.93, curl=False)  # curl locally below
+
+    # extract hand + wrist stub
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(body.data)
+    keep = [f for f in bm.faces
+            if 0.66 < f.calc_center_median().z < 1.01
+            and f.calc_center_median().x * b > 0.20]
+    keep_set = set(keep)
+    bmesh.ops.delete(bm, geom=[f for f in bm.faces if f not in keep_set], context="FACES")
+    me = bpy.data.meshes.new(f"vmh_hand.{side_key}")
+    bm.to_mesh(me)
+    bm.free()
+    hand = bpy.data.objects.new(f"vmh_hand.{side_key}", me)
+    bpy.context.scene.collection.objects.link(hand)
+    me.materials.append(mat("dark"))
+    # gloved look: shorten the slender base-mesh fingers before curling
+    for v in me.vertices:
+        if v.co.z < 0.85 and v.co.y <= 0.03:
+            v.co.z = 0.85 + (v.co.z - 0.85) * 0.74
+    # hand-local multi-joint fist curl (fingers only; thumb sits at y > 0.03)
+    px = 0.30 * b
+    for z_k, deg, run in ((0.85, 60, 0.08), (0.82, 60, 0.055), (0.795, 55, 0.04)):
+        for v in me.vertices:
+            x, y, z = v.co
+            if z > z_k or y > 0.03:
+                continue
+            t = min(1.0, (z_k - z) / run)
+            ang = math.radians(deg) * t
+            c_, s_ = math.cos(ang), math.sin(ang)
+            dx, dz = x - px, z - z_k
+            v.co.x = px + (dx * c_ + dz * s_ * b)
+            v.co.z = z_k + (-dx * s_ * b + dz * c_)
+    me.update()
+    bpy.ops.object.select_all(action="DESELECT")
+    hand.select_set(True)
+    bpy.context.view_layer.objects.active = hand
+    try:
+        bpy.ops.object.shade_smooth_by_angle(angle=math.radians(60))
+    except Exception:
+        bpy.ops.object.shade_smooth()
+
+    # explicit frame mapping, hanging-arm space -> viewmodel wrist space.
+    # src (body): fingers point down (-Z); knuckles face laterally (b, 0, 0).
+    # dst (FP): fingers continue along the arm; knuckles face up-and-outward.
+    def basis(K, Z):
+        K = (K - K.dot(Z) * Z).normalized()
+        Y = Z.cross(K)
+        M = Matrix.Identity(4)
+        M.col[0][:3], M.col[1][:3], M.col[2][:3] = K, Y, Z
+        return M
+
+    Z_src = Vector((0, 0, -1))
+    K_src = Vector((b, 0, 0))
+    arm_dir = (Vector(cfg["wrist"]) - Vector(cfg["elbow"])).normalized()
+    # wrist bends down from the arm line: fingers pitch below the sightline
+    Z_dst = (arm_dir + Vector((0, 0, -0.12))).normalized()
+    K_dst = Vector((0.3 * s, 0, 1.0)).normalized()
+    R = basis(K_dst, Z_dst) @ basis(K_src, Z_src).inverted()
+    roll = Matrix.Rotation(math.radians(roll_deg), 4, Z_dst)
+    src_wrist = Vector((0.275 * b, -0.03, 0.95))
+    xf = (Matrix.Translation(Vector(cfg["wrist"]) - arm_dir * 0.09) @ roll @ R
+          @ Matrix.Scale(scale, 4) @ Matrix.Translation(-src_wrist))
+    hand.matrix_world = xf @ hand.matrix_world
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    parts_out.append(hand)
+
+    # knuckle plate: authored in src space on the back of the hand, then
+    # pushed through the same transform so it always rides the fist
+    kp = plate(f"vmh_knuckle.{side_key}", (0.016, 0.048, 0.032),
+               (0.322 * b, -0.028, 0.865), (0, 0, 0), mat("teal"), bevel=0.002)
+    kp.matrix_world = xf @ kp.matrix_world
+    parts_out.append(kp)
+    bpy.data.objects.remove(body, do_unlink=True)
 
 
 def build_arms_mesh():
@@ -147,8 +209,10 @@ def build_arms_mesh():
     for k, cfg in ARMS.items():
         rot, L = _seg_rot(cfg["elbow"], cfg["wrist"])
         mid = _lerp(cfg["elbow"], cfg["wrist"], 0.5)
-        parts.append(plate(f"forearm.{k}", (0.082, L, 0.082), mid, rot, mat("white"),
-                           taper=(0.75, 0.75)))
+        # subsurf rounds the slab into a soft tapered sleeve (dims compensated
+        # for Catmull-Clark shrink)
+        parts.append(plate(f"forearm.{k}", (0.105, L * 1.1, 0.105), mid, rot, mat("white"),
+                           taper=(0.88, 0.88), bevel=0, subsurf=2))
         parts.append(plate(f"cuff.{k}", (0.098, 0.055, 0.098),
                            _lerp(cfg["elbow"], cfg["wrist"], 0.08), rot, mat("teal"), bevel=0.005))
         parts.append(plate(f"wrap1.{k}", (0.084, 0.02, 0.084),
