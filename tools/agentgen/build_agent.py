@@ -98,8 +98,29 @@ def normalize_base(height, head_scale):
     for v in me.vertices:
         if v.co.y > 0.045 and 1.45 < v.co.z < 1.70 and abs(v.co.x) < 0.10:
             v.co.y = 0.045
+    curl_fingers(me)
     me.update()
     return o
+
+
+def curl_fingers(me, knuckle_z=0.845, max_deg=55.0, run=0.09):
+    """Relaxed half-fist: progressively rotate finger verts (below the knuckle
+    line on the hanging arms) toward the palm, pivoting per-side around the
+    knuckle. Arms hang at |x| > 0.24; fingers point down (-z)."""
+    for v in me.vertices:
+        x, y, z = v.co
+        if abs(x) < 0.24 or z > knuckle_z or z < 0.70:
+            continue
+        side = 1.0 if x > 0 else -1.0
+        t = min(1.0, (knuckle_z - z) / run)
+        ang = math.radians(max_deg) * t * t  # ease-in: tips curl hardest
+        # pivot at the knuckle line for this side
+        px = 0.30 * side
+        dx, dz = x - px, z - knuckle_z
+        c, s = math.cos(ang), math.sin(ang)
+        # rotate in the x–z plane so fingertips sweep medially (toward palm)
+        v.co.x = px + (dx * c + dz * s * side)
+        v.co.z = knuckle_z + (-dx * s * side + dz * c)
 
 
 # ---------------- UV-island face labeling

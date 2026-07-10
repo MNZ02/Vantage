@@ -27,7 +27,7 @@ ZEPHYR = {
         # layered shells, inner→outer
         {"kind": "shell", "region": "pants",  "offset": 0.004, "thick": 0.006, "mat": "pants"},
         {"kind": "shell", "region": "boots",  "offset": 0.010, "thick": 0.010, "mat": "gear"},
-        {"kind": "shell", "region": "gloves", "offset": 0.006, "thick": 0.006, "mat": "gear"},
+        {"kind": "shell", "region": "gloves", "offset": 0.009, "thick": 0.008, "mat": "gear"},
         {"kind": "shell", "region": "jacket", "offset": 0.010, "thick": 0.010, "mat": "jacket"},
         {"kind": "shell", "region": "mask",   "offset": 0.008, "thick": 0.006, "mat": "gear"},
         {"kind": "shell", "region": "hood",   "offset": 0.030, "thick": 0.008, "mat": "jacket"},
