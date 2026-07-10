@@ -222,22 +222,18 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
   // First-person arms: a CHILD of the weapon anchor (not the camera), so the
   // hands grip the weapon and inherit all of its motion (sway, bob, recoil,
   // reload drop/twist, ADS pull) as one rigid unit. The arms glb is authored
-  // in camera space with -Z forward and its grip at the origin, matching the
-  // weapon glbs (origin at grip), so at the anchor it lands on the weapon; the
-  // small offset below nudges the hands onto the grip. Model is chosen by the
-  // local agent (Zephyr's gauntlets vs generic arms) and swapped when it
-  // changes. Async — no placeholder, so nothing shows until the .glb lands;
-  // culling is off (arms sit on the near plane).
+  // directly in ANCHOR space (tools/agentgen/build_viewmodel.py: weapon grip
+  // at the origin, matching the weapon glbs' grip-origin convention, right
+  // fist wrapped on the grip, left hand cradling the handguard), so it lands
+  // on the weapon with no offset. Model is chosen by the local agent
+  // (Zephyr's gauntlets vs generic arms) and swapped when it changes. Async —
+  // no placeholder, so nothing shows until the .glb lands; culling is off
+  // (arms sit on the near plane).
   //
   // viewmodel_zephyr ships skinned + equip/reload/inspect clips — cloned with
   // SkeletonUtils and driven by AnimationMixer when present; procedural
   // reloadPoseAt remains the fallback when clips aren't available.
   const armsGroup = new THREE.Group();
-  // Anchor-local offset placing the arms' authored hand-convergence point onto
-  // the weapon grip (anchor origin), tuned live against the real gun geometry:
-  // grip(0,-0.05,0) − handConvergence(0.286,-0.347,-0.092), then nudged up so
-  // the wrist clears the ability HUD bar.
-  armsGroup.position.set(-0.286, 0.32, 0.08);
   anchor.add(armsGroup);
   let currentArmsModel: ModelName | null = null;
   let armsMixer: THREE.AnimationMixer | null = null;

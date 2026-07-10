@@ -3,7 +3,13 @@ forearms, cuffs, wraps, wind-glow) + curled-fist hands + 1-bone rig + three
 scripted f-curve actions (equip / reload / inspect) with anticipation and
 overshoot. No imported geometry — everything builds from this file.
 
-Camera space: origin = camera, Blender -Y = view forward (exports to glTF -Z).
+Camera space: origin = camera, Blender +Y = view forward (exports to glTF -Z;
+verified empirically by importing weapon_rifle.glb — its muzzle lands on +Y).
+The arms are posed around the ACTUAL rifle at the client's weapon anchor
+(viewmodel.ts: anchor (0.16, -0.13, -0.35) glTF = (0.16, 0.35, -0.13) here):
+right fist wraps the pistol grip, left hand cradles the handguard. The
+armsGroup offset in viewmodel.ts must be (0,0,0) — arms are authored in
+final camera space.
 The client's procedural sway/bob/recoil (viewmodel.ts pure math) stays the
 motion source of truth; the clips are authored alternatives it can adopt via
 THREE.AnimationMixer.
@@ -28,11 +34,23 @@ PAL = {
     "glow":  ("#5FF2DE", 0.0, 0.35, "#33E0CC"),
 }
 
+# ANCHOR SPACE: the client parents armsGroup to the weapon anchor, whose
+# origin is the weapon grip (weapon glbs have their origin at the grip). So
+# everything here is authored with the grip at (0,0,0); the camera sits at
+# (-0.16, -0.35, +0.13) in this frame (inverse of the anchor position).
+CAMERA_POS = (-0.16, -0.35, 0.13)
+
 ARMS = {
-    "R": {"elbow": (0.30, 0.10, -0.36), "wrist": (0.10, -0.42, -0.235),
-          "hand_rot": (18, 0, -14), "side": 1},
-    "L": {"elbow": (-0.28, 0.00, -0.34), "wrist": (-0.06, -0.60, -0.255),
-          "hand_rot": (14, 0, 14), "side": -1},
+    # right fist wraps the pistol grip (rifle grip ≈ (0, -0.11, -0.10));
+    # fingers point across the grip (-X), knuckles face out-right/back
+    "R": {"elbow": (0.18, -0.46, -0.34), "wrist": (0.06, -0.115, -0.085),
+          "finger_dir": (-0.82, 0.10, -0.56), "knuckle_dir": (0.75, -0.35, 0.55),
+          "side": 1},
+    # left hand cradles the handguard from below (guard ≈ (0, +0.27, -0.03));
+    # fingers wrap up-and-across (+X), knuckles face down-left
+    "L": {"elbow": (-0.40, -0.42, -0.42), "wrist": (-0.055, 0.24, -0.10),
+          "finger_dir": (0.85, 0.10, 0.52), "knuckle_dir": (-0.60, -0.15, 0.78),
+          "side": -1},
 }
 
 
@@ -180,13 +198,12 @@ def build_fist(side_key, parts_out, scale=1.15, roll_deg=0.0):
     Z_src = Vector((0, 0, -1))
     K_src = Vector((b, 0, 0))
     arm_dir = (Vector(cfg["wrist"]) - Vector(cfg["elbow"])).normalized()
-    # wrist bends down from the arm line: fingers pitch below the sightline
-    Z_dst = (arm_dir + Vector((0, 0, -0.12))).normalized()
-    K_dst = Vector((0.3 * s, 0, 1.0)).normalized()
+    Z_dst = Vector(cfg["finger_dir"]).normalized()
+    K_dst = Vector(cfg["knuckle_dir"]).normalized()
     R = basis(K_dst, Z_dst) @ basis(K_src, Z_src).inverted()
     roll = Matrix.Rotation(math.radians(roll_deg), 4, Z_dst)
     src_wrist = Vector((0.275 * b, -0.03, 0.95))
-    xf = (Matrix.Translation(Vector(cfg["wrist"]) - arm_dir * 0.09) @ roll @ R
+    xf = (Matrix.Translation(Vector(cfg["wrist"]) - arm_dir * 0.03) @ roll @ R
           @ Matrix.Scale(scale, 4) @ Matrix.Translation(-src_wrist))
     hand.matrix_world = xf @ hand.matrix_world
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
@@ -301,26 +318,26 @@ def rig_and_animate(mesh):
         arm.animation_data.action = None
 
     make("equip", [
-        (1,  (0.06, 0.05, -0.30), (-38, 0, 12)),
-        (7,  (0.005, -0.01, 0.03), (4, 0, -2)),
+        (1,  (0.06, -0.05, -0.30), (-38, 0, 12)),
+        (7,  (0.005, 0.01, 0.03), (4, 0, -2)),
         (10, (0, 0, -0.008), (-1, 0, 0.5)),
         (12, (0, 0, 0), (0, 0, 0)),
     ])
     make("reload", [
         (1,  (0, 0, 0), (0, 0, 0)),
-        (8,  (-0.01, 0.02, -0.09), (-20, 0, 14)),
-        (16, (-0.012, 0.02, -0.10), (-22, 0, 15)),
-        (22, (-0.008, 0.015, -0.085), (-16, 0, 10)),
-        (25, (-0.01, 0.02, -0.095), (-19, 0, 12)),
-        (34, (0.004, -0.008, 0.018), (3, 0, -2)),
+        (8,  (-0.01, -0.02, -0.09), (-20, 0, 14)),
+        (16, (-0.012, -0.02, -0.10), (-22, 0, 15)),
+        (22, (-0.008, -0.015, -0.085), (-16, 0, 10)),
+        (25, (-0.01, -0.02, -0.095), (-19, 0, 12)),
+        (34, (0.004, 0.008, 0.018), (3, 0, -2)),
         (40, (0, 0, 0), (0, 0, 0)),
     ])
     make("inspect", [
         (1,  (0, 0, 0), (0, 0, 0)),
-        (14, (0.02, 0.06, 0.02), (6, -18, 24)),
-        (28, (0.025, 0.07, 0.03), (10, -26, 32)),
-        (40, (0.02, 0.05, 0.02), (5, -12, 20)),
-        (52, (-0.003, -0.005, 0.012), (-2, 2, -3)),
+        (14, (0.02, -0.06, 0.02), (6, -18, 24)),
+        (28, (0.025, -0.07, 0.03), (10, -26, 32)),
+        (40, (0.02, -0.05, 0.02), (5, -12, 20)),
+        (52, (-0.003, 0.005, 0.012), (-2, 2, -3)),
         (60, (0, 0, 0), (0, 0, 0)),
     ])
     return arm
