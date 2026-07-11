@@ -20,7 +20,13 @@ export type ModelName =
   | "agent"
   | "agent_zephyr"
   | "viewmodel_arms"
+  | "viewmodel_arms_pistol"
+  | "viewmodel_arms_knife"
+  | "viewmodel_arms_sniper"
   | "viewmodel_zephyr"
+  | "viewmodel_zephyr_pistol"
+  | "viewmodel_zephyr_knife"
+  | "viewmodel_zephyr_sniper"
   | "map_crossing";
 
 // new URL(..., import.meta.url) so Vite serves the repo-root assets/ dir in
@@ -41,8 +47,18 @@ const MODEL_URLS: Record<ModelName, string> = {
   // drives through the identical bone code — placeholder covers other agents.
   agent: new URL("../../../assets/models/agent_placeholder.glb", import.meta.url).href,
   agent_zephyr: new URL("../../../assets/models/agent_zephyr.glb", import.meta.url).href,
+  // FP arms are authored per weapon CLASS (one grip pose can't serve a rifle
+  // handguard, a pistol cup-grip and a one-handed knife). The base file is
+  // the rifle/smg pose; _pistol/_knife/_sniper are selected by
+  // viewmodel.ts armsModelFor(agentId, weaponClass).
   viewmodel_arms: new URL("../../../assets/models/viewmodel_arms.glb", import.meta.url).href,
+  viewmodel_arms_pistol: new URL("../../../assets/models/viewmodel_arms_pistol.glb", import.meta.url).href,
+  viewmodel_arms_knife: new URL("../../../assets/models/viewmodel_arms_knife.glb", import.meta.url).href,
+  viewmodel_arms_sniper: new URL("../../../assets/models/viewmodel_arms_sniper.glb", import.meta.url).href,
   viewmodel_zephyr: new URL("../../../assets/models/viewmodel_zephyr.glb", import.meta.url).href,
+  viewmodel_zephyr_pistol: new URL("../../../assets/models/viewmodel_zephyr_pistol.glb", import.meta.url).href,
+  viewmodel_zephyr_knife: new URL("../../../assets/models/viewmodel_zephyr_knife.glb", import.meta.url).href,
+  viewmodel_zephyr_sniper: new URL("../../../assets/models/viewmodel_zephyr_sniper.glb", import.meta.url).href,
   // map_crossing.glb: visual-only level mesh generated from the SAME
   // @vg/sim LEVEL_BOXES that drive collision (tools/mapgen/build_map.py),
   // with baked vertex-color AO. Collision never reads this file.

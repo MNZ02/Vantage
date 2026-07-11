@@ -176,6 +176,29 @@ export interface ScopeOverlay {
   setStage(stage: 0 | 1 | 2): void;
 }
 
+export interface ViewmodelComposition {
+  scale: number;
+  x: number;
+  y: number;
+  z: number;
+}
+
+/**
+ * Portrait/narrow canvases have a much smaller horizontal field of view when
+ * vertical FOV stays fixed. Pull and scale the first-person rig inward so it
+ * remains a framing element instead of covering the aiming area and HUD.
+ */
+export function viewmodelCompositionForAspect(aspect: number): ViewmodelComposition {
+  const safeAspect = Number.isFinite(aspect) && aspect > 0 ? aspect : 16 / 9;
+  const narrow = Math.max(0, Math.min(1, (1.2 - safeAspect) / 0.75));
+  return {
+    scale: 1 - narrow * 0.38,
+    x: 0.16 - narrow * 0.085,
+    y: -0.13 - narrow * 0.04,
+    z: -0.35 - narrow * 0.07,
+  };
+}
+
 /** DOM canvas overlay: dark vignette + crosshair lines for Longbow ADS stage 1/2. Stage 0 = hidden. */
 function createScopeOverlay(): ScopeOverlay {
   const el = document.createElement("div");
@@ -242,10 +265,6 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
   /** True when the active arms glb has a reload clip — skip procedural reloadPoseAt. */
   let armsHasReloadClip = false;
 
-  function findClip(clips: readonly THREE.AnimationClip[], name: string): THREE.AnimationClip | undefined {
-    return clips.find((c) => c.name === name || c.name.startsWith(`${name}.`));
-  }
-
   function clearArmsMixer(): void {
     if (armsMixer) {
       armsMixer.stopAllAction();
@@ -256,12 +275,25 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
     armsHasReloadClip = false;
   }
 
-  function setArmsForAgent(agentId: number): void {
-    const desired: ModelName = agentId === AGENT_ZEPHYR ? "viewmodel_zephyr" : "viewmodel_arms";
-    if (desired === currentArmsModel) return;
+  /** Arms are authored per weapon CLASS (a rifle handguard C-clamp can't hold
+   *  a pistol or a knife) — the glb is picked by agent AND class.
+   *  rifle/smg share the base pose file. */
+  function armsModelFor(agentId: number, cls: WeaponClass): ModelName {
+    const base = agentId === AGENT_ZEPHYR ? "viewmodel_zephyr" : "viewmodel_arms";
+    const suffix = cls === "pistol" ? "_pistol" : cls === "knife" ? "_knife" : cls === "sniper" ? "_sniper" : "";
+    return `${base}${suffix}` as ModelName;
+  }
+
+  function setArms(agentId: number, cls: WeaponClass, playEquip = false): void {
+    const desired = armsModelFor(agentId, cls);
+    if (desired === currentArmsModel) {
+      // same arms glb (e.g. rifle<->smg): still sell the swap with the clip
+      if (playEquip && equipAction && armsMixer) equipAction.reset().fadeIn(0.05).play();
+      return;
+    }
     currentArmsModel = desired;
     void loadModel(desired).then((master) => {
-      if (currentArmsModel !== desired || !master) return; // superseded by a later agent, or load failed
+      if (currentArmsModel !== desired || !master) return; // superseded by a later selection, or load failed
       clearArmsMixer();
       const clips = getModelAnimations(desired);
       // Skinned clone when the glb has a skeleton (zephyr arms) so mixer bones
@@ -285,8 +317,8 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
 
       if (clips.length > 0) {
         armsMixer = new THREE.AnimationMixer(root);
-        const equipClip = findClip(clips, "equip");
-        const reloadClip = findClip(clips, "reload");
+        const equipClip = selectBestAnimationClip(clips, "equip");
+        const reloadClip = selectBestAnimationClip(clips, "reload");
         if (equipClip) {
           equipAction = armsMixer.clipAction(equipClip);
           equipAction.setLoop(THREE.LoopOnce, 1);
@@ -298,6 +330,9 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
           reloadAction.clampWhenFinished = true;
           armsHasReloadClip = true;
         }
+        // arms swapped because the weapon class changed: play equip on the
+        // freshly bound action so the draw reads even though the load is async
+        if (playEquip && equipAction) equipAction.reset().fadeIn(0.05).play();
       }
     });
   }
@@ -331,6 +366,7 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
     setVisible(v: boolean) {
       anchor.visible = v;
       armsGroup.visible = v;
+      if (!v) scope.setStage(0);
     },
     fireKick(weaponId: number) {
       const cls = weaponClassFor(weaponId);
@@ -338,17 +374,17 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
       kickRecoilSpring(recoil, kickByClass[cls]);
     },
     update(info) {
-      setArmsForAgent(info.agentId);
       const cls = weaponClassFor(info.weaponId);
-      if (cls !== currentClass) {
+      const clsChanged = cls !== currentClass;
+      if (clsChanged) {
         meshes.get(currentClass)!.visible = false;
         meshes.get(cls)!.visible = true;
         currentClass = cls;
-        // Authored equip clip on weapon switch (Zephyr arms); no-op if missing.
-        if (equipAction && armsMixer) {
-          equipAction.reset().fadeIn(0.05).play();
-        }
       }
+      // Arms follow (agentId × weapon class); on a class change the selected
+      // arms play their equip clip (setArms handles both the same-glb and the
+      // async swap case).
+      setArms(info.agentId, cls, clsChanged);
 
       if (armsMixer) armsMixer.update(Math.max(0, info.dtSeconds));
 
@@ -390,11 +426,13 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
 
       const adsFrac = info.ads ? 1 : 0;
       const zoomVisualPull = info.ads ? Math.min(0.06, (info.adsZoom - 1) * 0.02) : 0;
+      const composition = viewmodelCompositionForAspect(camera.aspect);
+      anchor.scale.setScalar(composition.scale);
 
       anchor.position.set(
-        (1 - adsFrac) * 0.16 + adsFrac * 0.02 + sway.x + bob.x,
-        -0.13 + sway.y + bob.y + reloadDropY,
-        -0.35 + zoomVisualPull,
+        (1 - adsFrac) * composition.x + adsFrac * 0.02 + sway.x + bob.x,
+        composition.y + sway.y + bob.y + reloadDropY,
+        composition.z + zoomVisualPull,
       );
       anchor.rotation.set(-recoil.offset * 0.05 + castPitch, 0.06 * (1 - adsFrac), reloadTwist - recoil.offset * 0.02);
 
@@ -405,4 +443,68 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
     },
     scope,
   };
+}
+
+/**
+ * Blender can emit duplicate action names (`reload`, `reload.001`, ...).
+ * Prefer the matching clip with the most actual keyframe variation instead
+ * of blindly choosing the first/exact name: malformed exact-name actions can
+ * otherwise suppress the procedural fallback while contributing almost no
+ * visible rotation.
+ */
+export function selectBestAnimationClip(
+  clips: readonly THREE.AnimationClip[],
+  name: string,
+): THREE.AnimationClip | undefined {
+  const candidates = clips.filter((clip) => clip.name === name || clip.name.startsWith(`${name}.`));
+  let best: THREE.AnimationClip | undefined;
+  let bestScore = -1;
+
+  for (const clip of candidates) {
+    let score = 0;
+    for (const track of clip.tracks) {
+      const valueSize = track.getValueSize();
+      const values = track.values;
+
+      // Unit quaternions have a double-cover: q and -q describe the same
+      // orientation. Exporters are free to flip that sign between adjacent
+      // keys, so raw component ranges can report a large change for a pose
+      // that did not rotate at all. Measure the shortest angular distance
+      // between consecutive keys instead.
+      if (track instanceof THREE.QuaternionKeyframeTrack && valueSize === 4) {
+        for (let i = valueSize; i < values.length; i += valueSize) {
+          const previous = i - valueSize;
+          const previousLength = Math.hypot(values[previous]!, values[previous + 1]!, values[previous + 2]!, values[previous + 3]!);
+          const currentLength = Math.hypot(values[i]!, values[i + 1]!, values[i + 2]!, values[i + 3]!);
+          if (previousLength === 0 || currentLength === 0) continue;
+          const dot =
+            (values[previous]! * values[i]! +
+              values[previous + 1]! * values[i + 1]! +
+              values[previous + 2]! * values[i + 2]! +
+              values[previous + 3]! * values[i + 3]!) /
+            (previousLength * currentLength);
+          const cosHalfAngle = Math.min(1, Math.abs(dot));
+          score += 2 * Math.acos(cosHalfAngle);
+        }
+        continue;
+      }
+
+      for (let component = 0; component < valueSize; component++) {
+        let min = Number.POSITIVE_INFINITY;
+        let max = Number.NEGATIVE_INFINITY;
+        for (let i = component; i < values.length; i += valueSize) {
+          const value = values[i]!;
+          if (value < min) min = value;
+          if (value > max) max = value;
+        }
+        if (Number.isFinite(min) && Number.isFinite(max)) score += max - min;
+      }
+    }
+    if (score > bestScore) {
+      best = clip;
+      bestScore = score;
+    }
+  }
+
+  return best;
 }
