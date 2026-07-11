@@ -53,20 +53,78 @@ export function createImpactSparksPool(scene: THREE.Scene): ImpactSparksPool {
   const geometry = new THREE.BufferGeometry();
   const totalParticles = SPARK_BURST_POOL_SIZE * SPARKS_PER_BURST;
   const positions = new Float32Array(totalParticles * 3);
+  const colors = new Float32Array(totalParticles * 3);
+  const velocities = new Float32Array(totalParticles * 3);
+  for (let i = 0; i < totalParticles; i++) positions[i * 3 + 1] = -9999;
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  const material = new THREE.PointsMaterial({ color: 0xffcc66, size: 0.05, transparent: true, opacity: 1 });
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  const material = new THREE.PointsMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    size: 0.065,
+    transparent: true,
+    opacity: 1,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  });
   const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  points.renderOrder = 5;
   scene.add(points);
 
+  const burstBornAt = new Array<number>(SPARK_BURST_POOL_SIZE).fill(0);
   const burstExpiresAt = new Array<number>(SPARK_BURST_POOL_SIZE).fill(0);
   let cursor = 0;
+  let animationRunning = false;
+  let lastFrameMs = 0;
 
   function hideBurst(burstIndex: number): void {
     const base = burstIndex * SPARKS_PER_BURST * 3;
     for (let i = 0; i < SPARKS_PER_BURST; i++) {
       positions[base + i * 3 + 1] = -9999; // park off-screen rather than resizing the buffer
+      colors[base + i * 3 + 0] = 0;
+      colors[base + i * 3 + 1] = 0;
+      colors[base + i * 3 + 2] = 0;
+    }
+  }
+
+  function animate(nowMs: number): void {
+    const dt = lastFrameMs > 0 ? Math.min(0.033, (nowMs - lastFrameMs) / 1000) : 0;
+    lastFrameMs = nowMs;
+    let hasActiveBurst = false;
+    for (let burstIndex = 0; burstIndex < SPARK_BURST_POOL_SIZE; burstIndex++) {
+      const expiresAt = burstExpiresAt[burstIndex]!;
+      if (expiresAt <= 0) continue;
+      if (nowMs >= expiresAt) {
+        hideBurst(burstIndex);
+        burstExpiresAt[burstIndex] = 0;
+        continue;
+      }
+      hasActiveBurst = true;
+      const life01 = (nowMs - burstBornAt[burstIndex]!) / SPARK_LIFETIME_MS;
+      const brightness = Math.max(0, 1 - life01);
+      const base = burstIndex * SPARKS_PER_BURST * 3;
+      for (let i = 0; i < SPARKS_PER_BURST; i++) {
+        const p = base + i * 3;
+        velocities[p + 1] = velocities[p + 1]! - 4.8 * dt;
+        positions[p + 0] = positions[p + 0]! + velocities[p + 0]! * dt;
+        positions[p + 1] = positions[p + 1]! + velocities[p + 1]! * dt;
+        positions[p + 2] = positions[p + 2]! + velocities[p + 2]! * dt;
+        // White-hot core cooling toward amber, then black (PointsMaterial
+        // multiplies these vertex colors by its white base color).
+        colors[p + 0] = brightness;
+        colors[p + 1] = brightness * (0.42 + brightness * 0.42);
+        colors[p + 2] = brightness * 0.12;
+      }
     }
     geometry.attributes["position"]!.needsUpdate = true;
+    geometry.attributes["color"]!.needsUpdate = true;
+    if (hasActiveBurst) {
+      requestAnimationFrame(animate);
+    } else {
+      animationRunning = false;
+      lastFrameMs = 0;
+    }
   }
 
   return {
@@ -75,16 +133,29 @@ export function createImpactSparksPool(scene: THREE.Scene): ImpactSparksPool {
       cursor = (cursor + 1) % SPARK_BURST_POOL_SIZE;
       const base = burstIndex * SPARKS_PER_BURST * 3;
       for (let i = 0; i < SPARKS_PER_BURST; i++) {
-        const spread = 0.08;
-        positions[base + i * 3 + 0] = position.x + (Math.random() - 0.5) * spread;
-        positions[base + i * 3 + 1] = position.y + (Math.random() - 0.5) * spread;
-        positions[base + i * 3 + 2] = position.z + (Math.random() - 0.5) * spread;
+        const p = base + i * 3;
+        const angle = Math.random() * Math.PI * 2;
+        const horizontalSpeed = 0.35 + Math.random() * 0.9;
+        positions[p + 0] = position.x + (Math.random() - 0.5) * 0.035;
+        positions[p + 1] = position.y + (Math.random() - 0.5) * 0.035;
+        positions[p + 2] = position.z + (Math.random() - 0.5) * 0.035;
+        velocities[p + 0] = Math.cos(angle) * horizontalSpeed;
+        velocities[p + 1] = 0.35 + Math.random() * 1.2;
+        velocities[p + 2] = Math.sin(angle) * horizontalSpeed;
+        colors[p + 0] = 1;
+        colors[p + 1] = 0.84;
+        colors[p + 2] = 0.12;
       }
       geometry.attributes["position"]!.needsUpdate = true;
-      burstExpiresAt[burstIndex] = performance.now() + SPARK_LIFETIME_MS;
-      setTimeout(() => {
-        if (performance.now() >= burstExpiresAt[burstIndex]!) hideBurst(burstIndex);
-      }, SPARK_LIFETIME_MS);
+      geometry.attributes["color"]!.needsUpdate = true;
+      const nowMs = performance.now();
+      burstBornAt[burstIndex] = nowMs;
+      burstExpiresAt[burstIndex] = nowMs + SPARK_LIFETIME_MS;
+      if (!animationRunning) {
+        animationRunning = true;
+        lastFrameMs = nowMs;
+        requestAnimationFrame(animate);
+      }
     },
   };
 }
@@ -144,7 +215,8 @@ export function createDeathMarkerPool(scene: THREE.Scene): DeathMarkerPool {
 // point light while planted. Dropped shows the model without the alarm
 // light — you can find it by sight, matching the minimap's dropped marker. ----
 export interface SpikeBeacon {
-  sync(state: SimState, nowSeconds: number): void;
+  /** Pass null to actively hide stale round-end/match-end spike state. */
+  sync(state: SimState | null, nowSeconds: number): void;
 }
 
 export function createSpikeBeacon(scene: THREE.Scene): SpikeBeacon {
@@ -152,6 +224,7 @@ export function createSpikeBeacon(scene: THREE.Scene): SpikeBeacon {
   scene.add(light);
   const holder = new THREE.Group();
   const material = new THREE.MeshStandardMaterial({ color: 0x3a0d0d, emissive: 0xff2020, emissiveIntensity: 1 });
+  let pulseMaterials: THREE.MeshStandardMaterial[] = [material];
   const placeholder = new THREE.Mesh(new THREE.OctahedronGeometry(0.18, 0), material);
   placeholder.position.y = 0.2;
   holder.add(placeholder);
@@ -160,28 +233,46 @@ export function createSpikeBeacon(scene: THREE.Scene): SpikeBeacon {
 
   void loadModel("prop_spike").then((master) => {
     if (!master) return;
+    // Clone materials because the spike's alarm pulse is per-instance state;
+    // mutating the cached GLB master would leak emissive changes to any other
+    // prop_spike clone. Keep concrete MeshStandardMaterial refs so the pulse
+    // continues after the procedural placeholder is removed.
+    const cloned = cloneModel(master, true);
+    pulseMaterials = cloned.materials.filter((candidate): candidate is THREE.MeshStandardMaterial => candidate instanceof THREE.MeshStandardMaterial);
+    for (const pulseMaterial of pulseMaterials) {
+      pulseMaterial.emissive.setHex(0xff2020);
+      pulseMaterial.emissiveIntensity = 0.3;
+    }
     holder.clear(); // .glb origin is at the floor — no lift needed
-    holder.add(cloneModel(master).group);
+    holder.add(cloned.group);
   });
 
   return {
-    sync(state: SimState, nowSeconds: number) {
+    sync(state: SimState | null, nowSeconds: number) {
+      if (!state) {
+        holder.visible = false;
+        light.intensity = 0;
+        for (const pulseMaterial of pulseMaterials) pulseMaterial.emissiveIntensity = 0.3;
+        return;
+      }
       const planted = state.spikeState === SPIKE_PLANTED;
       const dropped = state.spikeState === SPIKE_DROPPED;
       holder.visible = planted || dropped;
       if (!holder.visible) {
         light.intensity = 0;
+        for (const pulseMaterial of pulseMaterials) pulseMaterial.emissiveIntensity = 0.3;
         return;
       }
       holder.position.set(state.spikeX, state.spikeY, state.spikeZ);
       if (!planted) {
         light.intensity = 0;
+        for (const pulseMaterial of pulseMaterials) pulseMaterial.emissiveIntensity = 0.3;
         return;
       }
       light.position.set(state.spikeX, state.spikeY + 0.3, state.spikeZ);
       const pulse = 0.5 + 0.5 * Math.sin(nowSeconds * 6);
       light.intensity = 1.5 + pulse * 2.5;
-      material.emissiveIntensity = 0.6 + pulse * 1.2;
+      for (const pulseMaterial of pulseMaterials) pulseMaterial.emissiveIntensity = 0.6 + pulse * 1.2;
     },
   };
 }

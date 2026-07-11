@@ -1,6 +1,8 @@
 // Client netcode glue: connects over WebSocket, drives PredictedClient +
 // RemoteInterpolator, and falls back to the M0 offline single-player mode if
-// the connection fails or doesn't complete within 2s of load.
+// the connection fails or doesn't complete within 5s of load. The slightly
+// wider startup window leaves room for shader/model initialization on slow
+// GPUs without incorrectly abandoning a healthy local WebSocket handshake.
 //
 // M3: also owns mid-match reconnect — the session token + server URL are
 // stashed in sessionStorage on every Welcome (match mode only), so a tab
@@ -22,17 +24,20 @@ import {
   type KillEventMessage,
   type HitConfirmMessage,
   type MatchEventMessage,
+  type SnapshotDroppedWeapon,
   type SnapshotMessage,
   type TeamPingMessage,
   type Transport,
 } from "@vg/protocol";
 import {
+  ABILITY_PENETRATES_WALLS,
   LEVEL_BOXES,
   MODE_MATCH,
   createState,
   eyePosition,
-  getWeaponDef,
+  raycastBoxes,
   raycastPlayers,
+  raycastWalls,
   shotDirection,
   type InputFrame,
   type ShotEvent,
@@ -41,8 +46,9 @@ import {
 import { HitRegTracker, type HitRegStats } from "./hitreg.js";
 import { RemoteInterpolator, type RemotePose } from "./interpolation.js";
 import { PredictedClient, type AuthoritativeSnapshot } from "./prediction.js";
+import { getShotPresentationWeapon } from "./shotPresentation.js";
 
-const CONNECT_TIMEOUT_MS = 2000;
+const CONNECT_TIMEOUT_MS = 5000;
 const INPUT_REDUNDANCY = 3; // newest + previous 2, see @vg/protocol InputBatch docs
 const FIRE_MAX_RANGE = 100; // mirrors the server's default (see ServerHostOptions.fireMaxRange)
 const RECONNECT_RETRY_INTERVAL_MS = 2000;
@@ -61,6 +67,17 @@ export interface NetHud {
 
 export interface PredictedHitEvent {
   targetIndex: number;
+}
+
+/** Cosmetic nearest impact resolved from the same predicted shot direction used by hit-reg feedback. */
+export interface PredictedShotImpactEvent {
+  x: number;
+  y: number;
+  z: number;
+  distance: number;
+  kind: "player" | "world" | "ability-wall";
+  /** Present only for player impacts. */
+  targetIndex: number | null;
 }
 
 export interface ConfirmedHitEvent {
@@ -143,6 +160,8 @@ export interface NetClient {
   /** Full predicted SimState — HUD/weapon/ADS/credits all read from here for the local player. */
   getPredictedState(): SimState | null;
   getRemotePoses(): readonly RemotePose[] | null;
+  /** Latest authoritative dropped-weapon list from Snapshot. */
+  getDroppedWeapons(): readonly SnapshotDroppedWeapon[];
   /** The server tick remote players are currently being rendered at (carried in every InputBatch's viewTick header). */
   getViewTick(): number;
   /** Shots the local player fired on the most recent sendInput() call (for tracer/hitmarker rendering). */
@@ -157,6 +176,8 @@ export interface NetClient {
   /** M3: phase/round/score/spike/minimap state, updated on every Snapshot. Zeroed-out in DM mode. */
   getMatchHud(): MatchHud;
   onPredictedHit(cb: (e: PredictedHitEvent) => void): void;
+  /** Fires once for the nearest visible player/world impact of each locally-predicted shot. */
+  onPredictedShotImpact(cb: (e: PredictedShotImpactEvent) => void): void;
   onConfirmedHit(cb: (e: ConfirmedHitEvent) => void): void;
   onDamageTaken(cb: (e: DamageTakenEvent) => void): void;
   onKillEvent(cb: (e: KillFeedEvent) => void): void;
@@ -226,8 +247,9 @@ function clearSavedSession(): void {
  * fields a cosmetic raycast needs, from currently-interpolated remote poses
  * — used solely for the client's own predicted-hit feedback (see PLAN.md
  * §3.2 hit feedback policy: predicted hitmarkers are cosmetic only, never
- * authoritative). The local player's own row is left at rest (irrelevant:
- * raycastPlayers always excludes the shooter index).
+ * authoritative). The local row is populated too so raycastPlayers can use
+ * its team for friendly-fire exclusion, though its collision volume is
+ * ignored because raycastPlayers always excludes the shooter index.
  */
 function buildCosmeticState(poses: readonly RemotePose[], numPlayers: number): SimState {
   const scratch = createState(0, numPlayers);
@@ -242,6 +264,7 @@ function buildCosmeticState(poses: readonly RemotePose[], numPlayers: number): S
     scratch.posZ[i] = p.posZ;
     scratch.crouching[i] = p.crouching ? 1 : 0;
     scratch.alive[i] = p.connected && p.alive ? 1 : 0;
+    scratch.team[i] = p.team;
   }
   return scratch;
 }
@@ -312,11 +335,13 @@ export function connectNetClient(): Promise<NetClient | null> {
     let correctionsAtWindowStart = 0;
     let correctionsPerSecond = 0;
     let matchHud: MatchHud = NULL_MATCH_HUD;
+    let droppedWeapons: readonly SnapshotDroppedWeapon[] = [];
     let reconnecting = false;
     let userClosed = false;
     let currentTransport = transport;
 
     const predictedHitCbs: Array<(e: PredictedHitEvent) => void> = [];
+    const predictedShotImpactCbs: Array<(e: PredictedShotImpactEvent) => void> = [];
     const confirmedHitCbs: Array<(e: ConfirmedHitEvent) => void> = [];
     const damageTakenCbs: Array<(e: DamageTakenEvent) => void> = [];
     const killEventCbs: Array<(e: KillFeedEvent) => void> = [];
@@ -357,6 +382,7 @@ export function connectNetClient(): Promise<NetClient | null> {
         ),
       );
       mode = msg.mode;
+      droppedWeapons = msg.droppedWeapons;
       matchHud = {
         mode: msg.mode,
         myTeam: localIndex !== null ? (msg.players[localIndex]?.team ?? 255) : 255,
@@ -659,13 +685,45 @@ export function connectNetClient(): Promise<NetClient | null> {
           const cosmeticState = buildCosmeticState(poses, numPlayers);
           const origin = eyePosition(state, localIndex);
           for (const shot of shots) {
-            const weapon = getWeaponDef(shot.weaponId);
+            const weapon = getShotPresentationWeapon(shot.weaponId);
             if (!weapon) continue;
             const dir = shotDirection(state, localIndex, weapon, shot.shotIndex, shot.sprayIndex);
-            const hit = raycastPlayers(cosmeticState, localIndex, origin, dir, FIRE_MAX_RANGE, mode === MODE_MATCH);
-            hitreg.recordPredictedShot(hit !== null);
-            if (hit) {
-              for (const cb of predictedHitCbs) cb({ targetIndex: hit.playerIndex });
+            const playerHit = raycastPlayers(cosmeticState, localIndex, origin, dir, FIRE_MAX_RANGE, mode === MODE_MATCH);
+            const penetratesWalls = ABILITY_PENETRATES_WALLS.has(shot.weaponId);
+
+            // Static level geometry is exact on the client because LEVEL_BOXES
+            // is the same source used by ServerHost. Ability walls come from
+            // the reconciled predicted state. Only remote player positions are
+            // approximate (interpolated at view time), matching the existing
+            // cosmetic hitmarker contract.
+            const staticWallDist = penetratesWalls ? null : raycastBoxes(LEVEL_BOXES, origin, dir, FIRE_MAX_RANGE);
+            const abilityWallHit = penetratesWalls ? null : raycastWalls(state, origin, dir, FIRE_MAX_RANGE);
+            let occluderDist: number | null = staticWallDist;
+            let occluderKind: PredictedShotImpactEvent["kind"] = "world";
+            if (abilityWallHit && (occluderDist === null || abilityWallHit.dist < occluderDist)) {
+              occluderDist = abilityWallHit.dist;
+              occluderKind = "ability-wall";
+            }
+
+            // The authoritative server treats a wall at the same distance as
+            // blocking, hence the strict comparison here.
+            const visiblePlayerHit = playerHit !== null && (occluderDist === null || playerHit.dist < occluderDist);
+            hitreg.recordPredictedShot(visiblePlayerHit);
+            if (visiblePlayerHit && playerHit) {
+              for (const cb of predictedHitCbs) cb({ targetIndex: playerHit.playerIndex });
+            }
+
+            const impactDistance = visiblePlayerHit && playerHit ? playerHit.dist : occluderDist;
+            if (impactDistance !== null) {
+              const impact: PredictedShotImpactEvent = {
+                x: origin.x + dir.x * impactDistance,
+                y: origin.y + dir.y * impactDistance,
+                z: origin.z + dir.z * impactDistance,
+                distance: impactDistance,
+                kind: visiblePlayerHit ? "player" : occluderKind,
+                targetIndex: visiblePlayerHit && playerHit ? playerHit.playerIndex : null,
+              };
+              for (const cb of predictedShotImpactCbs) cb(impact);
             }
           }
         }
@@ -680,6 +738,7 @@ export function connectNetClient(): Promise<NetClient | null> {
       getLocalIndex: () => localIndex,
       getPredictedState: () => (predicted ? predicted.getPredictedState() : null),
       getRemotePoses: () => interpolator.sample(),
+      getDroppedWeapons: () => droppedWeapons,
       getViewTick: () => Math.round(interpolator.getCurrentTargetTick()),
       getLastLocalShots: () => (predicted ? predicted.getLastShots() : []),
       buy(itemId: number) {
@@ -697,6 +756,9 @@ export function connectNetClient(): Promise<NetClient | null> {
       getMatchHud: () => matchHud,
       onPredictedHit(cb) {
         predictedHitCbs.push(cb);
+      },
+      onPredictedShotImpact(cb) {
+        predictedShotImpactCbs.push(cb);
       },
       onConfirmedHit(cb) {
         confirmedHitCbs.push(cb);

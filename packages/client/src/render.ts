@@ -31,6 +31,14 @@ import type { MaterialSet } from "./materials.js";
 import { createPlayerModel } from "./playerModel.js";
 import { flashAfterimageCurve } from "./vfx.js";
 import type { Zone } from "./zones.js";
+import { minimapBackingStoreSize, worldToMinimapPoint } from "./hudLayout.js";
+import {
+  DEBUG_HUD_EVENT,
+  dispatchDebugHudVisibility,
+  loadDebugHudVisible,
+  saveDebugHudVisible,
+  type DebugHudVisibilityDetail,
+} from "./hudPreferences.js";
 
 /** Minimal shape render.ts's killfeed needs — kept decoupled from net.ts's full NetClient event type. */
 export interface KillFeedEntry {
@@ -165,16 +173,20 @@ export interface FpsCounter {
   update(fps: number): void;
   /** Extra debug lines appended below the fps line (net stats — see net.ts's NetHud). */
   updateExtra(lines: readonly string[]): void;
+  /** Performance telemetry is opt-in (F3/settings), never painted over gameplay by default. */
+  setVisible(visible: boolean): void;
+  toggle(): void;
 }
 
 export function createFpsCounter(): FpsCounter {
   const el = document.createElement("div");
+  el.className = "vg-hud vg-debug-hud";
+  el.setAttribute("aria-label", "Performance telemetry");
+  el.setAttribute("aria-live", "off");
   el.style.position = "fixed";
-  el.style.top = "8px";
-  el.style.left = "8px";
   el.style.padding = "2px 6px";
   el.style.font = "12px monospace";
-  el.style.color = "#0f0";
+  el.style.color = "#8dffb1";
   el.style.background = "rgba(0,0,0,0.5)";
   el.style.zIndex = "10";
   el.style.whiteSpace = "pre";
@@ -182,9 +194,41 @@ export function createFpsCounter(): FpsCounter {
   document.body.appendChild(el);
   let fpsLine = "fps: --";
   let extraLines: readonly string[] = [];
-  function render(): void {
-    el.textContent = [fpsLine, ...extraLines].join("\n");
+  let visible = loadDebugHudVisible(window.localStorage);
+  let lastPaintMs = Number.NEGATIVE_INFINITY;
+  let lastPaintedText = "";
+
+  function setVisible(next: boolean, persist = true): void {
+    if (visible === next && persist) return;
+    visible = next;
+    el.style.display = visible ? "block" : "none";
+    if (visible) render(true);
+    if (persist) saveDebugHudVisible(window.localStorage, visible);
   }
+
+  function render(force = false): void {
+    if (!visible) return;
+    const now = performance.now();
+    if (!force && now - lastPaintMs < 250) return;
+    const text = [fpsLine, ...extraLines].join("\n");
+    if (text !== lastPaintedText) {
+      el.textContent = text;
+      lastPaintedText = text;
+    }
+    lastPaintMs = now;
+  }
+
+  setVisible(visible, false);
+  document.addEventListener("keydown", (event) => {
+    if (event.code !== "F3" || event.repeat) return;
+    event.preventDefault();
+    setVisible(!visible);
+    dispatchDebugHudVisibility(visible);
+  });
+  window.addEventListener(DEBUG_HUD_EVENT, ((event: CustomEvent<DebugHudVisibilityDetail>) => {
+    setVisible(event.detail.visible);
+  }) as EventListener);
+
   return {
     update(fps: number) {
       fpsLine = `fps: ${fps.toFixed(0)}`;
@@ -193,6 +237,11 @@ export function createFpsCounter(): FpsCounter {
     updateExtra(lines: readonly string[]) {
       extraLines = lines;
       render();
+    },
+    setVisible,
+    toggle() {
+      setVisible(!visible);
+      dispatchDebugHudVisibility(visible);
     },
   };
 }
@@ -308,6 +357,53 @@ export function createHitFlashOverlay(): { flash(): void } {
   };
 }
 
+/** Persistent first-person aiming reticle. Scope/ADS and gameplay visibility
+ * are separate inputs so menus, death/spectate, and scoped weapons can hide it
+ * without coupling this renderer to simulation state. */
+export interface Crosshair {
+  setVisible(visible: boolean): void;
+  setAds(ads: boolean): void;
+}
+
+export function createCrosshair(): Crosshair {
+  const el = document.createElement("div");
+  el.className = "vg-crosshair";
+  el.setAttribute("aria-hidden", "true");
+  for (const direction of ["top", "right", "bottom", "left"] as const) {
+    const arm = document.createElement("span");
+    arm.className = `vg-crosshair__arm vg-crosshair__arm--${direction}`;
+    el.appendChild(arm);
+  }
+  const dot = document.createElement("span");
+  dot.className = "vg-crosshair__dot";
+  el.appendChild(dot);
+  document.body.appendChild(el);
+
+  const syncPointerLockClass = (): void => {
+    document.body.classList.toggle("vg-pointer-locked", document.pointerLockElement !== null);
+  };
+  document.addEventListener("pointerlockchange", syncPointerLockClass);
+  syncPointerLockClass();
+
+  let gameplayVisible = true;
+  let adsActive = false;
+  function render(): void {
+    el.style.display = gameplayVisible && !adsActive ? "block" : "none";
+  }
+  render();
+
+  return {
+    setVisible(visible) {
+      gameplayVisible = visible;
+      render();
+    },
+    setAds(ads) {
+      adsActive = ads;
+      render();
+    },
+  };
+}
+
 /**
  * Crosshair hitmarker(s): a predicted hit (client's own cosmetic raycast,
  * instant) shows a hollow marker; a server-confirmed hit shows a solid
@@ -408,9 +504,8 @@ const KILLFEED_FADE_MS = 6000;
 
 export function createKillFeed(playerLabel: (index: number) => string): KillFeed {
   const container = document.createElement("div");
+  container.className = "vg-hud vg-killfeed";
   container.style.position = "fixed";
-  container.style.top = "8px";
-  container.style.right = "8px";
   container.style.zIndex = "10";
   container.style.display = "flex";
   container.style.flexDirection = "column";
@@ -434,8 +529,7 @@ export function createKillFeed(playerLabel: (index: number) => string): KillFeed
   return {
     push(entry: KillFeedEntry) {
       const row = document.createElement("div");
-      row.style.background = "rgba(0,0,0,0.35)";
-      row.style.padding = "2px 6px";
+      row.className = "vg-killfeed__row";
       row.style.transition = `opacity ${KILLFEED_FADE_MS}ms linear`;
       const marker = entry.headshot ? "[HS]" : "▸";
       row.textContent = `${playerLabel(entry.killerIndex)} ${marker} ${playerLabel(entry.victimIndex)} (${weaponName(entry.weaponId)})`;
@@ -501,6 +595,8 @@ export interface BuyMenu {
 
 export function createBuyMenu(onBuy: (itemId: number) => void, onSell?: (itemId: number) => void): BuyMenu {
   const overlay = document.createElement("div");
+  overlay.className = "vg-hud vg-modal-backdrop";
+  overlay.setAttribute("aria-hidden", "true");
   overlay.style.position = "fixed";
   overlay.style.inset = "0";
   overlay.style.zIndex = "20";
@@ -512,18 +608,29 @@ export function createBuyMenu(onBuy: (itemId: number) => void, onSell?: (itemId:
   overlay.style.color = "#fff";
 
   const panel = document.createElement("div");
+  panel.className = "vg-panel vg-buy-panel";
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "vg-buy-title");
+  panel.tabIndex = -1;
   panel.style.background = "#1c1f24";
   panel.style.border = "1px solid #444";
   panel.style.borderRadius = "6px";
   panel.style.padding = "16px 20px";
-  panel.style.minWidth = "320px";
   overlay.appendChild(panel);
 
   const title = document.createElement("div");
-  title.textContent = "BUY (press 1-8, click, B or Esc to close)";
+  title.textContent = "ARMORY";
+  title.className = "vg-panel__title";
+  title.id = "vg-buy-title";
   title.style.marginBottom = "10px";
   title.style.opacity = "0.8";
   panel.appendChild(title);
+
+  const phaseLine = document.createElement("div");
+  phaseLine.className = "vg-buy-panel__phase";
+  phaseLine.textContent = "BUY PHASE · 1–8 TO PURCHASE · B / ESC TO CLOSE";
+  panel.appendChild(phaseLine);
 
   const creditsLine = document.createElement("div");
   creditsLine.style.marginBottom = "10px";
@@ -536,10 +643,29 @@ export function createBuyMenu(onBuy: (itemId: number) => void, onSell?: (itemId:
   ];
 
   let credits = 0;
+  let playerAlive = true;
+  let buyPhaseOpen = true; // offline/DM preserves the existing always-buy behavior
   const rows: HTMLDivElement[] = [];
+  const purchaseButtons: HTMLButtonElement[] = [];
   const sellButtons: HTMLButtonElement[] = [];
+
+  function refreshRows(): void {
+    creditsLine.textContent = `CREDITS  ${credits.toLocaleString()}${playerAlive ? "" : "  ·  ELIMINATED"}`;
+    phaseLine.textContent = buyPhaseOpen
+      ? "BUY PHASE · 1–8 TO PURCHASE · B / ESC TO CLOSE"
+      : "ARMORY CLOSED · AVAILABLE DURING BUY PHASE";
+    phaseLine.dataset.closed = String(!buyPhaseOpen);
+    rows.forEach((row, i) => {
+      const interactive = playerAlive && buyPhaseOpen && items[i]!.price <= credits;
+      row.style.opacity = interactive ? "1" : "0.38";
+      row.style.pointerEvents = interactive || (buyPhaseOpen && playerAlive) ? "auto" : "none";
+      purchaseButtons[i]!.disabled = !interactive;
+    });
+  }
+
   items.forEach((item, i) => {
     const row = document.createElement("div");
+    row.className = "vg-buy-panel__row";
     row.style.padding = "4px 8px";
     row.style.borderRadius = "3px";
     row.style.display = "flex";
@@ -547,11 +673,24 @@ export function createBuyMenu(onBuy: (itemId: number) => void, onSell?: (itemId:
     row.style.justifyContent = "space-between";
     row.style.gap = "10px";
 
-    const label = document.createElement("span");
+    const label = document.createElement("button");
+    label.type = "button";
     label.style.cursor = "pointer";
-    label.textContent = `${i + 1}. ${item.label} — ${item.price}cr`;
-    label.addEventListener("click", () => onBuy(item.itemId));
+    label.style.border = "0";
+    label.style.padding = "0";
+    label.style.background = "transparent";
+    label.style.color = "inherit";
+    label.style.font = "inherit";
+    label.style.textAlign = "left";
+    label.textContent = `${i + 1}  ${item.label}`;
+    const price = document.createElement("strong");
+    price.textContent = `${item.price.toLocaleString()} CR`;
+    label.appendChild(price);
+    label.addEventListener("click", () => {
+      if (playerAlive && buyPhaseOpen && item.price <= credits) onBuy(item.itemId);
+    });
     row.appendChild(label);
+    purchaseButtons.push(label);
 
     const sellBtn = document.createElement("button");
     sellBtn.textContent = "Sell";
@@ -572,29 +711,42 @@ export function createBuyMenu(onBuy: (itemId: number) => void, onSell?: (itemId:
   });
 
   document.body.appendChild(overlay);
+  let open = false;
+  let previouslyFocused: HTMLElement | null = null;
 
   return {
-    setOpen(open: boolean) {
+    setOpen(nextOpen: boolean) {
+      if (open === nextOpen) return;
+      open = nextOpen;
       overlay.style.display = open ? "flex" : "none";
+      overlay.setAttribute("aria-hidden", String(!open));
+      if (open) {
+        previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        (purchaseButtons.find((button) => !button.disabled) ?? panel).focus();
+      } else if (previouslyFocused) {
+        previouslyFocused.focus();
+        previouslyFocused = null;
+      }
     },
     setState(newCredits: number, alive: boolean) {
       credits = newCredits;
-      creditsLine.textContent = `Credits: ${credits}${alive ? "" : " (dead — can't buy)"}`;
-      rows.forEach((row, i) => {
-        const affordable = alive && items[i]!.price <= credits;
-        row.style.opacity = affordable ? "1" : "0.4";
-      });
+      playerAlive = alive;
+      refreshRows();
     },
     setMatchState(purchasedItemIds: ReadonlySet<number>, isBuyPhase: boolean) {
+      buyPhaseOpen = isBuyPhase;
       items.forEach((item, i) => {
         sellButtons[i]!.style.display = onSell && isBuyPhase && purchasedItemIds.has(item.itemId) ? "inline-block" : "none";
       });
+      refreshRows();
     },
   };
 }
 
 /** Health/armor/weapon/credits/respawn-countdown HUD overlay. */
 export interface CombatHud {
+  /** Hides all lower combat presentation outside active buy/round play. */
+  setVisible(visible: boolean): void;
   update(state: {
     health: number;
     armor: number;
@@ -608,20 +760,40 @@ export interface CombatHud {
 }
 
 export function createCombatHud(): CombatHud {
-  const el = document.createElement("div");
-  el.style.position = "fixed";
-  el.style.bottom = "12px";
-  el.style.left = "50%";
-  el.style.transform = "translateX(-50%)";
-  el.style.zIndex = "10";
-  el.style.font = "15px monospace";
-  el.style.color = "#fff";
-  el.style.textShadow = "0 0 3px rgba(0,0,0,0.9)";
-  el.style.textAlign = "center";
-  el.style.whiteSpace = "pre";
-  document.body.appendChild(el);
+  const container = document.createElement("div");
+  container.className = "vg-hud vg-combat-hud";
+  container.setAttribute("aria-label", "Combat status");
+  container.style.display = "none";
+
+  const vitals = document.createElement("div");
+  vitals.className = "vg-combat-hud__vitals";
+  const healthValue = document.createElement("strong");
+  const armorValue = document.createElement("strong");
+  const health = document.createElement("span");
+  health.className = "vg-combat-hud__stat vg-combat-hud__stat--health";
+  health.append("HP ", healthValue);
+  const armor = document.createElement("span");
+  armor.className = "vg-combat-hud__stat vg-combat-hud__stat--armor";
+  armor.append("ARMOR ", armorValue);
+  vitals.append(health, armor);
+
+  const loadout = document.createElement("div");
+  loadout.className = "vg-combat-hud__loadout";
+  const weaponValue = document.createElement("span");
+  weaponValue.className = "vg-combat-hud__weapon";
+  const ammoValue = document.createElement("strong");
+  ammoValue.className = "vg-combat-hud__ammo";
+  const reserveValue = document.createElement("span");
+  reserveValue.className = "vg-combat-hud__reserve";
+  const creditsValue = document.createElement("span");
+  creditsValue.className = "vg-combat-hud__credits";
+  loadout.append(weaponValue, ammoValue, reserveValue, creditsValue);
+
+  container.append(vitals, loadout);
+  document.body.appendChild(container);
 
   const respawnEl = document.createElement("div");
+  respawnEl.className = "vg-hud vg-respawn-banner";
   respawnEl.style.position = "fixed";
   respawnEl.style.top = "40%";
   respawnEl.style.left = "50%";
@@ -633,12 +805,25 @@ export function createCombatHud(): CombatHud {
   respawnEl.style.display = "none";
   document.body.appendChild(respawnEl);
 
+  let visible = false;
+
   return {
+    setVisible(nextVisible) {
+      visible = nextVisible;
+      container.style.display = visible ? "block" : "none";
+      if (!visible) respawnEl.style.display = "none";
+    },
     update({ health, armor, weaponName, magAmmo, reserveAmmo, credits, alive, respawnSecondsLeft }) {
-      el.textContent = `HP ${health}  AR ${armor}   ${weaponName} ${magAmmo}/${reserveAmmo}   $${credits}`;
-      if (!alive) {
+      healthValue.textContent = String(Math.max(0, Math.round(health)));
+      armorValue.textContent = String(Math.max(0, Math.round(armor)));
+      weaponValue.textContent = weaponName.toUpperCase();
+      ammoValue.textContent = String(Math.max(0, magAmmo));
+      reserveValue.textContent = `/ ${Math.max(0, reserveAmmo)}`;
+      creditsValue.textContent = `${credits.toLocaleString()} CR`;
+      container.dataset.eliminated = String(!alive);
+      if (visible && !alive && respawnSecondsLeft > 0) {
         respawnEl.style.display = "block";
-        respawnEl.textContent = `respawning in ${Math.ceil(respawnSecondsLeft)}s`;
+        respawnEl.textContent = `RESPAWNING IN ${Math.ceil(respawnSecondsLeft)}S`;
       } else {
         respawnEl.style.display = "none";
       }
@@ -684,41 +869,41 @@ const REASON_NAMES = ["Eliminated", "Spike detonated", "Spike defused", "Time ex
 
 export function createMatchHud(): MatchHudView {
   const top = document.createElement("div");
+  top.className = "vg-hud vg-match-hud";
   top.style.position = "fixed";
-  top.style.top = "8px";
-  top.style.left = "50%";
-  top.style.transform = "translateX(-50%)";
+  top.style.display = "none";
   top.style.zIndex = "10";
-  top.style.font = "15px monospace";
   top.style.color = "#fff";
   top.style.textShadow = "0 0 3px rgba(0,0,0,0.9)";
   top.style.textAlign = "center";
-  top.style.whiteSpace = "pre";
+
+  const phaseLabel = document.createElement("span");
+  phaseLabel.className = "vg-match-hud__phase";
+  const clockLabel = document.createElement("strong");
+  clockLabel.className = "vg-match-hud__clock";
+  const scoreLabel = document.createElement("strong");
+  scoreLabel.className = "vg-match-hud__score";
+  const contextLabel = document.createElement("span");
+  contextLabel.className = "vg-match-hud__context";
+  top.append(phaseLabel, clockLabel, scoreLabel, contextLabel);
   document.body.appendChild(top);
 
   const spikeHud = document.createElement("div");
+  spikeHud.className = "vg-hud vg-spike-hud";
   spikeHud.style.position = "fixed";
-  spikeHud.style.top = "70px";
-  spikeHud.style.left = "50%";
-  spikeHud.style.transform = "translateX(-50%)";
   spikeHud.style.zIndex = "10";
-  spikeHud.style.font = "bold 16px monospace";
   spikeHud.style.color = "#ff4d4d";
   spikeHud.style.textShadow = "0 0 4px rgba(0,0,0,0.9)";
   spikeHud.style.textAlign = "center";
   document.body.appendChild(spikeHud);
 
   const progressBar = document.createElement("div");
+  progressBar.className = "vg-channel-progress";
   progressBar.style.position = "fixed";
-  progressBar.style.top = "95px";
-  progressBar.style.left = "50%";
-  progressBar.style.transform = "translateX(-50%)";
-  progressBar.style.width = "160px";
-  progressBar.style.height = "8px";
-  progressBar.style.border = "1px solid #fff";
   progressBar.style.zIndex = "10";
   progressBar.style.display = "none";
   const progressFill = document.createElement("div");
+  progressFill.className = "vg-channel-progress__fill";
   progressFill.style.height = "100%";
   progressFill.style.background = "#ffd54a";
   progressFill.style.width = "0%";
@@ -726,12 +911,12 @@ export function createMatchHud(): MatchHudView {
   document.body.appendChild(progressBar);
 
   const banner = document.createElement("div");
+  banner.className = "vg-hud vg-round-banner";
   banner.style.position = "fixed";
   banner.style.top = "35%";
   banner.style.left = "50%";
   banner.style.transform = "translate(-50%, -50%)";
   banner.style.zIndex = "15";
-  banner.style.font = "bold 26px monospace";
   banner.style.color = "#fff";
   banner.style.textShadow = "0 0 6px rgba(0,0,0,0.9)";
   banner.style.textAlign = "center";
@@ -739,28 +924,59 @@ export function createMatchHud(): MatchHudView {
   document.body.appendChild(banner);
 
   let bannerTimeout: ReturnType<typeof setTimeout> | null = null;
+  let bannerKind: "round" | "match" | null = null;
+  let bannerObservedAuthoritativePhase = false;
+  let lastMatchPhase: number | null = null;
+
+  function hideBanner(): void {
+    if (bannerTimeout) clearTimeout(bannerTimeout);
+    bannerTimeout = null;
+    bannerKind = null;
+    bannerObservedAuthoritativePhase = false;
+    banner.style.display = "none";
+  }
 
   return {
     update(info) {
       if (info.mode !== 1) {
-        top.textContent = "";
+        lastMatchPhase = null;
+        top.style.display = "none";
         spikeHud.textContent = "";
         progressBar.style.display = "none";
+        hideBanner();
         return;
       }
+      top.style.display = "flex";
       const phaseName = info.matchPhase === 2 ? "ROUND" : (PHASE_NAMES[info.matchPhase] ?? "");
       const teamName = info.myTeam === 0 ? "ATTACK" : info.myTeam === 1 ? "DEFENSE" : "—";
-      top.textContent = `${phaseName}  ${formatClock(info.phaseSecondsLeft)}   Round ${info.roundNumber}   ${info.scoreTeam0} - ${info.scoreTeam1}   [${teamName}]`;
+      phaseLabel.textContent = phaseName;
+      clockLabel.textContent = formatClock(info.phaseSecondsLeft);
+      scoreLabel.textContent = `${info.scoreTeam0}  —  ${info.scoreTeam1}`;
+      contextLabel.textContent = `R${info.roundNumber} · ${teamName}`;
 
-      if (info.spikeState === 2) {
+      // Match events can arrive before their matching phase snapshot. Wait
+      // until the authoritative end phase has actually been observed, then
+      // clear only when play advances into the next phase/new match.
+      if (bannerKind === "round") {
+        if (info.matchPhase === 3) bannerObservedAuthoritativePhase = true;
+        else if (bannerObservedAuthoritativePhase && info.matchPhase === 1) hideBanner();
+      } else if (bannerKind === "match") {
+        if (info.matchPhase === 4) bannerObservedAuthoritativePhase = true;
+        else if (bannerObservedAuthoritativePhase) hideBanner();
+      }
+      lastMatchPhase = info.matchPhase;
+
+      const roundActive = info.matchPhase === 2;
+      const canCarrySpike = info.matchPhase === 1 || roundActive;
+      if (roundActive && info.spikeState === 2) {
         spikeHud.textContent = `SPIKE PLANTED  ${formatClock(info.detonateSecondsLeft)}`;
-      } else if (info.isCarrier) {
+      } else if (canCarrySpike && info.isCarrier) {
         spikeHud.textContent = "CARRYING THE SPIKE";
       } else {
         spikeHud.textContent = "";
       }
 
-      if (info.ownChannelProgress01 !== null) {
+      if (roundActive && info.ownChannelProgress01 !== null) {
         progressBar.style.display = "block";
         progressFill.style.width = `${Math.round(info.ownChannelProgress01 * 100)}%`;
         progressFill.style.background = info.ownChannelKind === "defuse" ? "#4dafff" : "#ffd54a";
@@ -773,9 +989,13 @@ export function createMatchHud(): MatchHudView {
       const winnerName = winnerTeam === 0 ? "ATTACKERS" : "DEFENDERS";
       banner.textContent = `${winnerName} WIN — ${REASON_NAMES[reason] ?? ""}${myTeam !== 255 ? (won ? "  (you won)" : "  (you lost)") : ""}`;
       banner.style.display = "block";
+      bannerKind = "round";
+      bannerObservedAuthoritativePhase = lastMatchPhase === 3;
       if (bannerTimeout) clearTimeout(bannerTimeout);
       bannerTimeout = setTimeout(() => {
         banner.style.display = "none";
+        bannerKind = null;
+        bannerObservedAuthoritativePhase = false;
       }, 4500);
     },
     showMatchEnd(scoreTeam0, scoreTeam1, myTeam) {
@@ -784,6 +1004,8 @@ export function createMatchHud(): MatchHudView {
       const won = leader === myTeam;
       banner.textContent = `MATCH OVER — ${scoreTeam0} : ${scoreTeam1}${myTeam !== 255 ? (won ? "  YOU WIN" : "  YOU LOSE") : ""}`;
       banner.style.display = "block";
+      bannerKind = "match";
+      bannerObservedAuthoritativePhase = lastMatchPhase === 4;
     },
   };
 }
@@ -795,6 +1017,7 @@ export interface SpectateOverlay {
 
 export function createSpectateOverlay(): SpectateOverlay {
   const el = document.createElement("div");
+  el.className = "vg-hud vg-spectate-label";
   el.style.position = "fixed";
   el.style.bottom = "60px";
   el.style.left = "50%";
@@ -820,11 +1043,14 @@ export function createSpectateOverlay(): SpectateOverlay {
 /** Reconnect banner ("reconnecting…"), shown while net.ts's auto-retry loop is active. */
 export function createReconnectBanner(): { setVisible(visible: boolean): void } {
   const el = document.createElement("div");
+  el.className = "vg-hud vg-reconnect-banner";
+  el.setAttribute("role", "alert");
   el.style.position = "fixed";
   el.style.top = "50%";
   el.style.left = "50%";
   el.style.transform = "translate(-50%, -50%)";
-  el.style.zIndex = "20";
+  el.style.zIndex = "40";
+  el.style.pointerEvents = "none";
   el.style.font = "bold 20px monospace";
   el.style.color = "#fff";
   el.style.background = "rgba(0,0,0,0.7)";
@@ -854,6 +1080,8 @@ export interface MinimapPing {
 }
 
 export interface Minimap {
+  /** Match-only by default; callers opt in for modes that have meaningful team information. */
+  setVisible(visible: boolean): void;
   update(state: {
     self: MinimapPlayerMarker | null;
     teammates: readonly MinimapPlayerMarker[];
@@ -863,11 +1091,11 @@ export interface Minimap {
   }): void;
 }
 
-const MINIMAP_SIZE_PX = 220;
+const MINIMAP_FALLBACK_SIZE_PX = 200;
 const MINIMAP_PING_LIFETIME_MS = 5000;
 
 /**
- * ~220px top-down minimap, top-left: a prerendered outline of `boxes` (drawn
+ * Responsive top-down minimap, top-left: a prerendered outline of `boxes` (drawn
  * once), then per-frame overlay of self (arrow), living teammates (dots),
  * visible enemies (red dots, per the server's team-shared visibility mask —
  * see @vg/server ServerHost.updateVisibility()), the spike marker, and
@@ -880,92 +1108,131 @@ export function createMinimap(boxes: readonly Box[] = LEVEL_BOXES): Minimap {
   const WORLD_HALF_EXTENT = LEVEL_HALF_EXTENT + 1; // small margin so perimeter walls don't touch the canvas edge
 
   const canvas = document.createElement("canvas");
-  canvas.width = MINIMAP_SIZE_PX;
-  canvas.height = MINIMAP_SIZE_PX;
+  canvas.className = "vg-minimap";
+  canvas.setAttribute("role", "img");
+  canvas.setAttribute("aria-label", "Tactical minimap, north is up");
   canvas.style.position = "fixed";
-  canvas.style.top = "8px";
-  canvas.style.left = "8px";
   canvas.style.zIndex = "10";
-  canvas.style.background = "rgba(0,0,0,0.5)";
-  canvas.style.border = "1px solid rgba(255,255,255,0.4)";
   document.body.appendChild(canvas);
   const ctx = canvas.getContext("2d")!;
 
-  function worldToCanvas(x: number, z: number): { cx: number; cz: number } {
-    return {
-      cx: ((x + WORLD_HALF_EXTENT) / (WORLD_HALF_EXTENT * 2)) * MINIMAP_SIZE_PX,
-      cz: ((z + WORLD_HALF_EXTENT) / (WORLD_HALF_EXTENT * 2)) * MINIMAP_SIZE_PX,
-    };
+  const outline = document.createElement("canvas");
+  const octx = outline.getContext("2d")!;
+  let logicalSize = MINIMAP_FALLBACK_SIZE_PX;
+  let visible = false;
+
+  function worldToCanvas(x: number, z: number): { cx: number; cy: number } {
+    const point = worldToMinimapPoint(x, z, WORLD_HALF_EXTENT, logicalSize);
+    return { cx: point.x, cy: point.y };
   }
 
-  // Prerendered outline layer (drawn once — the level's static footprint never changes).
-  const outline = document.createElement("canvas");
-  outline.width = MINIMAP_SIZE_PX;
-  outline.height = MINIMAP_SIZE_PX;
-  const octx = outline.getContext("2d")!;
-  octx.fillStyle = "rgba(255,255,255,0.08)";
-  octx.strokeStyle = "rgba(255,255,255,0.35)";
-  for (const box of boxes) {
-    const a = worldToCanvas(box.minX, box.minZ);
-    const b = worldToCanvas(box.maxX, box.maxZ);
-    const w = b.cx - a.cx;
-    const h = b.cz - a.cz;
-    octx.fillRect(a.cx, a.cz, w, h);
-    octx.strokeRect(a.cx, a.cz, w, h);
+  function drawOutline(): void {
+    octx.clearRect(0, 0, logicalSize, logicalSize);
+    octx.fillStyle = "rgba(215,225,230,0.07)";
+    octx.strokeStyle = "rgba(215,225,230,0.28)";
+    octx.lineWidth = 0.75;
+    for (const box of boxes) {
+      const a = worldToCanvas(box.minX, box.minZ);
+      const b = worldToCanvas(box.maxX, box.maxZ);
+      const left = Math.min(a.cx, b.cx);
+      const top = Math.min(a.cy, b.cy);
+      const width = Math.abs(b.cx - a.cx);
+      const height = Math.abs(b.cy - a.cy);
+      octx.fillRect(left, top, width, height);
+      octx.strokeRect(left, top, width, height);
+    }
+
+    // A tiny north index makes the corrected +Z/up orientation legible at a glance.
+    octx.fillStyle = "rgba(255,255,255,0.72)";
+    octx.font = "600 9px system-ui, sans-serif";
+    octx.textAlign = "center";
+    octx.textBaseline = "top";
+    octx.fillText("N", logicalSize / 2, 5);
   }
+
+  function resizeBackingStore(): void {
+    const measured = Math.round(canvas.getBoundingClientRect().width);
+    const nextLogicalSize = measured > 0 ? measured : MINIMAP_FALLBACK_SIZE_PX;
+    const backingSize = minimapBackingStoreSize(nextLogicalSize, window.devicePixelRatio);
+    if (canvas.width === backingSize && logicalSize === nextLogicalSize) return;
+
+    logicalSize = nextLogicalSize;
+    canvas.width = backingSize;
+    canvas.height = backingSize;
+    outline.width = backingSize;
+    outline.height = backingSize;
+    const backingScale = backingSize / logicalSize;
+    ctx.setTransform(backingScale, 0, 0, backingScale, 0, 0);
+    octx.setTransform(backingScale, 0, 0, backingScale, 0, 0);
+    drawOutline();
+  }
+
+  // Configure once while the element participates in layout, then keep it
+  // hidden until match mode explicitly enables it.
+  resizeBackingStore();
+  canvas.hidden = true;
+  window.addEventListener("resize", resizeBackingStore);
+  if (typeof ResizeObserver !== "undefined") new ResizeObserver(resizeBackingStore).observe(canvas);
 
   return {
+    setVisible(nextVisible) {
+      if (visible === nextVisible) return;
+      visible = nextVisible;
+      canvas.hidden = !visible;
+      if (visible) resizeBackingStore();
+    },
     update({ self, teammates, visibleEnemies, spike, pings }) {
-      ctx.clearRect(0, 0, MINIMAP_SIZE_PX, MINIMAP_SIZE_PX);
-      ctx.drawImage(outline, 0, 0);
+      if (!visible) return;
+      ctx.clearRect(0, 0, logicalSize, logicalSize);
+      ctx.drawImage(outline, 0, 0, logicalSize, logicalSize);
 
       for (const ping of pings) {
         if (ping.ageMs > MINIMAP_PING_LIFETIME_MS) continue;
-        const { cx, cz } = worldToCanvas(ping.x, ping.z);
+        const { cx, cy } = worldToCanvas(ping.x, ping.z);
         const alpha = 1 - ping.ageMs / MINIMAP_PING_LIFETIME_MS;
         ctx.strokeStyle = `rgba(255,220,80,${alpha})`;
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(cx, cz, 6 + (1 - alpha) * 6, 0, Math.PI * 2);
+        ctx.arc(cx, cy, 6 + (1 - alpha) * 6, 0, Math.PI * 2);
         ctx.stroke();
       }
 
       if (spike) {
-        const { cx, cz } = worldToCanvas(spike.x, spike.z);
+        const { cx, cy } = worldToCanvas(spike.x, spike.z);
         ctx.fillStyle = spike.state === 2 ? "#ff3b3b" : "#ffd54a";
         ctx.beginPath();
-        ctx.arc(cx, cz, spike.state === 2 ? 5 : 4, 0, Math.PI * 2);
+        ctx.arc(cx, cy, spike.state === 2 ? 5 : 4, 0, Math.PI * 2);
         ctx.fill();
         if (spike.state === 2) {
           ctx.strokeStyle = "rgba(255,59,59,0.6)";
           ctx.lineWidth = 1;
           ctx.beginPath();
-          ctx.arc(cx, cz, 9, 0, Math.PI * 2);
+          ctx.arc(cx, cy, 9, 0, Math.PI * 2);
           ctx.stroke();
         }
       }
 
       ctx.fillStyle = "#3fa7ff";
       for (const t of teammates) {
-        const { cx, cz } = worldToCanvas(t.x, t.z);
+        const { cx, cy } = worldToCanvas(t.x, t.z);
         ctx.beginPath();
-        ctx.arc(cx, cz, 3, 0, Math.PI * 2);
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
         ctx.fill();
       }
 
       ctx.fillStyle = "#ff3b3b";
       for (const e of visibleEnemies) {
-        const { cx, cz } = worldToCanvas(e.x, e.z);
+        const { cx, cy } = worldToCanvas(e.x, e.z);
         ctx.beginPath();
-        ctx.arc(cx, cz, 3, 0, Math.PI * 2);
+        ctx.arc(cx, cy, 3, 0, Math.PI * 2);
         ctx.fill();
       }
 
       if (self) {
-        const { cx, cz } = worldToCanvas(self.x, self.z);
+        const { cx, cy } = worldToCanvas(self.x, self.z);
         const yaw = self.yaw ?? 0;
         ctx.save();
-        ctx.translate(cx, cz);
+        ctx.translate(cx, cy);
         ctx.rotate(yaw);
         ctx.fillStyle = "#ffffff";
         ctx.beginPath();
@@ -998,6 +1265,8 @@ export interface AgentSelectOverlay {
 
 export function createAgentSelectOverlay(onPick: (agentId: number) => void): AgentSelectOverlay {
   const overlay = document.createElement("div");
+  overlay.className = "vg-hud vg-modal-backdrop";
+  overlay.setAttribute("aria-hidden", "true");
   overlay.style.position = "fixed";
   overlay.style.inset = "0";
   overlay.style.zIndex = "25";
@@ -1009,6 +1278,11 @@ export function createAgentSelectOverlay(onPick: (agentId: number) => void): Age
   overlay.style.color = "#fff";
 
   const panel = document.createElement("div");
+  panel.className = "vg-panel vg-agent-panel";
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+  panel.setAttribute("aria-labelledby", "vg-agent-select-title");
+  panel.tabIndex = -1;
   panel.style.background = "#1c1f24";
   panel.style.border = "1px solid #444";
   panel.style.borderRadius = "6px";
@@ -1019,26 +1293,38 @@ export function createAgentSelectOverlay(onPick: (agentId: number) => void): Age
   overlay.appendChild(panel);
 
   const title = document.createElement("div");
+  title.className = "vg-panel__title";
+  title.id = "vg-agent-select-title";
   title.textContent = "SELECT AGENT (waiting for match start)";
   title.style.marginBottom = "6px";
   title.style.opacity = "0.85";
   panel.appendChild(title);
 
   const rows = AGENT_INFO.map((agent) => {
-    const row = document.createElement("div");
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "vg-agent-panel__row";
+    row.setAttribute("aria-pressed", "false");
     row.style.padding = "8px 10px";
     row.style.borderRadius = "4px";
     row.style.cursor = "pointer";
     row.style.border = "1px solid transparent";
-    row.style.minWidth = "360px";
-    const heading = document.createElement("div");
+    row.style.width = "100%";
+    row.style.background = "transparent";
+    row.style.color = "inherit";
+    row.style.font = "inherit";
+    row.style.textAlign = "left";
+    const heading = document.createElement("span");
+    heading.style.display = "block";
     heading.textContent = `${agent.name} — ${agent.role}`;
     heading.style.fontWeight = "bold";
-    const blurb = document.createElement("div");
+    const blurb = document.createElement("span");
+    blurb.style.display = "block";
     blurb.textContent = agent.blurb;
     blurb.style.opacity = "0.75";
     blurb.style.fontSize = "12px";
-    const takenLabel = document.createElement("div");
+    const takenLabel = document.createElement("span");
+    takenLabel.style.display = "block";
     takenLabel.style.fontSize = "11px";
     takenLabel.style.color = "#ffd54a";
     row.append(heading, blurb, takenLabel);
@@ -1050,10 +1336,22 @@ export function createAgentSelectOverlay(onPick: (agentId: number) => void): Age
   });
 
   document.body.appendChild(overlay);
+  let open = false;
+  let previouslyFocused: HTMLElement | null = null;
 
   return {
-    setOpen(open: boolean) {
+    setOpen(nextOpen: boolean) {
+      if (open === nextOpen) return;
+      open = nextOpen;
       overlay.style.display = open ? "flex" : "none";
+      overlay.setAttribute("aria-hidden", String(!open));
+      if (open) {
+        previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        (rows.find(({ row }) => !row.disabled)?.row ?? panel).focus();
+      } else if (previouslyFocused) {
+        previouslyFocused.focus();
+        previouslyFocused = null;
+      }
     },
     setPicks(picks, teams, localIndex, myAgentId) {
       const localTeam = teams[localIndex] ?? 255;
@@ -1071,6 +1369,9 @@ export function createAgentSelectOverlay(onPick: (agentId: number) => void): Age
         const isMine = myAgentId === agentId;
         row.style.opacity = takenByTeammate && !isMine ? "0.35" : "1";
         row.style.borderColor = isMine ? "#4dafff" : "transparent";
+        row.disabled = takenByTeammate && !isMine;
+        row.style.cursor = row.disabled ? "not-allowed" : "pointer";
+        row.setAttribute("aria-pressed", String(isMine));
         takenLabel.textContent = isMine ? "— your pick" : takenByTeammate ? `— taken by teammate P${pickerIndex}` : "";
       }
     },
@@ -1081,17 +1382,17 @@ const ABILITY_SLOT_KEYS = ["C", "Q", "F", "X"] as const;
 
 /** Bottom ability bar: 4 slots (basic1/basic2/signature/ult) with charge counts and ult N/cost dots. */
 export interface AbilityHud {
+  /** Matches combat HUD phase gating; agent data may keep updating while hidden. */
+  setVisible(visible: boolean): void;
   update(info: { agentId: number; charges: readonly [number, number, number, number]; ultPoints: number }): void;
 }
 
 export function createAbilityHud(): AbilityHud {
   const container = document.createElement("div");
+  container.className = "vg-hud vg-ability-hud";
   container.style.position = "fixed";
-  container.style.bottom = "50px";
-  container.style.left = "50%";
-  container.style.transform = "translateX(-50%)";
   container.style.zIndex = "10";
-  container.style.display = "flex";
+  container.style.display = "none";
   container.style.gap = "8px";
   container.style.font = "12px monospace";
   container.style.color = "#fff";
@@ -1100,6 +1401,7 @@ export function createAbilityHud(): AbilityHud {
 
   const slots = ABILITY_SLOT_KEYS.map((key) => {
     const box = document.createElement("div");
+    box.className = "vg-ability-hud__slot";
     box.style.background = "rgba(0,0,0,0.4)";
     box.style.border = "1px solid rgba(255,255,255,0.35)";
     box.style.borderRadius = "4px";
@@ -1116,13 +1418,22 @@ export function createAbilityHud(): AbilityHud {
     return { box, valueLabel };
   });
 
+  let visible = false;
+  let hasAgent = false;
+
+  function syncVisibility(): void {
+    container.style.display = visible && hasAgent ? "flex" : "none";
+  }
+
   return {
+    setVisible(nextVisible) {
+      visible = nextVisible;
+      syncVisibility();
+    },
     update({ agentId, charges, ultPoints }) {
-      if (agentId === AGENT_NONE) {
-        container.style.display = "none";
-        return;
-      }
-      container.style.display = "flex";
+      hasAgent = agentId !== AGENT_NONE;
+      syncVisibility();
+      if (!hasAgent) return;
       const def = AGENT_INFO.find((a) => a.id === agentId);
       const abilities = ABILITIES.filter((a) => a.agentId === agentId).sort((a, b) => a.slot - b.slot);
       for (let slot = 0; slot < 4; slot++) {

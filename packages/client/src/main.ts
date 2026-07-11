@@ -22,6 +22,7 @@ import {
   MODE_MATCH,
   NO_PLAYER,
   PHASE_BUY,
+  PHASE_ROUND,
   PHASE_WAITING,
   RUN_SPEED,
   SPIKE_CARRIED,
@@ -31,7 +32,6 @@ import {
   eyePosition,
   getActiveWeaponId,
   getCombatWeaponDef,
-  getWeaponDef,
   livingTeammates,
   raycastBoxes,
   shotDirection,
@@ -39,7 +39,20 @@ import {
   viewDirection,
   type SimState,
 } from "@vg/sim";
-import { buildInputFrame, getPitch, getYaw, onBuyKeyPressed, onBuyMenuToggle, setLookSensitivityMultiplier, setupInput } from "./input.js";
+import {
+  buildInputFrame,
+  getPitch,
+  getYaw,
+  isBuyMenuOpen,
+  isInterfaceOverlayOpen,
+  onBuyKeyPressed,
+  onBuyMenuToggle,
+  setBuyMenuAvailable,
+  setInterfaceOverlayOpen,
+  setLookAngles,
+  setLookSensitivityMultiplier,
+  setupInput,
+} from "./input.js";
 import { GRAYBOX_BOXES, SPAWN_POSITION, buildLevelDressing } from "./graybox.js";
 import {
   createAbilityEntityRenderer,
@@ -47,6 +60,7 @@ import {
   createAgentSelectOverlay,
   createBuyMenu,
   createCombatHud,
+  createCrosshair,
   createDamageDirectionIndicator,
   createFlashOverlay,
   createFpsCounter,
@@ -66,6 +80,7 @@ import {
 import { createMaterialSet } from "./materials.js";
 import { createViewmodel, weaponClassFor } from "./viewmodel.js";
 import { createDeathMarkerPool, createImpactSparksPool, createMuzzleFlashPool, createSpikeBeacon } from "./vfx.js";
+import { createBuyPhaseBarrierRenderer, createDroppedWeaponRenderer } from "./worldGameplayVisuals.js";
 import { createAudioEngine } from "./audio/engine.js";
 import type { AbilityCue } from "./audio/synth.js";
 import { ANNOUNCER_LINES, createAnnouncer } from "./audio/announcer.js";
@@ -73,9 +88,15 @@ import { DEFAULT_VOLUME_SETTINGS, loadVolumeSettings, saveVolumeSettings } from 
 import { FOOTSTEP_MAX_AUDIBLE_M, createFootstepTracker, isFootstepAudible, updateFootstepTracker } from "./audio/footsteps.js";
 import { createSettingsOverlay } from "./settingsOverlay.js";
 import { connectNetClient, type NetClient } from "./net.js";
+import { getShotPresentationWeapon } from "./shotPresentation.js";
+import { spawnLookTarget } from "./spawnLook.js";
 
 const canvas = document.getElementById("app") as HTMLCanvasElement;
 setupInput(canvas);
+// Begin the network handshake before model decoding, shader compilation, and
+// the first heavy render frames. Slow GPUs should not make a healthy server
+// look unreachable simply because visual startup work occupied the main thread.
+const netClientConnection = connectNetClient();
 
 const { renderer, scene, camera } = createScene(canvas);
 const viewmodel = createViewmodel(camera);
@@ -88,6 +109,7 @@ buildLevelDressing(scene, GRAYBOX_BOXES, materials);
 
 // M5: Web Audio engine (gracefully no-ops if Web Audio is unavailable) +
 // persisted volume settings + a minimal settings overlay (gear icon / N key).
+let agentSelectionOpen = false;
 const audioEngine = createAudioEngine();
 audioEngine.resumeOnGesture(canvas);
 let volumeSettings = loadVolumeSettings(window.localStorage);
@@ -98,11 +120,16 @@ function applyVolumeSettings(s: typeof volumeSettings): void {
   audioEngine.setMuteWhenTabHidden(s.muteWhenTabHidden);
 }
 applyVolumeSettings(volumeSettings);
-createSettingsOverlay(volumeSettings, (next) => {
-  volumeSettings = next;
-  applyVolumeSettings(next);
-  saveVolumeSettings(window.localStorage, next);
-});
+const settingsOverlay = createSettingsOverlay(
+  volumeSettings,
+  (next) => {
+    volumeSettings = next;
+    applyVolumeSettings(next);
+    saveVolumeSettings(window.localStorage, next);
+  },
+  (open) => setInterfaceOverlayOpen(open, "settings"),
+  () => !agentSelectionOpen,
+);
 
 // M5: announcer — SpeechSynthesis if available with voices loaded, else a
 // tone-stinger fallback (see audio/announcer.ts's feature-detect).
@@ -121,8 +148,12 @@ const muzzleFlashPool = createMuzzleFlashPool(scene);
 const impactSparksPool = createImpactSparksPool(scene);
 const deathMarkerPool = createDeathMarkerPool(scene);
 const spikeBeacon = createSpikeBeacon(scene);
+const droppedWeaponRenderer = createDroppedWeaponRenderer(scene);
+const buyPhaseBarriers = createBuyPhaseBarrierRenderer(scene);
+const impactPoint = new THREE.Vector3();
 
 const fpsCounter = createFpsCounter();
+const crosshair = createCrosshair();
 const hitFlash = createHitFlashOverlay();
 const hitmarker = createHitmarker();
 const killFeed = createKillFeed((i) => `P${i}`);
@@ -232,13 +263,17 @@ function startOffline(): void {
   offlineState.posY[0] = SPAWN_POSITION.y;
   offlineState.posZ[0] = SPAWN_POSITION.z;
   offlinePreviousState = offlineState;
+  setBuyMenuAvailable(true);
 }
 
-connectNetClient().then((client) => {
+netClientConnection.then((client) => {
   if (client) {
     netClient = client;
     client.onPredictedHit(() => {
       hitmarker.showPredicted();
+    });
+    client.onPredictedShotImpact((impact) => {
+      impactSparksPool.spawn(impactPoint.set(impact.x, impact.y, impact.z));
     });
     client.onConfirmedHit(({ damage, region }) => {
       hitmarker.showConfirmed(damage);
@@ -309,7 +344,7 @@ connectNetClient().then((client) => {
     console.log("[net] connected, playing online");
   } else {
     // eslint-disable-next-line no-console
-    console.log("[net] offline (no server reachable within 2s) — falling back to single-player");
+    console.log("[net] offline (no server reachable within 5s) — falling back to single-player");
     startOffline();
   }
 });
@@ -320,6 +355,7 @@ connectNetClient().then((client) => {
 // (offline) or by PredictedClient's own render-position smoothing (online).
 let accumulator = 0;
 let lastFrameTime = performance.now();
+let lookSyncKey: string | null = null;
 
 const MAX_FRAME_TIME = 0.25; // clamp to avoid a "spiral of death" after a stall (tab backgrounding, breakpoints, etc.)
 
@@ -388,9 +424,13 @@ function syncRemoteProxies(): void {
 let currentFov = 90;
 let adsSensitivityMult = 1;
 
+function isGameplayPresentationActive(state: SimState): boolean {
+  return state.mode !== MODE_MATCH || state.matchPhase === PHASE_BUY || state.matchPhase === PHASE_ROUND;
+}
+
 function zoomForStage(weaponId: number, adsStage: number): number {
   if (adsStage === 0) return 1;
-  const weapon = getWeaponDef(weaponId);
+  const weapon = getCombatWeaponDef(weaponId);
   if (!weapon) return 1;
   return weapon.adsZoomStages[adsStage - 1] ?? 1;
 }
@@ -401,8 +441,10 @@ function updateAds(frameSeconds: number): void {
   const state = netClient.getPredictedState();
   if (localIndex === null || !state) return;
 
-  const weaponId = state.activeSlot[localIndex] === 0 ? state.weaponPrimary[localIndex]! : state.weaponSecondary[localIndex]!;
-  const zoom = weaponId === WEAPON_NONE ? 1 : zoomForStage(weaponId, state.adsStage[localIndex]!);
+  const weaponId = getActiveWeaponId(state, localIndex);
+  const adsAllowed = state.alive[localIndex] === 1 && isGameplayPresentationActive(state);
+  const adsStage = adsAllowed ? state.adsStage[localIndex]! : 0;
+  const zoom = weaponId === WEAPON_NONE ? 1 : zoomForStage(weaponId, adsStage);
   const targetFov = 90 / zoom;
 
   // ~100ms smoothing: exponential approach with a time-constant tuned so it
@@ -426,7 +468,7 @@ function fireLocalTracersAndHitmarkers(): void {
 
   const origin = eyePosition(state, localIndex);
   for (const shot of shots) {
-    const weapon = getWeaponDef(shot.weaponId);
+    const weapon = getShotPresentationWeapon(shot.weaponId);
     if (!weapon) continue;
     const dir = shotDirection(state, localIndex, weapon, shot.shotIndex, shot.sprayIndex);
     const from = new THREE.Vector3(origin.x, origin.y, origin.z);
@@ -453,7 +495,7 @@ function updateViewmodel(state: SimState, localIndex: number, nowSeconds: number
     reloadProgress01 = 1 - Math.max(0, reloadEnd - state.tick) / weapon.reloadTicks;
   }
 
-  const adsStage = state.adsStage[localIndex]!;
+  const adsStage = state.alive[localIndex] === 1 && isGameplayPresentationActive(state) ? state.adsStage[localIndex]! : 0;
   viewmodel.update({
     timeSeconds: nowSeconds,
     dtSeconds: frameSeconds,
@@ -488,12 +530,24 @@ function updateHud(): void {
   const state = netClient.getPredictedState();
   if (localIndex === null || !state) return;
 
-  const weaponId = state.activeSlot[localIndex] === 0 ? state.weaponPrimary[localIndex]! : state.weaponSecondary[localIndex]!;
-  const weapon = getWeaponDef(weaponId);
-  const mag = state.activeSlot[localIndex] === 0 ? state.magPrimary[localIndex]! : state.magSecondary[localIndex]!;
-  const reserve = state.activeSlot[localIndex] === 0 ? state.reservePrimary[localIndex]! : state.reserveSecondary[localIndex]!;
+  const activeSlot = state.activeSlot[localIndex]!;
+  const weaponId = getActiveWeaponId(state, localIndex);
+  const weapon = getCombatWeaponDef(weaponId);
+  const mag = activeSlot === 0 ? state.magPrimary[localIndex]! : activeSlot === 1 ? state.magSecondary[localIndex]! : state.magUlt[localIndex]!;
+  const reserve = activeSlot === 0 ? state.reservePrimary[localIndex]! : activeSlot === 1 ? state.reserveSecondary[localIndex]! : 0;
   const alive = state.alive[localIndex] === 1;
   const respawnTicksLeft = alive ? 0 : Math.max(0, state.respawnTick[localIndex]! - state.tick);
+  const isBuyPhase = state.mode === MODE_MATCH && state.matchPhase === PHASE_BUY;
+  const gameplayPresentationActive = isGameplayPresentationActive(state);
+
+  setBuyMenuAvailable(state.mode !== MODE_MATCH || isBuyPhase);
+  minimap.setVisible(state.mode === MODE_MATCH && gameplayPresentationActive);
+  combatHud.setVisible(gameplayPresentationActive);
+  abilityHud.setVisible(gameplayPresentationActive);
+  crosshair.setVisible(alive && gameplayPresentationActive && !isBuyMenuOpen() && !isInterfaceOverlayOpen());
+  // Non-sniper ADS keeps the hip reticle until a dedicated weapon sight is
+  // authored. Longbow already owns a fullscreen scope overlay.
+  crosshair.setAds(weaponClassFor(weaponId) === "sniper" && state.adsStage[localIndex]! > 0);
 
   combatHud.update({
     health: state.health[localIndex]!,
@@ -519,14 +573,20 @@ function updateHud(): void {
     ultPoints: state.ultPoints[localIndex]!,
   });
   const flashedTicksLeft = Math.max(0, state.flashedUntilTick[localIndex]! - state.tick);
-  flashOverlay.update(flashedTicksLeft, state.flashIntensity[localIndex]!);
+  flashOverlay.update(gameplayPresentationActive ? flashedTicksLeft : 0, state.flashIntensity[localIndex]!);
   abilityEntities.sync(state);
 
   const inWaitingPhase = state.mode === MODE_MATCH && state.matchPhase === PHASE_WAITING;
   const myAgentId = state.agentId[localIndex]!;
   // Close once the local player has picked — staying open for the whole
   // waiting phase blocked the view after selection (reopen only if unpicked).
-  agentSelect.setOpen(inWaitingPhase && myAgentId === AGENT_NONE);
+  const nextAgentSelectionOpen = inWaitingPhase && myAgentId === AGENT_NONE;
+  // Register the mandatory picker before closing Settings so aggregate modal
+  // ownership never briefly re-locks the pointer between the two surfaces.
+  setInterfaceOverlayOpen(nextAgentSelectionOpen, "agent-select");
+  if (nextAgentSelectionOpen) settingsOverlay.setOpen(false);
+  agentSelectionOpen = nextAgentSelectionOpen;
+  agentSelect.setOpen(nextAgentSelectionOpen);
   if (inWaitingPhase) {
     const picks = Array.from(state.agentId);
     const teams = Array.from(state.team);
@@ -580,7 +640,7 @@ function updateHud(): void {
     ownChannelKind,
   });
 
-  buyMenu.setMatchState(purchasedItemIds(state, localIndex), state.matchPhase === PHASE_BUY);
+  buyMenu.setMatchState(purchasedItemIds(state, localIndex), isBuyPhase);
 
   // ---- Minimap ----
   const nowMs = performance.now();
@@ -619,7 +679,7 @@ function updateHud(): void {
   }
 
   // ---- Spectate overlay ----
-  if (!alive) {
+  if (gameplayPresentationActive && !alive) {
     const mates = livingTeammates(state, localIndex);
     if (spectateIndex === null || !mates.includes(spectateIndex)) spectateIndex = mates[0] ?? null;
     spectateOverlay.update(spectateIndex, mates.length === 0);
@@ -638,6 +698,37 @@ function purchasedItemIds(state: SimState, localIndex: number): Set<number> {
   return out;
 }
 
+/**
+ * Match round setup teleports players and assigns a spawn yaw. Mouse-look
+ * state lives outside SimState, so synchronise it once per round before the
+ * first outgoing input can overwrite defenders' PI-facing spawn direction.
+ */
+function syncLookToSpawnIfNeeded(): void {
+  if (!netClient) return;
+  const state = netClient.getPredictedState();
+  const localIndex = netClient.getLocalIndex();
+  if (!state || localIndex === null) return;
+  const target = spawnLookTarget(state, localIndex);
+  if (!target || lookSyncKey === target.key) return;
+  setLookAngles(target.yaw, target.pitch);
+  lookSyncKey = target.key;
+}
+
+/** Keeps authoritative world gameplay objects visible independently of HUD updates. */
+function syncWorldGameplayVisuals(nowSeconds: number): void {
+  const state = netClient?.getPredictedState() ?? offlineState;
+  if (!state) {
+    spikeBeacon.sync(null, nowSeconds);
+    buyPhaseBarriers.sync(false, nowSeconds);
+    droppedWeaponRenderer.sync([], nowSeconds);
+    return;
+  }
+  const activeGameplayWorld = state.mode !== MODE_MATCH || state.matchPhase === PHASE_ROUND;
+  spikeBeacon.sync(activeGameplayWorld ? state : null, nowSeconds);
+  buyPhaseBarriers.sync(state.mode === MODE_MATCH && state.matchPhase === PHASE_BUY, nowSeconds);
+  droppedWeaponRenderer.sync(activeGameplayWorld ? (netClient?.getDroppedWeapons() ?? []) : [], nowSeconds);
+}
+
 function frame(now: number): void {
   requestAnimationFrame(frame);
 
@@ -652,11 +743,17 @@ function frame(now: number): void {
   let renderY = 0;
   let renderZ = 0;
   let eyeHeight = EYE_HEIGHT_STAND;
+  let firstPersonPresentationActive = !netClient?.isOnline();
 
   let spectateCameraOverride: { x: number; y: number; z: number; yaw: number; pitch: number } | null = null;
 
   if (netClient && netClient.isOnline()) {
+    syncLookToSpawnIfNeeded();
     while (accumulator >= FIXED_DT) {
+      // sendInput() advances prediction and can enter a new round. Checking
+      // on every accumulated step prevents a second same-frame tick from
+      // immediately overwriting the newly assigned spawn direction.
+      syncLookToSpawnIfNeeded();
       const input = buildInputFrame();
       netClient.sendInput(input);
       fireLocalTracersAndHitmarkers();
@@ -680,7 +777,10 @@ function frame(now: number): void {
     // livingTeammates()'s team filter, used to populate spectateIndex).
     const localIndex = netClient.getLocalIndex();
     const state = netClient.getPredictedState();
-    if (localIndex !== null && state) updateViewmodel(state, localIndex, now / 1000, frameSeconds);
+    if (localIndex !== null && state) {
+      firstPersonPresentationActive = state.alive[localIndex] === 1 && isGameplayPresentationActive(state);
+      updateViewmodel(state, localIndex, now / 1000, frameSeconds);
+    }
     if (localIndex !== null && state && state.alive[localIndex] === 0 && spectateIndex !== null) {
       const poses = netClient.getRemotePoses();
       const target = poses?.[spectateIndex];
@@ -710,7 +810,7 @@ function frame(now: number): void {
   }
 
   camera.rotation.order = "YXZ";
-  viewmodel.setVisible(!spectateCameraOverride);
+  viewmodel.setVisible(!spectateCameraOverride && firstPersonPresentationActive);
   if (spectateCameraOverride) {
     camera.position.set(spectateCameraOverride.x, spectateCameraOverride.y + EYE_HEIGHT_STAND, spectateCameraOverride.z);
     camera.rotation.y = spectateCameraOverride.yaw + Math.PI;
@@ -725,6 +825,14 @@ function frame(now: number): void {
     camera.rotation.x = getPitch();
   }
 
+  // Offline mode has no HUD-state update path, but modal input ownership must
+  // still hide the aiming reticle consistently.
+  if (!netClient?.isOnline()) {
+    crosshair.setVisible(!isInterfaceOverlayOpen() && !isBuyMenuOpen());
+    crosshair.setAds(false);
+  }
+
+  syncWorldGameplayVisuals(now / 1000);
   renderer.render(scene, camera);
 
   if (frameSeconds > 0) {
