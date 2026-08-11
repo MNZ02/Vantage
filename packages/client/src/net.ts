@@ -52,6 +52,7 @@ const CONNECT_TIMEOUT_MS = 5000;
 const INPUT_REDUNDANCY = 3; // newest + previous 2, see @vg/protocol InputBatch docs
 const FIRE_MAX_RANGE = 100; // mirrors the server's default (see ServerHostOptions.fireMaxRange)
 const RECONNECT_RETRY_INTERVAL_MS = 2000;
+const RECONNECT_ATTEMPT_TIMEOUT_MS = 5000;
 const RECONNECT_TOTAL_WINDOW_MS = 90_000; // matches the server's reconnectHoldMs default
 const SESSION_STORAGE_KEY = "vg_reconnect_session";
 
@@ -193,9 +194,17 @@ export interface NetClient {
 function parseServerUrl(): string {
   const params = new URLSearchParams(window.location.search);
   const override = params.get("server");
-  if (override) return override;
+  if (override) {
+    try {
+      const parsed = new URL(override, window.location.href);
+      if (parsed.protocol === "ws:" || parsed.protocol === "wss:") return parsed.href;
+    } catch {
+      /* fall through to the same-origin host default */
+    }
+  }
   const host = window.location.hostname || "localhost";
-  return `ws://${host}:8787`;
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${host}:8787`;
 }
 
 function maybeWrapWithFakeLag(transport: Transport): Transport {
@@ -220,6 +229,8 @@ function loadSavedSession(): { token: Uint8Array; url: string } | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as SavedSession;
     if (!Array.isArray(parsed.token) || parsed.token.length !== TOKEN_LENGTH || typeof parsed.url !== "string") return null;
+    const parsedUrl = new URL(parsed.url);
+    if (parsedUrl.protocol !== "ws:" && parsedUrl.protocol !== "wss:") return null;
     return { token: Uint8Array.from(parsed.token), url: parsed.url };
   } catch {
     return null;
@@ -321,7 +332,7 @@ export function connectNetClient(): Promise<NetClient | null> {
     let predicted: PredictedClient | null = null;
     let localIndex: number | null = null;
     let numPlayers = 0;
-    let currentUrl = url;
+    const currentUrl = url;
     let currentToken: Uint8Array = initialToken;
     let mode = 0;
     const interpolator = new RemoteInterpolator();
@@ -337,6 +348,7 @@ export function connectNetClient(): Promise<NetClient | null> {
     let matchHud: MatchHud = NULL_MATCH_HUD;
     let droppedWeapons: readonly SnapshotDroppedWeapon[] = [];
     let reconnecting = false;
+    let networkConnected = true;
     let userClosed = false;
     let currentTransport = transport;
 
@@ -438,12 +450,17 @@ export function connectNetClient(): Promise<NetClient | null> {
             abilityCharges: p.abilityCharges,
           })),
           abilityEntities: msg.abilityEntities.map((e) => ({
+            slot: e.slot,
             entType: e.entType,
             owner: e.owner,
             abilityId: e.abilityId,
             x: e.x,
             y: e.y,
             z: e.z,
+            velX: e.velX,
+            velY: e.velY,
+            velZ: e.velZ,
+            ageTicks: e.ageTicks,
             endTicksLeft: e.endTicksLeft,
             param: e.param,
           })),
@@ -570,6 +587,8 @@ export function connectNetClient(): Promise<NetClient | null> {
           return;
         }
         if (userClosed) return;
+        if (t !== currentTransport) return;
+        networkConnected = false;
         // Mid-match unexpected disconnect: auto-retry rather than falling
         // back to offline mode (that would silently strand the player out
         // of a live match). Only meaningful in match mode (mode carries the
@@ -580,32 +599,68 @@ export function connectNetClient(): Promise<NetClient | null> {
       });
     }
 
-    let reconnectTimer: ReturnType<typeof setInterval> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempt: Transport | null = null;
+    let reconnectAttemptTimeout: ReturnType<typeof setTimeout> | null = null;
     let reconnectDeadline = 0;
 
-    function startReconnectLoop(): void {
-      if (reconnectTimer) return;
-      reconnecting = true;
-      reconnectDeadline = performance.now() + RECONNECT_TOTAL_WINDOW_MS;
-      attemptReconnect();
-      reconnectTimer = setInterval(() => {
-        if (performance.now() > reconnectDeadline) {
-          if (reconnectTimer) clearInterval(reconnectTimer);
-          reconnectTimer = null;
-          reconnecting = false;
-          clearSavedSession();
-          return;
+    function clearReconnectAttempt(close: boolean): void {
+      if (reconnectAttemptTimeout) {
+        clearTimeout(reconnectAttemptTimeout);
+        reconnectAttemptTimeout = null;
+      }
+      const attempt = reconnectAttempt;
+      reconnectAttempt = null;
+      if (close && attempt) {
+        try {
+          attempt.close();
+        } catch {
+          /* already closed */
         }
+      }
+    }
+
+    function giveUpReconnect(): void {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      clearReconnectAttempt(true);
+      reconnecting = false;
+      networkConnected = false;
+      clearSavedSession();
+    }
+
+    function scheduleReconnect(delayMs: number): void {
+      if (!reconnecting || userClosed || reconnectTimer || reconnectAttempt) return;
+      if (performance.now() > reconnectDeadline) {
+        giveUpReconnect();
+        return;
+      }
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
         attemptReconnect();
-      }, RECONNECT_RETRY_INTERVAL_MS);
+      }, delayMs);
+    }
+
+    function startReconnectLoop(): void {
+      if (reconnecting || userClosed) return;
+      reconnecting = true;
+      networkConnected = false;
+      reconnectDeadline = performance.now() + RECONNECT_TOTAL_WINDOW_MS;
+      scheduleReconnect(0);
     }
 
     function attemptReconnect(): void {
+      if (!reconnecting || userClosed || reconnectAttempt) return;
+      if (performance.now() > reconnectDeadline) {
+        giveUpReconnect();
+        return;
+      }
       let retrySocket: WebSocket;
       try {
         retrySocket = new WebSocket(currentUrl);
       } catch {
-        return; // will retry again on the next tick of reconnectTimer
+        scheduleReconnect(RECONNECT_RETRY_INTERVAL_MS);
+        return;
       }
       retrySocket.addEventListener("open", () => {
         try {
@@ -616,16 +671,19 @@ export function connectNetClient(): Promise<NetClient | null> {
       });
       const retryRaw = new WebSocketTransport(retrySocket);
       const retryTransport = maybeWrapWithFakeLag(retryRaw);
+      reconnectAttempt = retryTransport;
+      reconnectAttemptTimeout = setTimeout(() => {
+        if (reconnectAttempt !== retryTransport) return;
+        clearReconnectAttempt(true);
+        scheduleReconnect(RECONNECT_RETRY_INTERVAL_MS);
+      }, RECONNECT_ATTEMPT_TIMEOUT_MS);
       let attached = false;
       retryTransport.onMessage((data) => {
         const msg = decodeMessageSafely(data);
         if (msg === null) return;
         if (msg.type === MessageType.Welcome && !attached) {
           attached = true;
-          if (reconnectTimer) {
-            clearInterval(reconnectTimer);
-            reconnectTimer = null;
-          }
+          clearReconnectAttempt(false);
           currentTransport = retryTransport;
           wireTransport(retryTransport);
           // Re-deliver this very Welcome to the freshly-wired handler (it
@@ -645,6 +703,7 @@ export function connectNetClient(): Promise<NetClient | null> {
           predicted = new PredictedClient(msg.seed, msg.numPlayers, msg.playerIndex, LEVEL_BOXES, msg.mode);
           inputHistory.length = 0; // input seqs restart at 0 with the fresh PredictedClient
           reconnecting = false;
+          networkConnected = true;
           if (msg.mode === MODE_MATCH && msg.token.some((b) => b !== 0)) {
             currentToken = msg.token;
             saveSession(msg.token, currentUrl);
@@ -652,15 +711,16 @@ export function connectNetClient(): Promise<NetClient | null> {
         }
       });
       retryTransport.onClose(() => {
-        // A rejected/failed retry attempt: just let the interval try again
-        // (or give up once reconnectDeadline passes).
+        if (attached || reconnectAttempt !== retryTransport) return;
+        clearReconnectAttempt(false);
+        scheduleReconnect(RECONNECT_RETRY_INTERVAL_MS);
       });
     }
 
     const client: NetClient = {
       isOnline: () => true,
       sendInput(input: InputFrame) {
-        if (!predicted || localIndex === null) return;
+        if (!predicted || localIndex === null || !networkConnected) return;
         // Send exactly the quantized input PredictedClient predicted
         // with (F4 fix) — not the raw one — so the wire bytes agree
         // bit-for-bit with what local prediction/replay assumed.
@@ -740,17 +800,21 @@ export function connectNetClient(): Promise<NetClient | null> {
       getRemotePoses: () => interpolator.sample(),
       getDroppedWeapons: () => droppedWeapons,
       getViewTick: () => Math.round(interpolator.getCurrentTargetTick()),
-      getLastLocalShots: () => (predicted ? predicted.getLastShots() : []),
+      getLastLocalShots: () => (networkConnected && predicted ? predicted.getLastShots() : []),
       buy(itemId: number) {
+        if (!networkConnected) return;
         currentTransport.send(encodeMessage({ type: MessageType.BuyCmd, itemId }));
       },
       sell(itemId: number) {
+        if (!networkConnected) return;
         currentTransport.send(encodeMessage({ type: MessageType.SellCmd, itemId }));
       },
       sendPing(x: number, z: number) {
+        if (!networkConnected) return;
         currentTransport.send(encodeMessage({ type: MessageType.MapPing, x, z }));
       },
       selectAgent(agentId: number) {
+        if (!networkConnected) return;
         currentTransport.send(encodeMessage({ type: MessageType.AgentSelectCmd, agentId }));
       },
       getMatchHud: () => matchHud,
@@ -787,7 +851,7 @@ export function connectNetClient(): Promise<NetClient | null> {
           correctionsWindowStart = now;
         }
         return {
-          connected: true,
+          connected: networkConnected,
           rttMs: rttEstimateMs,
           snapshotAgeMs: now - lastSnapshotAt,
           correctionsPerSecond,
@@ -799,9 +863,10 @@ export function connectNetClient(): Promise<NetClient | null> {
       close() {
         userClosed = true;
         if (reconnectTimer) {
-          clearInterval(reconnectTimer);
+          clearTimeout(reconnectTimer);
           reconnectTimer = null;
         }
+        clearReconnectAttempt(true);
         currentTransport.close();
         clearSavedSession();
       },

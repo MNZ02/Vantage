@@ -9,24 +9,42 @@
 //   NUM_PLAYERS / MIN_PLAYERS / MODE still work as before.
 //   Or: `pnpm --filter @vg/server dev:solo` / root `pnpm dev:solo` (server only).
 import { createServer } from "node:http";
-import { WebSocketTransport } from "@vg/protocol";
+import { WebSocketTransport, type Transport } from "@vg/protocol";
+import { MAX_PLAYERS } from "@vg/sim";
 import { WebSocketServer } from "ws";
 import { spawnBotFill } from "./botFill.js";
 import { ServerHost } from "./serverHost.js";
 
-const PORT = Number(process.env["PORT"] ?? 8787);
+function integerEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  const value = raw === undefined ? fallback : Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be an integer in [${min}, ${max}], received ${raw ?? String(fallback)}`);
+  }
+  return value;
+}
+
+const PORT = integerEnv("PORT", 8787, 1, 65_535);
+const MAX_BUFFERED_BYTES = 1 << 20;
 
 const solo = process.env["SOLO"] === "1";
-const botsEnv = process.env["BOTS"];
-const botCount = botsEnv !== undefined ? Math.max(0, Number(botsEnv)) : solo ? 9 : 0;
+const numPlayers = integerEnv("NUM_PLAYERS", 10, 1, MAX_PLAYERS);
+const botCount = integerEnv("BOTS", solo ? Math.min(9, numPlayers - 1) : 0, 0, Math.max(0, numPlayers - 1));
 
 // Match mode by default; MODE=dm for deathmatch sandbox.
-const mode = process.env["MODE"] === "dm" ? "dm" : "match";
-const numPlayers = Number(process.env["NUM_PLAYERS"] ?? (botCount > 0 || solo ? 10 : 10));
+const rawMode = process.env["MODE"] ?? "match";
+if (rawMode !== "dm" && rawMode !== "match") throw new RangeError(`MODE must be "dm" or "match", received ${rawMode}`);
+const mode = rawMode;
 // With bots: wait for bots + at least one human before startMatch (unless
 // MIN_PLAYERS is set explicitly). Without bots: keep the old default of 2.
-const defaultMin = botCount > 0 ? Math.min(numPlayers, botCount + 1) : 2;
-const minPlayers = Number(process.env["MIN_PLAYERS"] ?? defaultMin);
+const defaultMin = botCount > 0 ? Math.min(numPlayers, botCount + 1) : Math.min(2, numPlayers);
+const minPlayers = integerEnv("MIN_PLAYERS", defaultMin, 1, numPlayers);
+const allowedOrigins = new Set(
+  (process.env["ALLOWED_ORIGINS"] ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+);
 
 const httpServer = createServer((req, res) => {
   if (req.url === "/health") {
@@ -38,7 +56,7 @@ const httpServer = createServer((req, res) => {
   res.end();
 });
 
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server: httpServer, maxPayload: 4096, perMessageDeflate: false });
 const host = new ServerHost({ mode, numPlayers, minPlayers });
 
 // Spawn bots BEFORE human clients so free WS slots remain for the player.
@@ -53,8 +71,30 @@ if (botCount > 0) {
   );
 }
 
-wss.on("connection", (socket) => {
-  const transport = new WebSocketTransport(socket);
+wss.on("connection", (socket, request) => {
+  const origin = request.headers.origin;
+  if (allowedOrigins.size > 0 && (!origin || !allowedOrigins.has(origin))) {
+    socket.close(1008, "origin not allowed");
+    return;
+  }
+  socket.on("error", (error) => {
+    // eslint-disable-next-line no-console
+    console.warn("[server] websocket error:", error.message);
+  });
+  const rawTransport = new WebSocketTransport(socket);
+  const transport: Transport = {
+    send(data) {
+      if (socket.readyState !== 1) return;
+      if (socket.bufferedAmount > MAX_BUFFERED_BYTES) {
+        socket.close(1009, "client too slow");
+        return;
+      }
+      rawTransport.send(data);
+    },
+    onMessage: (cb) => rawTransport.onMessage(cb),
+    onClose: (cb) => rawTransport.onClose(cb),
+    close: () => rawTransport.close(),
+  };
   const playerIndex = host.connect(transport);
   if (playerIndex === -1) {
     // Match mode, no free slot: pending on this transport's first Hello to
@@ -89,3 +129,16 @@ httpServer.listen(PORT, () => {
     console.log(`[server] open the client (pnpm dev) — match starts when a human joins`);
   }
 });
+
+let shuttingDown = false;
+function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  host.stop();
+  botFill?.stop();
+  for (const socket of wss.clients) socket.close(1001, "server shutting down");
+  wss.close(() => httpServer.close());
+}
+
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);

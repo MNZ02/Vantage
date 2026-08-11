@@ -6,6 +6,7 @@ import {
   AGENT_ZEPHYR,
   CROUCH_HEIGHT,
   EYE_HEIGHT_STAND,
+  LEVEL_BOXES,
   MODE_MATCH,
   NORTH_WALL_Z,
   PHASE_BUY,
@@ -20,6 +21,7 @@ import {
   WEAPONS,
   createPrngState,
   nextRandom,
+  raycastBoxes,
 } from "@vg/sim";
 import { MessageType, decodeMessageSafely, encodeMessage, type InputSample, type ProtocolMessage, type Transport } from "@vg/protocol";
 
@@ -47,7 +49,34 @@ const DEFUSE_RANGE_M = 1.3; // a hair inside DEFUSE_RADIUS_M so bots don't hover
 const BURST_LEN_TICKS = 10;
 const BURST_GAP_TICKS = 25;
 const ENGAGE_RANGE_M = 40;
-const AIM_ERROR_RAD = 0.06; // "small error", per spec
+const AIM_ERROR_RAD = 0.06; // baseline at mid range for a mid-skill bot
+
+// ---- Perception model. Bots used to acquire any enemy within range + LOS
+// instantly, including directly behind them — omniscient within 40 m. Now an
+// enemy has to enter the bot's forward vision cone (or get close enough to be
+// heard), stay unobstructed, and survive a human-ish reaction delay before the
+// bot can open fire. All deterministic: geometry + the bot's own PRNG.
+/** Half-angle of the forward vision cone (about the last yaw the bot SENT). */
+const VISION_HALF_ANGLE_RAD = 1.05; // ≈60° each side, 120° cone
+/** Inside this range, footsteps give the enemy away regardless of facing (LOS still required — hearing is not a wallhack). */
+const HEARING_RADIUS_M = 9;
+/** How long a lost target stays in memory (bot keeps watching the last-seen spot instead of instantly forgetting). */
+const TARGET_MEMORY_TICKS = 96; // 1.5 s @ 64 Hz
+
+/**
+ * Below this health a bot breaks off instead of trading: it stops advancing on
+ * the objective and holds/backs off. Bots used to push a site at 5 HP and feed.
+ */
+const LOW_HEALTH = 35;
+/**
+ * Distance at which a bot plants its feet to shoot rather than walking and
+ * spraying. Movement spread scales with speed as a fraction of RUN_SPEED, so a
+ * walking bot's shots go nowhere; standing still restores first-bullet
+ * accuracy the same way it does for a player.
+ */
+const STOP_TO_SHOOT_RANGE_M = 32;
+/** Rough magazine proxy — snapshots carry no ammo, so bots count their own shots. */
+const SHOTS_BEFORE_RELOAD = 24;
 
 /** Site zone centers (2D), derived once from @vg/sim's SITE_ZONES — match-mode bots path to these. */
 const SITE_CENTERS: ReadonlyArray<{ x: number; z: number }> = SITE_ZONES.map((zone) => ({
@@ -116,6 +145,8 @@ function nextNavPoint(pos: { x: number; z: number }, goal: { x: number; z: numbe
 }
 
 interface KnownOther {
+  /** Server player index — stable identity for the perception memory. */
+  index: number;
   x: number;
   y: number;
   z: number;
@@ -124,6 +155,29 @@ interface KnownOther {
   connected: boolean;
   team: number;
   health: number;
+}
+
+/** Per-enemy sighting record (ticks are server ticks from snapshots). */
+interface Sighting {
+  /** When the current unbroken period of visibility began (reaction timer base). */
+  firstVisibleTick: number;
+  /** Last tick the enemy was actually visible (memory expiry base). */
+  lastVisibleTick: number;
+  /** Last position seen — what the bot aims/looks toward after losing sight. */
+  x: number;
+  y: number;
+  z: number;
+  crouching: boolean;
+}
+
+/** What the perception pass hands the behavior code each tick. */
+interface Target {
+  /** Currently-visible enemy to shoot at, or null (never set through a wall). */
+  live: KnownOther | null;
+  /** Where to point the camera: the live enemy, or a remembered last-seen spot. */
+  aim: { x: number; y: number; z: number; crouching: boolean } | null;
+  /** True once the reaction delay since first sight has elapsed. */
+  canFire: boolean;
 }
 
 /** Ability-cast probability per tick when a heuristic condition is met (kept low — spec: "occasionally cast", not every tick). */
@@ -145,7 +199,22 @@ export class Bot {
   private burstTicksLeft = 0;
   private ticksUntilNextBurst = 0;
   private boughtOnce = false;
+  private health = 100;
+  private shotsSinceReload = 0;
+  private reloadTicksLeft = 0;
   private others: KnownOther[] = [];
+  /** Facing actually sent last tick — the vision cone points where the bot is looking, not where it wishes it were. */
+  private lastSentYaw = 0;
+  /** Sighting memory, keyed by server player index. */
+  private readonly sightings = new Map<number, Sighting>();
+  /**
+   * Per-bot skill in [0,1), drawn once from the seed. Scales aim error and
+   * reaction time so a lobby has sharp bots and sloppy bots instead of ten
+   * clones of one flat constant.
+   */
+  private readonly skill: number;
+  /** Ticks between first sighting and being allowed to fire (from skill: ~125–405 ms). */
+  private readonly reactionTicks: number;
 
   // ---- M3 match awareness (only populated when the server runs mode: "match") ----
   private mode = 0; // MODE_DM by default
@@ -178,6 +247,8 @@ export class Bot {
     this.waypointIndex = this.randInt(WAYPOINTS.length);
     this.assignedSiteIndex = this.randInt(Math.max(1, SITE_CENTERS.length));
     this.ticksUntilNextBurst = this.randInt(60);
+    this.skill = this.rand();
+    this.reactionTicks = 8 + Math.round((1 - this.skill) * 18); // 8..26 ticks
     transport.onMessage((data) => {
       const msg = decodeMessageSafely(data);
       if (msg !== null) this.handleMessage(msg);
@@ -213,6 +284,16 @@ export class Bot {
         this.lastKnownPos = { x: me.posX, z: me.posZ };
         this.credits = me.credits;
         this.alive = me.alive;
+        this.health = me.health;
+        if (!me.alive) {
+          // fresh magazine, clean burst state and empty sighting memory on
+          // respawn — a dead bot should not wake up mid-reaction to a target
+          // it saw in its previous life
+          this.shotsSinceReload = 0;
+          this.reloadTicksLeft = 0;
+          this.burstTicksLeft = 0;
+          this.sightings.clear();
+        }
         this.hasPrimary = me.weaponPrimary !== 255;
         this.team = me.team;
         this.agentId = me.agentId;
@@ -220,8 +301,8 @@ export class Bot {
         this.ultPoints = me.ultPoints;
       }
       this.others = msg.players
-        .filter((_, i) => i !== this.playerIndex)
-        .map((p) => ({ x: p.posX, y: p.posY, z: p.posZ, crouching: p.crouching, alive: p.alive, connected: p.connected, team: p.team, health: p.health }));
+        .map((p, i) => ({ index: i, x: p.posX, y: p.posY, z: p.posZ, crouching: p.crouching, alive: p.alive, connected: p.connected, team: p.team, health: p.health }))
+        .filter((p) => p.index !== this.playerIndex);
     }
   }
 
@@ -263,19 +344,150 @@ export class Bot {
    * objective) and "fight" them, which friendly-fire-off makes harmless but
    * pointless, starving the soak of any actual cross-team engagements.
    */
-  private nearestEnemy(pos: { x: number; z: number }): KnownOther | null {
-    let best: KnownOther | null = null;
-    let bestDist = ENGAGE_RANGE_M;
+  /**
+   * Perception pass + target selection, replacing the old nearestEnemy().
+   *
+   * An enemy becomes VISIBLE when it is inside the forward vision cone (about
+   * the yaw actually sent last tick) or inside HEARING_RADIUS_M, AND has clear
+   * line of sight. Visibility starts a reaction timer; only after
+   * `reactionTicks` may the bot fire. Losing sight keeps the enemy in memory
+   * for TARGET_MEMORY_TICKS — the bot keeps watching the last-seen spot — but
+   * memory never licenses firing: `live` (and therefore shooting) is strictly
+   * present-tense visibility.
+   */
+  private acquireTarget(pos: { x: number; z: number }): Target {
+    const now = this.lastKnownServerTick;
+    const visible = new Set<number>();
     for (const other of this.others) {
       if (!other.alive || !other.connected) continue;
       if (this.mode === MODE_MATCH && other.team === this.team) continue;
+      const dx = other.x - pos.x;
+      const dz = other.z - pos.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist >= ENGAGE_RANGE_M) continue;
+      if (dist > HEARING_RADIUS_M) {
+        // outside earshot: must be in the cone the bot is actually facing
+        let diff = Math.atan2(dx, dz) - this.lastSentYaw;
+        while (diff > Math.PI) diff -= 2 * Math.PI;
+        while (diff < -Math.PI) diff += 2 * Math.PI;
+        if (Math.abs(diff) > VISION_HALF_ANGLE_RAD) continue;
+      }
+      if (!this.hasLineOfSight(pos, other)) continue;
+      visible.add(other.index);
+      const rec = this.sightings.get(other.index);
+      if (rec) {
+        rec.lastVisibleTick = now;
+        rec.x = other.x;
+        rec.y = other.y;
+        rec.z = other.z;
+        rec.crouching = other.crouching;
+      } else {
+        this.sightings.set(other.index, {
+          firstVisibleTick: now,
+          lastVisibleTick: now,
+          x: other.x,
+          y: other.y,
+          z: other.z,
+          crouching: other.crouching,
+        });
+      }
+    }
+    // expire stale memories (and records of the now-dead/disconnected)
+    for (const [idx, rec] of this.sightings) {
+      const other = this.others.find((o) => o.index === idx);
+      const gone = !other || !other.alive || !other.connected;
+      if (gone || now - rec.lastVisibleTick > TARGET_MEMORY_TICKS) this.sightings.delete(idx);
+    }
+
+    // live target: nearest currently-visible enemy
+    let live: KnownOther | null = null;
+    let bestDist = Infinity;
+    for (const other of this.others) {
+      if (!visible.has(other.index)) continue;
       const dist = Math.hypot(other.x - pos.x, other.z - pos.z);
       if (dist < bestDist) {
-        best = other;
+        live = other;
         bestDist = dist;
       }
     }
-    return best;
+    if (live) {
+      const rec = this.sightings.get(live.index)!;
+      return { live, aim: live, canFire: now - rec.firstVisibleTick >= this.reactionTicks };
+    }
+    // no live target: keep eyes on the freshest memory, if any
+    let mem: Sighting | null = null;
+    for (const rec of this.sightings.values()) {
+      if (!mem || rec.lastVisibleTick > mem.lastVisibleTick) mem = rec;
+    }
+    return { live: null, aim: mem, canFire: false };
+  }
+
+  /**
+   * Aim error grows with distance and shrinks with skill (flat AIM_ERROR_RAD
+   * before). Curve anchored so a mid-skill bot at ~13 m matches the old flat
+   * error: Crossing's lane fights sit at 20-40 m, and a first draft that
+   * doubled the error there dropped the whole-match kill count to 5 and
+   * zeroed the killfeed soak.
+   */
+  private aimErrorRad(dist: number): number {
+    return AIM_ERROR_RAD * (1.35 - 0.7 * this.skill) * (0.7 + dist / 45);
+  }
+
+  /**
+   * Clear shot from this bot's eye to an enemy's centre of mass?
+   *
+   * Without this, target selection was pure distance, so bots locked onto and
+   * fired at enemies through solid walls — burning magazines into geometry,
+   * standing still to "fight" someone two rooms away, and never engaging the
+   * opponent actually in front of them. LEVEL_BOXES is static level data the
+   * server already owns, and it's used here only to RESTRICT behaviour.
+   */
+  private hasLineOfSight(pos: { x: number; z: number }, other: KnownOther): boolean {
+    const height = other.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
+    const ox = pos.x;
+    const oy = EYE_HEIGHT_STAND;
+    const oz = pos.z;
+    const dx = other.x - ox;
+    const dy = other.y + height * 0.5 - oy;
+    const dz = other.z - oz;
+    const dist = Math.hypot(dx, dy, dz);
+    if (dist < 1e-3) return true;
+    const hit = raycastBoxes(
+      LEVEL_BOXES,
+      { x: ox, y: oy, z: oz },
+      { x: dx / dist, y: dy / dist, z: dz / dist },
+      dist - 0.15, // stop short of the body so the target itself never counts
+    );
+    return hit === null;
+  }
+
+  /**
+   * Burst-fire state machine, shared by both modes. Match bots previously used
+   * a flat `rand() < 0.5`, i.e. ~32 trigger pulls a second held down forever —
+   * no recoil discipline, no reload window, and nothing resembling how the
+   * weapon is meant to be fired. Returns whether to hold fire this tick.
+   */
+  private updateBurst(enemy: KnownOther | null): boolean {
+    if (this.burstTicksLeft > 0) {
+      this.burstTicksLeft--;
+      if (enemy) {
+        this.shotsSinceReload++;
+        return true;
+      }
+      return false;
+    }
+    if (this.ticksUntilNextBurst > 0) {
+      this.ticksUntilNextBurst--;
+      return false;
+    }
+    if (enemy && this.rand() < 0.6) {
+      this.burstTicksLeft = BURST_LEN_TICKS - 1;
+      this.ticksUntilNextBurst = BURST_GAP_TICKS + this.randInt(40);
+      this.shotsSinceReload++;
+      return true;
+    }
+    this.ticksUntilNextBurst = 5 + this.randInt(20);
+    return false;
   }
 
   /** Occasionally buys a random affordable weapon (bot economy, so combat soaks exercise weapon variety). */
@@ -302,6 +514,7 @@ export class Bot {
   }
 
   private send(sample: InputSample): void {
+    this.lastSentYaw = sample.yaw; // the vision cone tracks what was actually sent
     this.history.push(sample);
     if (this.history.length > 3) this.history.shift();
     const firstSeq = this.seq - this.history.length + 1;
@@ -365,6 +578,18 @@ export class Bot {
     const isAttacker = this.team === TEAM_ATTACKERS;
     const isCarrier = this.spikeCarrier === this.playerIndex && this.spikeState === SPIKE_CARRIED;
     const spikePlanted = this.spikeState === SPIKE_PLANTED;
+    /**
+     * Who is on a clock and must keep moving through contact, rather than
+     * stopping to duel: attackers until the spike is down, defenders once it
+     * is. That also happens to be the right read of each side's job — attackers
+     * execute, defenders hold angles, and the roles swap on the plant.
+     *
+     * Gating this on the carrier alone was not enough: when the carrier died,
+     * every remaining attacker stopped at the first sightline, nobody
+     * retrieved the dropped spike, and the soak went from reliable plants to
+     * zero.
+     */
+    const objectiveCritical = isAttacker ? !spikePlanted : spikePlanted;
 
     let target: { x: number; z: number };
     let arriveRadius = SITE_ARRIVE_RADIUS;
@@ -403,7 +628,9 @@ export class Bot {
 
     this.maybeBuy();
 
-    const enemy = shouldInteract ? null : this.nearestEnemy(pos); // don't get distracted mid-channel
+    // don't get distracted mid-channel
+    const t = shouldInteract ? { live: null, aim: null, canFire: false } : this.acquireTarget(pos);
+    const enemy = t.live;
     // Movement heading (toward the OBJECTIVE) and look/aim yaw (toward an
     // enemy, if any) are deliberately decoupled: sim's InputFrame always
     // moves relative to whatever yaw is sent, so if an enemy is in range the
@@ -413,21 +640,58 @@ export class Bot {
     let yaw = Math.atan2(navDx, navDz); // no enemy: look the way we're walking
     let pitch = 0;
     let fire = false;
-    if (enemy) {
-      const edx = enemy.x - pos.x;
-      const edz = enemy.z - pos.z;
-      const horizontalDist = Math.max(0.5, Math.hypot(edx, edz));
-      const enemyHeight = enemy.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
-      const enemyBodyY = enemy.y + enemyHeight * 0.5;
+    let crouch = false;
+    let holdPosition = false;
+    let enemyDist = Infinity;
+    if (t.aim) {
+      // Aim at the live enemy, or keep watching a remembered spot after
+      // losing sight (instead of instantly snapping back to the objective).
+      const edx = t.aim.x - pos.x;
+      const edz = t.aim.z - pos.z;
+      enemyDist = Math.hypot(edx, edz);
+      const horizontalDist = Math.max(0.5, enemyDist);
+      const enemyHeight = t.aim.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
+      const enemyBodyY = t.aim.y + enemyHeight * 0.5;
       const dy = enemyBodyY - EYE_HEIGHT_STAND;
-      yaw = Math.atan2(edx, edz) + (this.rand() * 2 - 1) * AIM_ERROR_RAD;
-      pitch = Math.atan2(dy, horizontalDist) + (this.rand() * 2 - 1) * AIM_ERROR_RAD;
-      fire = this.rand() < 0.5;
+      const err = this.aimErrorRad(enemyDist);
+      yaw = Math.atan2(edx, edz) + (this.rand() * 2 - 1) * err;
+      pitch = Math.atan2(dy, horizontalDist) + (this.rand() * 2 - 1) * err;
     }
+    // Fire only at a LIVE, reaction-cleared target — never at a memory.
+    fire = this.updateBurst(t.canFire ? enemy : null);
+    if (enemy && t.canFire) {
+      // Stop-and-pop: plant the feet only for the ticks actually spent firing,
+      // then move again during the burst gap. Movement spread scales with
+      // ground speed, so a walking bot's bursts go nowhere — but holding still
+      // for the whole engagement is worse. Stopping outright for any visible
+      // enemy made defenders holding angles unbeatable: they killed every
+      // attacker before a site was reached and the soak produced zero plants.
+      holdPosition = !objectiveCritical && fire && enemyDist <= STOP_TO_SHOOT_RANGE_M;
+      crouch = holdPosition && enemyDist > 8;
+    }
+
+    // Reload out of contact rather than dry-firing into the next fight.
+    let reload = false;
+    if (this.reloadTicksLeft > 0) {
+      this.reloadTicksLeft--;
+      reload = true;
+    } else if (this.shotsSinceReload >= SHOTS_BEFORE_RELOAD && !fire) {
+      reload = true;
+      this.reloadTicksLeft = 8;
+      this.shotsSinceReload = 0;
+    }
+
+    // Hurt bots in contact back off instead of trading. Expressed as a
+    // backpedal rather than a "stand still when hurt" rule, which would freeze
+    // a wounded bot in the open indefinitely and never resolve.
+    const wounded = this.health > 0 && this.health < LOW_HEALTH;
+    const retreat = wounded && enemy !== null && !objectiveCritical;
 
     let forward = 0;
     let right = 0;
-    if (!shouldInteract && !arrived && navDist > 1e-6) {
+    if (!shouldInteract && retreat) {
+      forward = -1; // yaw already faces the enemy, so this walks straight back
+    } else if (!shouldInteract && !arrived && !holdPosition && navDist > 1e-6) {
       // Decompose the world-space wish direction (toward the nav waypoint)
       // into forward/right components relative to `yaw` (see movement.ts's
       // wishDirection(): forward = (sin(yaw), cos(yaw)), right = (-cos(yaw), sin(yaw))).
@@ -444,11 +708,11 @@ export class Bot {
       yaw,
       pitch,
       jump: false,
-      crouch: false,
+      crouch,
       walk: false,
       fire,
       ads: false,
-      reload: false,
+      reload,
       slot1: false,
       slot2: false,
       interact: shouldInteract,
@@ -476,59 +740,58 @@ export class Bot {
 
     this.maybeBuy();
 
-    // Bot aim: point at the nearest other player's last-known (interpolated,
-    // from its perspective) position with small error, per spec — falls
-    // back to the waypoint-wander heading when no enemy is in range.
-    const enemy = this.nearestEnemy(pos);
+    // Bot aim: point at the current perceived target (live enemy, or the
+    // remembered last-seen spot) with distance/skill-scaled error — falls
+    // back to the waypoint-wander heading when nothing is perceived.
+    const t = this.acquireTarget(pos);
+    const enemy = t.live;
     let yaw = wanderYaw;
     let pitch = 0;
-    if (enemy) {
-      const edx = enemy.x - pos.x;
-      const edz = enemy.z - pos.z;
-      const horizontalDist = Math.max(0.5, Math.hypot(edx, edz));
-      const enemyHeight = enemy.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
-      const enemyBodyY = enemy.y + enemyHeight * 0.5;
+    if (t.aim) {
+      const edx = t.aim.x - pos.x;
+      const edz = t.aim.z - pos.z;
+      const dist = Math.hypot(edx, edz);
+      const horizontalDist = Math.max(0.5, dist);
+      const enemyHeight = t.aim.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
+      const enemyBodyY = t.aim.y + enemyHeight * 0.5;
       const dy = enemyBodyY - EYE_HEIGHT_STAND;
-      yaw = Math.atan2(edx, edz) + (this.rand() * 2 - 1) * AIM_ERROR_RAD;
-      pitch = Math.atan2(dy, horizontalDist) + (this.rand() * 2 - 1) * AIM_ERROR_RAD;
+      const err = this.aimErrorRad(dist);
+      yaw = Math.atan2(edx, edz) + (this.rand() * 2 - 1) * err;
+      pitch = Math.atan2(dy, horizontalDist) + (this.rand() * 2 - 1) * err;
     }
 
     // Burst-fire while wandering: alternate short firing bursts with gaps,
     // rather than a flat per-tick fire probability, so soaks exercise real
     // mag/reload/spray cycling instead of isolated single shots. Bots only
-    // open fire when an enemy is actually in range.
-    let fire = false;
-    if (this.burstTicksLeft > 0) {
-      fire = enemy !== null;
-      this.burstTicksLeft--;
-    } else if (this.ticksUntilNextBurst > 0) {
-      this.ticksUntilNextBurst--;
-    } else if (enemy && this.rand() < 0.6) {
-      this.burstTicksLeft = BURST_LEN_TICKS;
-      this.ticksUntilNextBurst = BURST_GAP_TICKS + this.randInt(40);
-      fire = true;
-      this.burstTicksLeft--;
-    } else if (this.rand() < 0.15) {
-      this.burstTicksLeft = BURST_LEN_TICKS;
-      this.ticksUntilNextBurst = BURST_GAP_TICKS + this.randInt(40);
-      fire = false; // no enemy in range: burst window still consumes, but stays silent
-      this.burstTicksLeft--;
-    } else {
-      this.ticksUntilNextBurst = 5 + this.randInt(20);
+    // open fire at a live, reaction-cleared target — never at a memory.
+    const fire = this.updateBurst(t.canFire ? enemy : null);
+
+    // Same out-of-contact reload rule the match bots use.
+    let reload = false;
+    if (this.reloadTicksLeft > 0) {
+      this.reloadTicksLeft--;
+      reload = true;
+    } else if (this.shotsSinceReload >= SHOTS_BEFORE_RELOAD && !fire) {
+      reload = true;
+      this.reloadTicksLeft = 8;
+      this.shotsSinceReload = 0;
     }
 
     this.evaluateAbilityHeuristics(pos, enemy);
     this.send({
-      forward: 1,
+      // Stop to shoot, same as match mode — a walking bot's spread is wide
+      // enough that its bursts are mostly wasted. Keep moving while the
+      // reaction timer runs so bots don't freeze before they can even fire.
+      forward: enemy && t.canFire ? 0 : 1,
       right: 0,
       yaw,
       pitch,
       jump: this.rand() < 0.01,
-      crouch: this.rand() < 0.03,
+      crouch: enemy !== null && t.canFire && this.rand() < 0.4,
       walk: false,
       fire,
       ads: false,
-      reload: this.rand() < 0.01,
+      reload,
       slot1: false,
       slot2: false,
       interact: false,

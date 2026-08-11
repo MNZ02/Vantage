@@ -19,7 +19,6 @@ import {
   WALL_BOX_MAX_HP,
   LEVEL_BOXES,
   LEVEL_HALF_EXTENT,
-  RUN_SPEED,
   WEAPONS,
   type Box,
   type SimState,
@@ -30,6 +29,7 @@ import { surfaceKindForIndex, type GrayboxSurface } from "./graybox.js";
 import type { MaterialSet } from "./materials.js";
 import { createPlayerModel } from "./playerModel.js";
 import { flashAfterimageCurve } from "./vfx.js";
+import { trapModalFocus } from "./focusTrap.js";
 import type { Zone } from "./zones.js";
 import { minimapBackingStoreSize, worldToMinimapPoint } from "./hudLayout.js";
 import {
@@ -61,21 +61,31 @@ export function createScene(canvas: HTMLCanvasElement): SceneHandle {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, logarithmicDepthBuffer: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
+  // Filmic tone mapping, previously left at the three.js default of none.
+  // Without it linear radiance is encoded straight to sRGB with no highlight
+  // rolloff, which is why the snow courtyard and a shadowed facade sat at
+  // opposite ends of the range with no midtones between them — the sky gradient
+  // banded for the same reason. ACES compresses the highlights and lifts the
+  // mids. This is a GLOBAL change: it affects agents and the viewmodel too.
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.25;
 
   const scene = new THREE.Scene();
-  // Dusk palette locked to graybox.ts's sky dome (zenith 0x0c1028 → horizon
-  // 0xff8a5c). Fog is a soft mid-horizon haze so distant walls fall off into
-  // the sky instead of a flat gray wall.
-  scene.background = new THREE.Color(0x1a1830);
-  scene.fog = new THREE.Fog(0x4a3a48, 35, 95);
+  // Daylight palette locked to graybox.ts's sky dome (zenith 0x1b4a87 →
+  // horizon haze 0xcfe0ea). Fog matches that horizon haze so distant walls
+  // fall off into the sky rather than into a flat gray wall — with the fog
+  // still the old dusk purple, everything past mid-map read as bruised.
+  scene.background = new THREE.Color(0x8fb4d2);
+  scene.fog = new THREE.Fog(0xc2d6e2, 40, 115);
 
   const camera = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.05, 250);
 
-  // Warm key from the sky sun direction + cool fill so verticals read against
-  // the dusk dome without washing out the baked map AO.
-  const hemi = new THREE.HemisphereLight(0xc8d4ff, 0x4a3828, 1.15);
+  // Near-white key from the sky sun direction + cool sky fill. The hemisphere
+  // GROUND term is snow bounce, not dirt: it was 0x4a3828 for the dusk scene,
+  // which lit the undersides of a snow courtyard dark brown.
+  const hemi = new THREE.HemisphereLight(0xbfd9f2, 0xb4bcc0, 1.45);
   scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffe2c0, 1.45);
+  const sun = new THREE.DirectionalLight(0xfff6e2, 1.9);
   sun.position.set(20, 30, 10);
   scene.add(sun);
 
@@ -95,7 +105,7 @@ export function createScene(canvas: HTMLCanvasElement): SceneHandle {
 // procedural models with recoil/reload/ADS motion) — see main.ts's import.
 
 /**
- * Builds one mesh per graybox surface — the same box list drives sim
+ * Builds instanced graybox meshes grouped by material — the same box list drives sim
  * collision (see graybox.ts). M5: if a MaterialSet is supplied, each surface
  * gets its zone-tinted textured material (floor/wall by zone, crates get the
  * wood-crate texture, ramp gets the metal panel texture — see
@@ -105,17 +115,31 @@ export function createScene(canvas: HTMLCanvasElement): SceneHandle {
  */
 export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSurface[], materials?: MaterialSet): void {
   const placeholders: THREE.Mesh[] = [];
-  boxes.forEach((b, index) => {
-    const sizeX = b.maxX - b.minX;
-    const sizeY = b.maxY - b.minY;
-    const sizeZ = b.maxZ - b.minZ;
-    const geometry = new THREE.BoxGeometry(sizeX, sizeY, sizeZ);
-    const material = materials ? materialForSurface(index, b.zone, materials) : new THREE.MeshStandardMaterial({ color: b.color, roughness: 0.9, metalness: 0.05 });
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, (b.minZ + b.maxZ) / 2);
+  const fallbackMaterial = materials ? null : new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, metalness: 0.05, vertexColors: true });
+  const grouped = new Map<THREE.Material, Array<{ box: GrayboxSurface; index: number }>>();
+  boxes.forEach((box, index) => {
+    const material = materials ? materialForSurface(index, box.zone, materials) : fallbackMaterial!;
+    const entries = grouped.get(material) ?? [];
+    entries.push({ box, index });
+    grouped.set(material, entries);
+  });
+
+  const transform = new THREE.Object3D();
+  for (const [material, entries] of grouped) {
+    const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), material, entries.length);
+    for (let instance = 0; instance < entries.length; instance++) {
+      const b = entries[instance]!.box;
+      transform.position.set((b.minX + b.maxX) / 2, (b.minY + b.maxY) / 2, (b.minZ + b.maxZ) / 2);
+      transform.scale.set(b.maxX - b.minX, b.maxY - b.minY, b.maxZ - b.minZ);
+      transform.updateMatrix();
+      mesh.setMatrixAt(instance, transform.matrix);
+      if (!materials) mesh.setColorAt(instance, new THREE.Color(b.color));
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     scene.add(mesh);
     placeholders.push(mesh);
-  });
+  }
   // Baked-lighting swap (same placeholder/fallback contract as every other
   // .glb in assets.ts): map_crossing.glb is generated from the SAME
   // LEVEL_BOXES by tools/mapgen/build_map.py, with AO baked into vertex
@@ -152,6 +176,7 @@ export function buildGrayboxMeshes(scene: THREE.Scene, boxes: readonly GrayboxSu
       // Shared MaterialSet materials are reused across placeholders — do NOT
       // dispose materials here (only the per-placeholder BoxGeometry).
     }
+    fallbackMaterial?.dispose();
     // Wall panels + cover-crate skins sit on the same faces as this mesh.
     // Hide them so they don't z-fight the baked map (they stay for graybox
     // fallback when this load fails).
@@ -176,6 +201,7 @@ export interface FpsCounter {
   /** Performance telemetry is opt-in (F3/settings), never painted over gameplay by default. */
   setVisible(visible: boolean): void;
   toggle(): void;
+  isVisible(): boolean;
 }
 
 export function createFpsCounter(): FpsCounter {
@@ -231,10 +257,12 @@ export function createFpsCounter(): FpsCounter {
 
   return {
     update(fps: number) {
+      if (!visible) return;
       fpsLine = `fps: ${fps.toFixed(0)}`;
       render();
     },
     updateExtra(lines: readonly string[]) {
+      if (!visible) return;
       extraLines = lines;
       render();
     },
@@ -243,6 +271,7 @@ export function createFpsCounter(): FpsCounter {
       setVisible(!visible);
       dispatchDebugHudVisibility(visible);
     },
+    isVisible: () => visible,
   };
 }
 
@@ -713,6 +742,9 @@ export function createBuyMenu(onBuy: (itemId: number) => void, onSell?: (itemId:
   document.body.appendChild(overlay);
   let open = false;
   let previouslyFocused: HTMLElement | null = null;
+  panel.addEventListener("keydown", (event) => {
+    if (open) trapModalFocus(event, panel);
+  });
 
   return {
     setOpen(nextOpen: boolean) {
@@ -1040,8 +1072,8 @@ export function createSpectateOverlay(): SpectateOverlay {
   };
 }
 
-/** Reconnect banner ("reconnecting…"), shown while net.ts's auto-retry loop is active. */
-export function createReconnectBanner(): { setVisible(visible: boolean): void } {
+/** Connection-state banner for retrying and terminal disconnect states. */
+export function createReconnectBanner(): { setState(state: "connected" | "reconnecting" | "disconnected"): void } {
   const el = document.createElement("div");
   el.className = "vg-hud vg-reconnect-banner";
   el.setAttribute("role", "alert");
@@ -1059,9 +1091,13 @@ export function createReconnectBanner(): { setVisible(visible: boolean): void } 
   el.style.display = "none";
   el.textContent = "Connection lost — reconnecting…";
   document.body.appendChild(el);
+  let currentState: "connected" | "reconnecting" | "disconnected" = "connected";
   return {
-    setVisible(visible: boolean) {
-      el.style.display = visible ? "block" : "none";
+    setState(state) {
+      if (state === currentState) return;
+      currentState = state;
+      el.style.display = state === "connected" ? "none" : "block";
+      el.textContent = state === "reconnecting" ? "Connection lost — reconnecting…" : "Connection lost — reconnect failed. Reload to try again.";
     },
   };
 }
@@ -1338,6 +1374,9 @@ export function createAgentSelectOverlay(onPick: (agentId: number) => void): Age
   document.body.appendChild(overlay);
   let open = false;
   let previouslyFocused: HTMLElement | null = null;
+  panel.addEventListener("keydown", (event) => {
+    if (open) trapModalFocus(event, panel);
+  });
 
   return {
     setOpen(nextOpen: boolean) {

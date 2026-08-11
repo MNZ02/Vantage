@@ -3,7 +3,7 @@ import { FIXED_DT, LEVEL_BOXES, PHASE_BUY, PHASE_ROUND, SITE_ZONES, type InputFr
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
 import { PredictedClient } from "../src/prediction.js";
-import { createScriptedInputSender, idleInput, toAuthoritative } from "./testUtils.js";
+import { createScriptedInputSender, idleInput, observePrediction, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
 
@@ -48,9 +48,16 @@ describe("prediction exactness in match mode (acceptance criterion 13, match-mod
     let reachedRound = false;
     let plantedInputTicks = 0;
 
-    for (let i = 0; i < 900; i++) {
-      if (predicted) {
-        const state = predicted.getPredictedState();
+    // Budget has to cover the 128-tick buy phase plus walking from spawn to
+    // site A before the plant channel is exercised at all, so it scales with
+    // RUN_SPEED — at 5.4 m/s that crossing alone is ~600 ticks and the old 900
+    // left the `plantedInputTicks > 0` precondition failing. What's under test
+    // is reconciliation exactness during the channel, not how fast you get
+    // there, so give it room rather than weakening the assertion.
+    for (let i = 0; i < 1500; i++) {
+      const active = observePrediction(predicted);
+      if (active) {
+        const state = active.getPredictedState();
         let input: InputFrame;
         if (state.matchPhase === PHASE_BUY) {
           // Push north (+Z, toward the attacker-side barrier at z=-8) the
@@ -77,7 +84,7 @@ describe("prediction exactness in match mode (acceptance criterion 13, match-mod
         } else {
           input = idleInput(0);
         }
-        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        const { seq, quantizedInput } = active.queueAndPredict(input);
         send(seq, quantizedInput, Math.round(t));
       }
       t++;

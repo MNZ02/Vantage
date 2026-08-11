@@ -11,8 +11,10 @@
 // castLumenWall) rather than a velocity. Wall boxes never move, so the two
 // meanings never collide for the same entity.
 
-import { ENT_NONE, ENT_WALL_BOX, MAX_ABILITY_ENTITIES, NO_PLAYER } from "../constants.js";
+import { ENT_NONE, ENT_SMOKE, ENT_WALL_BOX, MAX_ABILITY_ENTITIES, NO_PLAYER } from "../constants.js";
+import type { SphereLike } from "../raycast.js";
 import type { Box, SimState } from "../state.js";
+import { getAbilityDef } from "./data.js";
 
 /** First free (entType === ENT_NONE) entity slot, or -1 if the table is full. */
 export function findFreeEntitySlot(state: SimState): number {
@@ -113,6 +115,19 @@ export function liveWallBoxes(state: SimState): Box[] {
   const out: Box[] = [];
   for (let i = 0; i < MAX_ABILITY_ENTITIES; i++) {
     if (state.entType[i] === ENT_WALL_BOX) out.push(wallBoxFromEntity(state, i));
+  }
+  return out;
+}
+
+/** Every live smoke as a spherical sight/flash/reveal occluder. */
+export function liveSmokeSpheres(state: SimState): SphereLike[] {
+  const out: SphereLike[] = [];
+  for (let i = 0; i < MAX_ABILITY_ENTITIES; i++) {
+    if (state.entType[i] !== ENT_SMOKE) continue;
+    const radius = getAbilityDef(state.entAbilityId[i]!)?.radius ?? 0;
+    if (radius > 0) {
+      out.push({ x: state.entX[i]!, y: state.entY[i]!, z: state.entZ[i]!, radius });
+    }
   }
   return out;
 }

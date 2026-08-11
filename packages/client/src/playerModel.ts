@@ -5,7 +5,7 @@
 // (group/setPose/dispose) is deliberately the same shape the old capsule
 // proxy exposed, so render.ts/main.ts don't need to change at the call site.
 import * as THREE from "three";
-import { AGENT_ZEPHYR, CROUCH_HEIGHT, STAND_HEIGHT, CAPSULE_RADIUS } from "@vg/sim";
+import { AGENT_SONAR, AGENT_ZEPHYR, CROUCH_HEIGHT, STAND_HEIGHT } from "@vg/sim";
 import { MODEL_FOR_CLASS, weaponClassFor, type WeaponClass } from "./viewmodel.js";
 import { cloneModel, cloneSkinnedModel, getLoadedModel, loadModel, type ModelName } from "./assets.js";
 
@@ -82,7 +82,7 @@ export interface PlayerModelPose {
   alive: boolean;
   team: number;
   isAlly: boolean;
-  /** AGENT_ZEPHYR(0) renders the Zephyr hero model; anything else falls back to the generic placeholder rig. */
+  /** AGENT_ZEPHYR(0) and AGENT_SONAR(2) have bespoke models; anything else falls back to the generic placeholder rig. */
   agentId: number;
   weaponId: number;
   /** Horizontal speed, m/s — drives the walk-cycle swing amplitude. */
@@ -99,27 +99,26 @@ export interface PlayerModelHandle {
   dispose(scene: THREE.Scene): void;
 }
 
-interface Part {
-  mesh: THREE.Mesh;
-  /** Rest-local position, re-applied each frame before pose offsets. */
-  restY: number;
-}
-
 const DEATH_FADE_SECONDS = 2;
 
 // ---- Authored agent rigs ----
 // Which authored skinned model represents a given agentId (Zephyr has a bespoke
 // hero model; every other agent falls back to the generic placeholder rig).
 // Both share the identical 18-bone rig, so the bone-driving code is agnostic.
+type AgentModelName = ModelName & ("agent" | "agent_zephyr" | "agent_sonar");
+
 function agentModelFor(agentId: number): ModelName {
-  return agentId === AGENT_ZEPHYR ? "agent_zephyr" : "agent";
+  if (agentId === AGENT_ZEPHYR) return "agent_zephyr";
+  if (agentId === AGENT_SONAR) return "agent_sonar";
+  return "agent";
 }
 
 // Measured standing height of each skinned mesh (feet ≈ y0 to head top);
 // the rig is scaled so this matches the sim capsule's STAND_HEIGHT.
-const AGENT_MODEL_HEIGHT: Record<ModelName & ("agent" | "agent_zephyr"), number> = {
+const AGENT_MODEL_HEIGHT: Record<AgentModelName, number> = {
   agent: 1.745,
   agent_zephyr: 1.8,
+  agent_sonar: 1.8,
 };
 
 // Accent material names (per model) retinted to the ally/enemy color for IFF.
@@ -132,6 +131,12 @@ const ACCENT_MATERIAL_NAMES = new Set([
   "v2_z_glow",
   "ag_zephyr_accent",
   "ag_zephyr_glow",
+  // agent_sonar: flat regions marked on the generated body by import_agent.py.
+  // Its ag_sonar_body material carries a texture, so it must NOT be listed —
+  // three.js multiplies material colour into the map, and retinting it would
+  // wash the whole costume ally-blue or enemy-red instead of just the insignia.
+  "ag_sonar_accent",
+  "ag_sonar_glow",
 ]);
 // Rig bones carry a ~180°-about-X rest rotation, so their local X axis aligns
 // with world X — the walk-cycle swing (and crouch knee-bend) is a delta about
@@ -189,10 +194,12 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
   const upperArmR = mesh(new THREE.BoxGeometry(ARM_HALF_WIDTH * 2, 0.28, 0.14), limbMat);
   const lowerArmR = mesh(new THREE.BoxGeometry(ARM_HALF_WIDTH * 1.8, 0.26, 0.13), limbMat);
 
-  const upperLegL = mesh(new THREE.BoxGeometry(0.16, 0.01, 0.16), limbMat); // heights set per-pose (leg length varies stand/crouch)
-  const lowerLegL = mesh(new THREE.BoxGeometry(0.14, 0.01, 0.14), limbMat);
-  const upperLegR = mesh(new THREE.BoxGeometry(0.16, 0.01, 0.16), limbMat);
-  const lowerLegR = mesh(new THREE.BoxGeometry(0.14, 0.01, 0.14), limbMat);
+  // Unit-height leg geometries are scaled in Y per pose. Replacing geometry
+  // every frame created four GPU resources per player per render frame.
+  const upperLegL = mesh(new THREE.BoxGeometry(0.16, 1, 0.16), limbMat);
+  const lowerLegL = mesh(new THREE.BoxGeometry(0.14, 1, 0.14), limbMat);
+  const upperLegR = mesh(new THREE.BoxGeometry(0.16, 1, 0.16), limbMat);
+  const lowerLegR = mesh(new THREE.BoxGeometry(0.14, 1, 0.14), limbMat);
 
   // All the procedural body boxes above are the instant placeholder + the
   // permanent fallback. Once the authored agent rig (agent_placeholder.glb)
@@ -243,7 +250,7 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
     if (rig) disposeRig(rig);
     const { root, materials: glbMats } = cloneSkinnedModel(master);
     const wrapper = new THREE.Group();
-    wrapper.scale.setScalar(STAND_HEIGHT / AGENT_MODEL_HEIGHT[modelName as "agent" | "agent_zephyr"]);
+    wrapper.scale.setScalar(STAND_HEIGHT / AGENT_MODEL_HEIGHT[modelName as AgentModelName]);
     wrapper.add(root);
     group.add(wrapper);
     for (const mesh of proceduralBodyMeshes) mesh.visible = false; // rig takes over the body; weaponHolder stays
@@ -285,11 +292,6 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
   }
 
   const weaponLengthByClass: Record<WeaponClass, number> = { pistol: 0.16, smg: 0.28, rifle: 0.42, sniper: 0.55, knife: 0.2 };
-
-  function setLegGeometry(legMesh: THREE.Mesh, length: number, width: number, depth: number): void {
-    legMesh.geometry.dispose();
-    legMesh.geometry = new THREE.BoxGeometry(width, length, depth);
-  }
 
   /**
    * Drives the loaded rig from the same walk-cycle inputs as the procedural
@@ -370,10 +372,10 @@ export function createPlayerModel(scene: THREE.Scene): PlayerModelHandle {
         torso.position.set(0, legHeight + torsoHeight / 2, 0);
         head.position.set(0, legHeight + torsoHeight + HEAD_DIAMETER / 2, 0);
 
-        setLegGeometry(upperLegL, halfLeg, 0.16, 0.16);
-        setLegGeometry(lowerLegL, halfLeg, 0.14, 0.14);
-        setLegGeometry(upperLegR, halfLeg, 0.16, 0.16);
-        setLegGeometry(lowerLegR, halfLeg, 0.14, 0.14);
+        upperLegL.scale.y = halfLeg;
+        lowerLegL.scale.y = halfLeg;
+        upperLegR.scale.y = halfLeg;
+        lowerLegR.scale.y = halfLeg;
 
         upperLegL.position.set(-0.11, legHeight - halfLeg / 2, 0);
         lowerLegL.position.set(-0.11, legHeight - halfLeg - halfLeg / 2, 0);

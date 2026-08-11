@@ -37,7 +37,6 @@ import {
   SPIKE_PLANTED,
   TEAM_ATTACKERS,
   TEAM_DEFENDERS,
-  TEAM_NONE,
   WEAPON_NONE,
 } from "./constants.js";
 import { WEAPON_VIPER, getWeaponDef } from "./weapons/data.js";
@@ -401,7 +400,34 @@ function applyRoundEnd(next: SimState, winnerRole: number, reason: number, curre
   const diff = Math.abs(next.scoreTeam0 - next.scoreTeam1);
   if (leader >= next.config.winTarget && diff >= 2) {
     next.matchPhase = PHASE_MATCH_END;
-    next.phaseEndTick = -1;
+    // Post-match screen lingers for matchEndTicks, then advanceMatchState
+    // resets scores and auto-starts a fresh match (was -1 = terminal, which
+    // left the game permanently stuck on "MATCH OVER").
+    next.phaseEndTick = currentTick + 1 + next.config.matchEndTicks;
+  }
+}
+
+/**
+ * Wipes match-level progress (scores, round counter, half-swap, loss streaks)
+ * back to a pristine pre-round-1 state and restores original sides, so the
+ * subsequent enterBuyPhase() opens round 1 of a brand-new match. Player agents
+ * and connections are preserved. Called by advanceMatchState() when the
+ * post-match screen (PHASE_MATCH_END) expires.
+ */
+function resetForNewMatch(next: SimState): void {
+  next.scoreTeam0 = 0;
+  next.scoreTeam1 = 0;
+  next.roundNumber = 0;
+  next.halvesSwapped = 0;
+  next.lossStreakTeam0 = 0;
+  next.lossStreakTeam1 = 0;
+  // halvesSwapped === 0 means "original sides"; restore them (mirrors
+  // startMatch's alternating-by-index assignment) so a reset match doesn't
+  // inherit the swapped sides from the match that just ended.
+  for (let i = 0; i < next.numPlayers; i++) {
+    if (next.team[i] === TEAM_ATTACKERS || next.team[i] === TEAM_DEFENDERS) {
+      next.team[i] = i % 2 === 0 ? TEAM_ATTACKERS : TEAM_DEFENDERS;
+    }
   }
 }
 
@@ -533,6 +559,12 @@ export function advanceMatchState(prev: SimState, next: SimState, decisions: Cha
   }
 
   if (next.matchPhase === PHASE_ROUND_END && currentTick + 1 >= next.phaseEndTick) {
+    enterBuyPhase(next, currentTick);
+    return;
+  }
+
+  if (next.matchPhase === PHASE_MATCH_END && currentTick + 1 >= next.phaseEndTick) {
+    resetForNewMatch(next);
     enterBuyPhase(next, currentTick);
     return;
   }

@@ -100,6 +100,33 @@ describe("reconnect (acceptance criterion 12)", () => {
     expect(welcomesB.length).toBe(1);
   });
 
+  it("with spare capacity, closing a token-reattached transport disconnects the restored slot rather than its provisional slot", () => {
+    const host = new ServerHost({ numPlayers: 3, mode: "match", minPlayers: 2 });
+    const [client0, server0] = createLoopbackPair();
+    const welcomes0 = collectWelcomes(client0);
+    host.connect(server0);
+    const [, server1] = createLoopbackPair();
+    host.connect(server1);
+
+    const welcome = welcomes0[welcomes0.length - 1]!;
+    expect(welcome.type).toBe(MessageType.Welcome);
+    if (welcome.type !== MessageType.Welcome) throw new Error("expected Welcome");
+    const originalIndex = welcome.playerIndex;
+    client0.close();
+
+    const [reconnectedClient, reconnectedServer] = createLoopbackPair();
+    const provisionalIndex = host.connect(reconnectedServer);
+    expect(provisionalIndex).not.toBe(originalIndex);
+    reconnectedClient.send(
+      encodeMessage({ type: MessageType.Hello, protocolVersion: PROTOCOL_VERSION, reconnectToken: welcome.token }),
+    );
+    expect(host.isConnected(originalIndex)).toBe(true);
+
+    reconnectedClient.close();
+    expect(host.isConnected(originalIndex)).toBe(false);
+    expect(host.isConnected(provisionalIndex)).toBe(false);
+  });
+
   it("on a full match, a connect attempt with no valid token is rejected (connection closed), never silently granted a slot", () => {
     const host = new ServerHost({ numPlayers: 3, mode: "match", minPlayers: 3 });
     const [, server0] = createLoopbackPair();

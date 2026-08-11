@@ -9,6 +9,7 @@ import {
   DEFAULT_OT_START_CREDITS,
   DEFAULT_PLANT_BONUS,
   DEFAULT_PLANT_TICKS,
+  DEFAULT_MATCH_END_TICKS,
   DEFAULT_ROUND_END_TICKS,
   DEFAULT_ROUND_TICKS,
   DEFAULT_SPIKE_TICKS,
@@ -57,14 +58,14 @@ export interface InputFrame {
   readonly slot1: boolean; // edge-triggered: switch to primary slot
   readonly slot2: boolean; // edge-triggered: switch to secondary slot
   /** Level-triggered (held): channels plant/defuse in match mode. See match.ts. */
-  readonly interact: boolean;
+  readonly interact?: boolean;
   /** Edge-triggered: cast a map ping (server-only concern — sim's tick() never reads this field). */
-  readonly ping: boolean;
+  readonly ping?: boolean;
   /** M4a, edge-triggered: cast the agent's basic1/basic2/signature/ult ability. See abilities/logic.ts. */
-  readonly ability1: boolean;
-  readonly ability2: boolean;
-  readonly signature: boolean;
-  readonly ult: boolean;
+  readonly ability1?: boolean;
+  readonly ability2?: boolean;
+  readonly signature?: boolean;
+  readonly ult?: boolean;
 }
 
 export function defaultInput(yaw = 0, pitch = 0): InputFrame {
@@ -125,6 +126,8 @@ export interface MatchConfig {
   readonly defuseTicks: number;
   readonly defuseCheckpointTicks: number;
   readonly roundEndTicks: number;
+  /** How long PHASE_MATCH_END lingers (post-match screen) before a fresh match auto-starts. */
+  readonly matchEndTicks: number;
   readonly winTarget: number;
   readonly halfAtRound: number;
   readonly otStartCredits: number;
@@ -144,6 +147,7 @@ export const DEFAULT_MATCH_CONFIG: MatchConfig = {
   defuseTicks: DEFAULT_DEFUSE_TICKS,
   defuseCheckpointTicks: DEFAULT_DEFUSE_CHECKPOINT_TICKS,
   roundEndTicks: DEFAULT_ROUND_END_TICKS,
+  matchEndTicks: DEFAULT_MATCH_END_TICKS,
   winTarget: DEFAULT_WIN_TARGET,
   halfAtRound: DEFAULT_HALF_AT_ROUND,
   otStartCredits: DEFAULT_OT_START_CREDITS,
@@ -338,7 +342,33 @@ export function createState(seed: number, numPlayers: number = MAX_PLAYERS): Sim
  */
 export function createMatchState(seed: number, numPlayers: number = MAX_PLAYERS, config: Partial<MatchConfig> = {}): SimState {
   const fullConfig: MatchConfig = { ...DEFAULT_MATCH_CONFIG, ...config };
+  validateMatchConfig(fullConfig);
   return createStateInternal(seed, numPlayers, 1, fullConfig);
+}
+
+function validateMatchConfig(config: MatchConfig): void {
+  const positiveKeys: ReadonlyArray<keyof MatchConfig> = [
+    "buyTicks", "firstRoundBuyTicks", "roundTicks", "spikeTicks", "plantTicks", "defuseTicks",
+    "defuseCheckpointTicks", "roundEndTicks", "matchEndTicks", "winTarget", "halfAtRound", "maxCredits",
+  ];
+  const nonNegativeKeys: ReadonlyArray<keyof MatchConfig> = [
+    "otStartCredits", "startCredits", "winCredits", "plantBonus",
+  ];
+  for (const key of positiveKeys) {
+    const value = config[key] as number;
+    if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`match config ${key} must be a positive safe integer`);
+  }
+  for (const key of nonNegativeKeys) {
+    const value = config[key] as number;
+    if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`match config ${key} must be a non-negative safe integer`);
+  }
+  if (!Array.isArray(config.lossCredits) || config.lossCredits.length !== 3 || config.lossCredits.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new RangeError("match config lossCredits must contain 3 non-negative safe integers");
+  }
+  if (config.defuseCheckpointTicks > config.defuseTicks) throw new RangeError("match config defuseCheckpointTicks cannot exceed defuseTicks");
+  for (const key of ["otStartCredits", "startCredits", "winCredits"] as const) {
+    if (config[key] > config.maxCredits) throw new RangeError(`match config ${key} cannot exceed maxCredits`);
+  }
 }
 
 function createStateInternal(seed: number, numPlayers: number, mode: number, config: MatchConfig): SimState {
@@ -473,50 +503,67 @@ function createStateInternal(seed: number, numPlayers: number, mode: number, con
 // (sprayIndex stays 0) without special-casing tick 0 in weapons/logic.ts.
 const SPRAY_RESET_FILL = 255;
 
+const SIM_STATE_ARRAY_KEYS = [
+  "posX", "posY", "posZ", "velX", "velY", "velZ", "yaw", "pitch", "crouching", "grounded",
+  "health", "armor", "alive", "respawnTick", "weaponPrimary", "weaponSecondary", "activeSlot",
+  "magPrimary", "reservePrimary", "magSecondary", "reserveSecondary", "shotCounter", "sprayIndex",
+  "ticksSinceFire", "nextFireTick", "reloadEndTick", "equipEndTick", "adsStage", "tagTicksLeft",
+  "landPenaltyTicksLeft", "credits", "prevButtons", "team", "weaponPrimaryAtBuyStart",
+  "weaponSecondaryAtBuyStart", "armorAtBuyStart", "primaryPurchasedItemId", "secondaryPurchasedItemId",
+  "armorPurchasedItemId", "agentId", "ultPoints", "abilityCharges", "signatureRechargeEndTick",
+  "flashedUntilTick", "flashIntensity", "dashKillCounter", "magUlt", "ultWindowEndTick",
+  "prevAbilityButtons", "pendingAbilityId", "pendingReadyTick", "pendingOriginX", "pendingOriginY",
+  "pendingOriginZ", "pendingYaw", "pendingTargetIndex", "entType", "entOwner", "entAbilityId", "entX",
+  "entY", "entZ", "entVelX", "entVelY", "entVelZ", "entSpawnTick", "entEndTick", "entParam",
+] as const;
+
+type SimStateArrayKey = (typeof SIM_STATE_ARRAY_KEYS)[number];
+type NumericArray = Uint8Array | Uint16Array | Uint32Array | Int32Array | Float64Array;
+type NumericArrayConstructor = {
+  readonly BYTES_PER_ELEMENT: number;
+  new (buffer: ArrayBuffer, byteOffset: number, length: number): NumericArray;
+};
+
+/**
+ * Copies every ECS column into one shared backing allocation. The state still
+ * exposes typed views per field, but a tick performs one ArrayBuffer allocation
+ * instead of one backing allocation for every column.
+ */
+function cloneStateArrays(state: SimState): Pick<SimState, SimStateArrayKey> {
+  let byteLength = 0;
+  for (const key of SIM_STATE_ARRAY_KEYS) {
+    const source = state[key] as NumericArray;
+    const alignment = source.BYTES_PER_ELEMENT;
+    byteLength = Math.ceil(byteLength / alignment) * alignment + source.byteLength;
+  }
+
+  const buffer = new ArrayBuffer(byteLength);
+  let byteOffset = 0;
+  const result = {} as Pick<SimState, SimStateArrayKey>;
+  const writable = result as unknown as Record<string, NumericArray>;
+  for (const key of SIM_STATE_ARRAY_KEYS) {
+    const source = state[key] as NumericArray;
+    const Ctor = source.constructor as NumericArrayConstructor;
+    const alignment = Ctor.BYTES_PER_ELEMENT;
+    byteOffset = Math.ceil(byteOffset / alignment) * alignment;
+    const target = new Ctor(buffer, byteOffset, source.length);
+    target.set(source);
+    writable[key] = target;
+    byteOffset += source.byteLength;
+  }
+  return result;
+}
+
 /** Deep-clones a SimState (tick() never mutates its input in place). */
 export function cloneState(state: SimState): SimState {
   return {
+    ...cloneStateArrays(state),
     tick: state.tick,
     prngState: state.prngState,
     seed: state.seed,
     numPlayers: state.numPlayers,
-    posX: state.posX.slice(),
-    posY: state.posY.slice(),
-    posZ: state.posZ.slice(),
-    velX: state.velX.slice(),
-    velY: state.velY.slice(),
-    velZ: state.velZ.slice(),
-    yaw: state.yaw.slice(),
-    pitch: state.pitch.slice(),
-    crouching: state.crouching.slice(),
-    grounded: state.grounded.slice(),
-
-    health: state.health.slice(),
-    armor: state.armor.slice(),
-    alive: state.alive.slice(),
-    respawnTick: state.respawnTick.slice(),
-    weaponPrimary: state.weaponPrimary.slice(),
-    weaponSecondary: state.weaponSecondary.slice(),
-    activeSlot: state.activeSlot.slice(),
-    magPrimary: state.magPrimary.slice(),
-    reservePrimary: state.reservePrimary.slice(),
-    magSecondary: state.magSecondary.slice(),
-    reserveSecondary: state.reserveSecondary.slice(),
-    shotCounter: state.shotCounter.slice(),
-    sprayIndex: state.sprayIndex.slice(),
-    ticksSinceFire: state.ticksSinceFire.slice(),
-    nextFireTick: state.nextFireTick.slice(),
-    reloadEndTick: state.reloadEndTick.slice(),
-    equipEndTick: state.equipEndTick.slice(),
-    adsStage: state.adsStage.slice(),
-    tagTicksLeft: state.tagTicksLeft.slice(),
-    landPenaltyTicksLeft: state.landPenaltyTicksLeft.slice(),
-    credits: state.credits.slice(),
-    prevButtons: state.prevButtons.slice(),
-
     mode: state.mode,
     config: state.config,
-    team: state.team.slice(),
     matchPhase: state.matchPhase,
     phaseEndTick: state.phaseEndTick,
     roundNumber: state.roundNumber,
@@ -540,44 +587,6 @@ export function cloneState(state: SimState): SimState {
     defuserIndex: state.defuserIndex,
     defuseCheckpointHit: state.defuseCheckpointHit,
 
-    weaponPrimaryAtBuyStart: state.weaponPrimaryAtBuyStart.slice(),
-    weaponSecondaryAtBuyStart: state.weaponSecondaryAtBuyStart.slice(),
-    armorAtBuyStart: state.armorAtBuyStart.slice(),
-    primaryPurchasedItemId: state.primaryPurchasedItemId.slice(),
-    secondaryPurchasedItemId: state.secondaryPurchasedItemId.slice(),
-    armorPurchasedItemId: state.armorPurchasedItemId.slice(),
-
-    agentId: state.agentId.slice(),
-    ultPoints: state.ultPoints.slice(),
-    abilityCharges: state.abilityCharges.slice(),
-    signatureRechargeEndTick: state.signatureRechargeEndTick.slice(),
-    flashedUntilTick: state.flashedUntilTick.slice(),
-    flashIntensity: state.flashIntensity.slice(),
-    dashKillCounter: state.dashKillCounter.slice(),
-    magUlt: state.magUlt.slice(),
-    ultWindowEndTick: state.ultWindowEndTick.slice(),
-    prevAbilityButtons: state.prevAbilityButtons.slice(),
-
-    pendingAbilityId: state.pendingAbilityId.slice(),
-    pendingReadyTick: state.pendingReadyTick.slice(),
-    pendingOriginX: state.pendingOriginX.slice(),
-    pendingOriginY: state.pendingOriginY.slice(),
-    pendingOriginZ: state.pendingOriginZ.slice(),
-    pendingYaw: state.pendingYaw.slice(),
-    pendingTargetIndex: state.pendingTargetIndex.slice(),
-
-    entType: state.entType.slice(),
-    entOwner: state.entOwner.slice(),
-    entAbilityId: state.entAbilityId.slice(),
-    entX: state.entX.slice(),
-    entY: state.entY.slice(),
-    entZ: state.entZ.slice(),
-    entVelX: state.entVelX.slice(),
-    entVelY: state.entVelY.slice(),
-    entVelZ: state.entVelZ.slice(),
-    entSpawnTick: state.entSpawnTick.slice(),
-    entEndTick: state.entEndTick.slice(),
-    entParam: state.entParam.slice(),
   };
 }
 

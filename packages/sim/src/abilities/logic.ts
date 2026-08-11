@@ -657,7 +657,7 @@ export function awardUltPoint(state: SimState, playerIndex: number): void {
   state.ultPoints[playerIndex] = Math.min(cap, state.ultPoints[playerIndex]! + 1);
 }
 
-function updateOrbPickups(prev: SimState, next: SimState, currentTick: number): void {
+function updateOrbPickups(prev: SimState, next: SimState): void {
   const roundOk = prev.mode !== MODE_MATCH || prev.matchPhase === PHASE_ROUND;
   if (!roundOk) return;
   for (let e = 0; e < MAX_ABILITY_ENTITIES; e++) {
@@ -724,7 +724,7 @@ export function stepAbilities(prev: SimState, next: SimState, inputs: readonly (
   }
 
   stepEntities(next, boxes, currentTick, events);
-  updateOrbPickups(prev, next, currentTick);
+  updateOrbPickups(prev, next);
 
   return events;
 }

@@ -5,12 +5,27 @@ export const FIXED_DT = 15.625 / 1000; // 64 Hz
 
 export const MAX_PLAYERS = 16;
 
-// Speeds, m/s.
-export const RUN_SPEED = 6.75;
-export const WALK_SPEED = 3.6;
-export const CROUCH_SPEED = 3.4;
+// Speeds, m/s. Scaled down ~29% from the original 6.75/3.6/3.4 for a slower,
+// more deliberate pace. All of them move together so the run:walk:crouch
+// ratios — and therefore when it's worth walking to stay silent, or crouching
+// for accuracy — are unchanged.
+//
+// Everything speed-dependent is expressed as a FRACTION of RUN_SPEED
+// (COUNTER_STRAFE_DEADZONE, weapon movement spread), so those rescale on their
+// own and no other tuning has to move with this.
+//
+// What does NOT rescale by itself: anything counted in ticks that assumes the
+// map can be crossed in a given time. See the shrunk `roundTicks` in
+// server/test/matchSoak.acceptance and the loop budget in
+// client/test/prediction-match — both are sized off this value.
+export const RUN_SPEED = 4.8;
+export const WALK_SPEED = 2.6;
+export const CROUCH_SPEED = 2.4;
 
-// Source-style ground movement.
+// Source-style ground movement. Deliberately NOT scaled with the speeds above:
+// accel and friction set how fast you reach and shed top speed, which is what
+// makes counter-strafing a skill. Slowing those too would blur the stop-to-
+// shoot window rather than just making traversal slower.
 export const GROUND_ACCEL = 14; // m/s^2 per m/s of wishSpeed headroom, tuned for snappy convergence
 export const GROUND_FRICTION = 6; // 1/s
 export const STOP_SPEED = 1.0; // m/s, below this friction uses a flat floor so players actually stop
@@ -147,6 +162,7 @@ export const DEFAULT_PLANT_TICKS = 256; // 4s
 export const DEFAULT_DEFUSE_TICKS = 448; // 7s
 export const DEFAULT_DEFUSE_CHECKPOINT_TICKS = 224; // 3.5s
 export const DEFAULT_ROUND_END_TICKS = 320; // 5s freeze
+export const DEFAULT_MATCH_END_TICKS = 640; // 10s post-match screen before a fresh match auto-starts
 export const DEFAULT_WIN_TARGET = 13;
 export const DEFAULT_HALF_AT_ROUND = 12;
 export const DEFAULT_OT_START_CREDITS = 5000;

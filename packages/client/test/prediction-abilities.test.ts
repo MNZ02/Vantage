@@ -3,11 +3,45 @@ import { AGENT_ZEPHYR, FIXED_DT, LEVEL_BOXES, PHASE_BUY, PHASE_ROUND, type Input
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
 import { PredictedClient } from "../src/prediction.js";
-import { createScriptedInputSender, idleInput, toAuthoritative } from "./testUtils.js";
+import { createScriptedInputSender, idleInput, observePrediction, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
 
 describe("prediction exactness for abilities (acceptance criterion 3)", () => {
+  it("reconciles sparse ability entities into their stable server slots with authoritative velocity and age", () => {
+    const predicted = new PredictedClient(7, 1, 0, LEVEL_BOXES);
+    predicted.reconcile({
+      serverTick: 50,
+      lastProcessedSeq: 0,
+      players: [],
+      abilityEntities: [
+        {
+          slot: 11,
+          entType: 3,
+          owner: 0,
+          abilityId: 13,
+          x: 4,
+          y: 1,
+          z: -2,
+          velX: 0.75,
+          velY: 0,
+          velZ: -0.25,
+          ageTicks: 9,
+          endTicksLeft: 120,
+          param: 350,
+        },
+      ],
+    });
+
+    const state = predicted.getPredictedState();
+    expect(state.entType[0]).toBe(0);
+    expect(state.entType[11]).toBe(3);
+    expect(state.entVelX[11]).toBeCloseTo(0.75);
+    expect(state.entVelZ[11]).toBeCloseTo(-0.25);
+    expect(state.entSpawnTick[11]).toBe(41);
+    expect(state.entEndTick[11]).toBe(170);
+  });
+
   it("self-mobility (updraft/dash), and charge/cooldown bookkeeping, reconcile exactly at 80ms RTT; a cast denied by a phase change leaves no stuck charge", () => {
     const host = new ServerHost({
       numPlayers: 2,
@@ -53,8 +87,9 @@ describe("prediction exactness for abilities (acceptance criterion 3)", () => {
     let reachedRound = false;
 
     for (let i = 0; i < 700; i++) {
-      if (predicted) {
-        const state = predicted.getPredictedState();
+      const active = observePrediction(predicted);
+      if (active) {
+        const state = active.getPredictedState();
 
         if (!agentSet) {
           const s = host.getState();
@@ -82,7 +117,7 @@ describe("prediction exactness for abilities (acceptance criterion 3)", () => {
         } else {
           input = { ...idleInput(0), forward: 1 };
         }
-        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        const { seq, quantizedInput } = active.queueAndPredict(input);
         send(seq, quantizedInput, Math.round(i));
       }
       clock.advance(FIXED_DT_MS);

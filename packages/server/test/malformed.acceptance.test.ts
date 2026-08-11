@@ -1,4 +1,4 @@
-import { createLoopbackPair } from "@vg/protocol";
+import { createLoopbackPair, encodeMessage, MessageType } from "@vg/protocol";
 import { describe, expect, it } from "vitest";
 import { ServerHost } from "../src/serverHost.js";
 import { createScriptedInputSender } from "./testUtils.js";
@@ -9,6 +9,62 @@ import { createScriptedInputSender } from "./testUtils.js";
 // used to kill a live devServer process: an unknown type tag, and a
 // truncated InputBatch that claims 5 frames but supplies none.
 describe("malformed input handling (blocker fix F1)", () => {
+  const idleFrame = {
+    forward: 0,
+    right: 0,
+    yaw: 0,
+    pitch: 0,
+    jump: false,
+    crouch: false,
+    walk: false,
+    fire: false,
+    ads: false,
+    reload: false,
+    slot1: false,
+    slot2: false,
+    interact: false,
+    ping: false,
+    ability1: false,
+    ability2: false,
+    signature: false,
+    ult: false,
+  } as const;
+
+  it("rejects non-finite look input before it can poison authoritative state", () => {
+    const host = new ServerHost({ numPlayers: 1 });
+    const [attacker, attackerServer] = createLoopbackPair();
+    host.connect(attackerServer);
+
+    attacker.send(
+      encodeMessage({
+        type: MessageType.InputBatch,
+        firstSeq: 0,
+        viewTick: 0,
+        frames: [{ ...idleFrame, yaw: Number.NaN }, { ...idleFrame, yaw: Number.POSITIVE_INFINITY }],
+      }),
+    );
+    host.step();
+
+    expect(host.getMalformedFrameCount()).toBe(1);
+    expect(Number.isFinite(host.getState().yaw[0])).toBe(true);
+    expect(Number.isFinite(host.getState().posX[0])).toBe(true);
+    expect(Number.isFinite(host.getState().posZ[0])).toBe(true);
+  });
+
+  it("rejects oversized batches and sequence numbers too far ahead of the consume window", () => {
+    const host = new ServerHost({ numPlayers: 1 });
+    const [attacker, attackerServer] = createLoopbackPair();
+    host.connect(attackerServer);
+
+    attacker.send(
+      encodeMessage({ type: MessageType.InputBatch, firstSeq: 0, viewTick: 0, frames: [idleFrame, idleFrame, idleFrame, idleFrame] }),
+    );
+    attacker.send(encodeMessage({ type: MessageType.InputBatch, firstSeq: 1_000_000, viewTick: 0, frames: [idleFrame] }));
+
+    expect(host.getMalformedFrameCount()).toBe(2);
+    expect(host.getJitterStats(0)?.maxDepth).toBe(0);
+  });
+
   it("survives an unknown message type tag", () => {
     const host = new ServerHost({ numPlayers: 2 });
     const [attacker, attackerServer] = createLoopbackPair();

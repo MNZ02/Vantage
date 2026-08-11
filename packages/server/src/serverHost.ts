@@ -18,6 +18,7 @@ import {
   FLASH_NONE,
   KILL_REWARD,
   LEVEL_BOXES,
+  LEVEL_HALF_EXTENT,
   MAX_ABILITY_ENTITIES,
   MAX_CREDITS,
   MAX_DROPPED_WEAPONS,
@@ -59,10 +60,12 @@ import {
   eyePosition,
   getAbilityDef,
   getCombatWeaponDef,
+  liveSmokeSpheres,
   liveWallBoxes,
   pickupWeapon,
   raycastBoxes,
   raycastPlayers,
+  raycastSpheres,
   raycastWalls,
   selectAgent,
   shotDirection,
@@ -105,6 +108,18 @@ import { StateRingBuffer } from "./ringbuffer.js";
 
 function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+/** Maximum retained samples in each diagnostic event/timing log. */
+export const SERVER_TELEMETRY_RETENTION = 8192;
+
+function appendBounded<T>(items: T[], value: T): void {
+  if (items.length >= SERVER_TELEMETRY_RETENTION) {
+    // Trim in chunks so the hot path does not shift thousands of elements on
+    // every append while still keeping a generous recent diagnostic window.
+    items.splice(0, SERVER_TELEMETRY_RETENTION >> 2);
+  }
+  items.push(value);
 }
 
 export type ServerMode = "dm" | "match";
@@ -178,8 +193,41 @@ interface HeldSlot {
 const FIRE_VIEW_TICK_MAX_AGE = 13; // ~200 ms at 64 Hz, per spec
 const RING_BUFFER_CAPACITY = 64; // 1 s at 64 Hz
 const VISIBILITY_EVERY_N_TICKS = 4;
+const VISIBILITY_GRACE_TICKS = 16;
 const VISIBILITY_HALF_FOV_RAD = ((110 / 2) * Math.PI) / 180; // 110 deg total FOV cone
 const MAP_PING_RATE_LIMIT_TICKS = 64; // 1/s @ 64Hz
+const MAX_INPUT_BATCH_FRAMES = 3;
+const MAX_ABS_WIRE_YAW = 1_000_000;
+const MAX_ABS_WIRE_PITCH = Math.PI / 2 + 0.02;
+
+function isWireAxis(value: number): boolean {
+  return value === -1 || value === 0 || value === 1;
+}
+
+function isValidInputSample(sample: InputSample): boolean {
+  return (
+    isWireAxis(sample.forward) &&
+    isWireAxis(sample.right) &&
+    Number.isFinite(sample.yaw) &&
+    Math.abs(sample.yaw) <= MAX_ABS_WIRE_YAW &&
+    Number.isFinite(sample.pitch) &&
+    Math.abs(sample.pitch) <= MAX_ABS_WIRE_PITCH
+  );
+}
+
+function requireIntegerInRange(name: string, value: number, min: number, max: number): number {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be an integer in [${min}, ${max}], received ${String(value)}`);
+  }
+  return value;
+}
+
+function requireFiniteInRange(name: string, value: number, min: number, max: number): number {
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be finite and in [${min}, ${max}], received ${String(value)}`);
+  }
+  return value;
+}
 
 function isZeroToken(token: Uint8Array): boolean {
   for (let i = 0; i < token.length; i++) if (token[i] !== 0) return false;
@@ -245,6 +293,10 @@ export class ServerHost {
   // ---- M3 visibility (team-shared fog of war for the minimap) ----
   /** visibilityMasks[team] = bitmask of ENEMY player indices currently visible to that team. */
   private visibilityMasks: [number, number] = [0, 0];
+  private readonly lastVisibleTick: [Int32Array, Int32Array];
+  private readonly lastVisibleX: [Float64Array, Float64Array];
+  private readonly lastVisibleY: [Float64Array, Float64Array];
+  private readonly lastVisibleZ: [Float64Array, Float64Array];
 
   // ---- M3 match events (diffed pre/post tick()) ----
   private readonly pendingMatchEvents: MatchEventMessage[] = [];
@@ -281,22 +333,22 @@ export class ServerHost {
    */
   private readonly lastOverlappingDropId: (number | null)[];
 
-  /** p95-friendly per-tick timing samples (wall-clock ms spent inside step()), for the soak test. */
+  /** Recent p95-friendly per-tick timing samples (wall-clock ms spent inside step()). */
   readonly stepDurationsMs: number[] = [];
 
   /** Count of frames dropped at the decode boundary (unknown tag, truncated, etc.) — see handleMessage(). */
   private malformedFrameCount = 0;
 
   constructor(opts: ServerHostOptions = {}) {
-    this.numPlayers = opts.numPlayers ?? MAX_PLAYERS;
-    this.seed = opts.seed ?? 1;
+    this.numPlayers = requireIntegerInRange("numPlayers", opts.numPlayers ?? MAX_PLAYERS, 1, MAX_PLAYERS);
+    this.seed = requireIntegerInRange("seed", opts.seed ?? 1, 0, 0xffff_ffff);
     this.boxes = opts.boxes ?? LEVEL_BOXES;
     this.lagComp = opts.lagComp ?? (typeof process !== "undefined" ? process.env["LAGCOMP"] !== "off" : true);
-    this.snapshotEvery = opts.snapshotEveryNTicks ?? 2;
-    this.fireMaxRange = opts.fireMaxRange ?? 100;
+    this.snapshotEvery = requireIntegerInRange("snapshotEveryNTicks", opts.snapshotEveryNTicks ?? 2, 1, 64);
+    this.fireMaxRange = requireFiniteInRange("fireMaxRange", opts.fireMaxRange ?? 100, 0.1, 10_000);
     this.mode = opts.mode ?? "dm";
-    this.minPlayers = opts.minPlayers ?? 2;
-    this.reconnectHoldMs = opts.reconnectHoldMs ?? 90_000;
+    this.minPlayers = requireIntegerInRange("minPlayers", opts.minPlayers ?? Math.min(2, this.numPlayers), 1, this.numPlayers);
+    this.reconnectHoldMs = requireFiniteInRange("reconnectHoldMs", opts.reconnectHoldMs ?? 90_000, 0, 10 * 60_000);
 
     if (this.mode === "match") {
       this.state = createMatchState(this.seed, this.numPlayers, opts.matchConfig ?? {});
@@ -318,6 +370,11 @@ export class ServerHost {
     }
     this.ring.push(this.state);
     this.lastOverlappingDropId = new Array(this.numPlayers).fill(null);
+    this.lastVisibleTick = [new Int32Array(this.numPlayers).fill(-1_000_000), new Int32Array(this.numPlayers).fill(-1_000_000)];
+    this.lastVisibleX = [new Float64Array(this.numPlayers), new Float64Array(this.numPlayers)];
+    this.lastVisibleY = [new Float64Array(this.numPlayers), new Float64Array(this.numPlayers)];
+    this.lastVisibleZ = [new Float64Array(this.numPlayers), new Float64Array(this.numPlayers)];
+    this.resetVisibilityMemory();
   }
 
   getState(): SimState {
@@ -370,7 +427,7 @@ export class ServerHost {
     return this.malformedFrameCount;
   }
 
-  /** All ShotEvents ever returned by tick() (for tests: matching a client-predicted shot to its authoritative counterpart by shotIndex). */
+  /** Recent ShotEvents returned by tick() (for diagnostics and prediction tests). */
   getAllShots(): readonly ShotEvent[] {
     return this.allShots;
   }
@@ -454,7 +511,7 @@ export class ServerHost {
     }
 
     transport.onMessage((data) => this.handleMessage(record, data));
-    transport.onClose(() => this.disconnect(index));
+    transport.onClose(() => this.disconnect(record.playerIndex, transport));
 
     // Start the match (team assignment happens inside startMatch()) BEFORE
     // sending Welcome, so the player whose join tips connectedCount() over
@@ -466,6 +523,7 @@ export class ServerHost {
     if (this.mode === "match" && this.state.matchPhase === PHASE_WAITING && this.connectedCount() >= this.minPlayers) {
       this.state = startMatch(this.state);
       this.ring.push(this.state);
+      this.resetVisibilityMemory();
       for (const [otherIndex, otherRecord] of this.clients) {
         if (otherIndex === index) continue;
         otherRecord.transport.send(
@@ -508,7 +566,9 @@ export class ServerHost {
    * token arriving within that window reattaches via handleMessage's Hello
    * branch (see tryReattach()) rather than through connect().
    */
-  disconnect(playerIndex: number): void {
+  disconnect(playerIndex: number, expectedTransport?: Transport): void {
+    const connected = this.clients.get(playerIndex);
+    if (expectedTransport && connected?.transport !== expectedTransport) return;
     if (this.mode === "match") {
       const token = this.slotTokens.get(playerIndex);
       this.clients.delete(playerIndex);
@@ -618,7 +678,7 @@ export class ServerHost {
       this.clients.set(matchedIndex, record);
       this.slotTokens.set(matchedIndex, token);
       transport.onMessage((data2) => this.handleMessage(record, data2));
-      transport.onClose(() => this.disconnect(matchedIndex));
+      transport.onClose(() => this.disconnect(record.playerIndex, transport));
       transport.send(
         encodeMessage({
           type: MessageType.Welcome,
@@ -644,8 +704,15 @@ export class ServerHost {
       return;
     }
     if (msg.type === MessageType.InputBatch) {
+      if (msg.frames.length < 1 || msg.frames.length > MAX_INPUT_BATCH_FRAMES || msg.frames.some((frame) => !isValidInputSample(frame))) {
+        this.malformedFrameCount++;
+        return;
+      }
       for (let i = 0; i < msg.frames.length; i++) {
-        record.jitter.arrive(msg.firstSeq + i, msg.frames[i]!);
+        if (!record.jitter.arrive(msg.firstSeq + i, msg.frames[i]!)) {
+          this.malformedFrameCount++;
+          return;
+        }
       }
       record.lastViewTick = msg.viewTick;
     } else if (msg.type === MessageType.BuyCmd) {
@@ -710,6 +777,8 @@ export class ServerHost {
 
   private handleMapPing(playerIndex: number, msg: MapPingMessage): void {
     if (this.mode !== "match") return;
+    if (!Number.isFinite(msg.x) || !Number.isFinite(msg.z)) return;
+    if (Math.abs(msg.x) > LEVEL_HALF_EXTENT || Math.abs(msg.z) > LEVEL_HALF_EXTENT) return;
     const record = this.clients.get(playerIndex);
     if (!record) return;
     if (this.state.tick - record.lastPingTick < MAP_PING_RATE_LIMIT_TICKS) return; // rate-limited
@@ -740,16 +809,16 @@ export class ServerHost {
           crouch: value.crouch,
           walk: value.walk,
           fire: value.fire,
-          ads: value.ads,
-          reload: value.reload,
-          slot1: value.slot1,
-          slot2: value.slot2,
-          interact: value.interact,
-          ping: value.ping,
-          ability1: value.ability1,
-          ability2: value.ability2,
-          signature: value.signature,
-          ult: value.ult,
+          ads: Boolean(value.ads),
+          reload: Boolean(value.reload),
+          slot1: Boolean(value.slot1),
+          slot2: Boolean(value.slot2),
+          interact: Boolean(value.interact),
+          ping: Boolean(value.ping),
+          ability1: Boolean(value.ability1),
+          ability2: Boolean(value.ability2),
+          signature: Boolean(value.signature),
+          ult: Boolean(value.ult),
         };
       }
     }
@@ -773,7 +842,7 @@ export class ServerHost {
     // lands before the round-end win-check that runs at the START of the
     // NEXT tick() call, so it correctly keeps the round alive.
     for (const shot of result.shots) {
-      this.allShots.push(shot);
+      appendBounded(this.allShots, shot);
       this.resolveShot(shot);
     }
     for (const evt of result.abilityEvents) {
@@ -789,6 +858,7 @@ export class ServerHost {
       this.diffMatchEvents(prevPhase, prevSpike, prevRound);
       if (prevPhase !== PHASE_BUY && this.state.matchPhase === PHASE_BUY) {
         this.drops.length = 0; // drops cleared at round reset (spec)
+        this.resetVisibilityMemory();
       }
       // Ult points: plant/defuse (kill/death handled in handleKill; orb
       // pickup handled in-sim via abilities/logic.ts's updateOrbPickups).
@@ -809,7 +879,7 @@ export class ServerHost {
     this.broadcastPendingMatchEvents();
     this.broadcastPendingAbilityEvents();
 
-    this.stepDurationsMs.push(nowMs() - startedAt);
+    appendBounded(this.stepDurationsMs, nowMs() - startedAt);
   }
 
   private diffMatchEvents(prevPhase: number, prevSpike: number, prevRound: number): void {
@@ -873,14 +943,8 @@ export class ServerHost {
    * call). Recomputed on demand (not cached) since walls spawn/break/expire
    * tick-to-tick; cheap at MAX_ABILITY_ENTITIES=64.
    *
-   * Deliberately NOT occluding (documented gap, not a bug): smoke spheres.
-   * Smokes are rendered as opaque on the client, but this server's own
-   * raycastBoxes/raycastWalls occlusion tests are AABB-only — there's no
-   * sphere-vs-ray primitive in @vg/sim's raycast module, so a smoke cannot
-   * block a flash/reveal/visibility check the way the plan's §3.1 originally
-   * envisioned ("smokes = sphere occluders (fed to server visibility *and*
-   * flash LoS tests)"). Sphere occlusion is deferred to a follow-up pass;
-   * noted in PLAN.md too.
+   * Smoke spheres are gathered separately by liveSmokeSpheres() because they
+   * are visual occluders rather than solid movement/bullet geometry.
    */
   private occlusionBoxes(): readonly Box[] {
     const wallBoxes = liveWallBoxes(this.state);
@@ -893,9 +957,9 @@ export class ServerHost {
    * to the enemy's eye position AND the enemy falls within a 110-degree cone
    * centered on that member's yaw. Deliberately amortized (every 4 ticks,
    * not every tick) and O(numPlayers^2) — fine at MAX_PLAYERS=16. Full
-   * snapshot interest-culling/anti-wallhack is explicitly DEFERRED (see
-   * PLAN.md §3.2) — this only feeds the minimap, not what raw combat state
-   * a client's own SimState mirror actually contains.
+   * The resulting mask also drives recipient-specific snapshot filtering:
+   * hidden enemy motion and private combat/economy fields are withheld while
+   * the last known position is frozen (with a short exit grace window).
    *
    * M4a: Sonar's Pulse/Recon Dart reveals (see activeReveals, populated by
    * resolveAbilityEvent) are ORed in on top of the raycast-based visibility
@@ -906,6 +970,7 @@ export class ServerHost {
   private updateVisibility(): void {
     const s = this.state;
     const boxes = this.occlusionBoxes();
+    const smokeSpheres = liveSmokeSpheres(s);
     let team0Mask = 0; // attackers' view of defenders
     let team1Mask = 0; // defenders' view of attackers
 
@@ -917,7 +982,7 @@ export class ServerHost {
 
       let visible = false;
       for (let m = 0; m < this.numPlayers; m++) {
-        if (s.alive[m] === 0 || s.team[m] !== viewerTeam) continue;
+        if (!this.clients.has(m) || s.alive[m] === 0 || s.team[m] !== viewerTeam) continue;
         const eyeM = eyePosition(s, m);
         const eyeE = eyePosition(s, e);
         const dx = eyeE.x - eyeM.x;
@@ -937,7 +1002,8 @@ export class ServerHost {
         if (Math.abs(diff) > VISIBILITY_HALF_FOV_RAD) continue;
 
         const blocked = raycastBoxes(boxes, eyeM, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
-        if (blocked === null) {
+        const smokeBlocked = raycastSpheres(smokeSpheres, eyeM, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
+        if (blocked === null && smokeBlocked === null) {
           visible = true;
           break;
         }
@@ -955,6 +1021,30 @@ export class ServerHost {
     }
 
     this.visibilityMasks = [team0Mask, team1Mask];
+    this.rememberVisiblePlayers(TEAM_ATTACKERS, team0Mask);
+    this.rememberVisiblePlayers(TEAM_DEFENDERS, team1Mask);
+  }
+
+  private resetVisibilityMemory(): void {
+    for (let team = 0; team <= 1; team++) {
+      for (let i = 0; i < this.numPlayers; i++) {
+        this.lastVisibleTick[team]![i] = -1_000_000;
+        this.lastVisibleX[team]![i] = this.state.posX[i]!;
+        this.lastVisibleY[team]![i] = this.state.posY[i]!;
+        this.lastVisibleZ[team]![i] = this.state.posZ[i]!;
+      }
+    }
+  }
+
+  private rememberVisiblePlayers(team: number, mask: number): void {
+    if (team !== TEAM_ATTACKERS && team !== TEAM_DEFENDERS) return;
+    for (let i = 0; i < this.numPlayers; i++) {
+      if ((mask & (1 << i)) === 0) continue;
+      this.lastVisibleTick[team]![i] = this.state.tick;
+      this.lastVisibleX[team]![i] = this.state.posX[i]!;
+      this.lastVisibleY[team]![i] = this.state.posY[i]!;
+      this.lastVisibleZ[team]![i] = this.state.posZ[i]!;
+    }
   }
 
   private pruneExpiredReveals(): void {
@@ -996,7 +1086,7 @@ export class ServerHost {
     const currentTick = this.state.tick;
 
     if (evt.abilityId === ABL_UMBRA_BLIND && evt.kind === "detonate") {
-      const flashes = computeFlash(this.state, this.occlusionBoxes(), evt.x, evt.y, evt.z);
+      const flashes = computeFlash(this.state, this.occlusionBoxes(), evt.x, evt.y, evt.z, liveSmokeSpheres(this.state));
       for (const f of flashes) this.state = applyFlash(this.state, f.playerIndex, f.intensity, currentTick);
     } else if (evt.abilityId === ABL_SONAR_SHOCK && evt.kind === "detonate") {
       const def = getAbilityDef(ABL_SONAR_SHOCK)!;
@@ -1020,7 +1110,7 @@ export class ServerHost {
       // requireLoS=false: Pulse ignores walls entirely (spec: "walls
       // irrelevant") — occlusionBoxes() is passed for call-site consistency
       // but has no effect here since the LoS raycast itself is skipped.
-      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, false);
+      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, false, liveSmokeSpheres(this.state));
       if (mask !== 0 && (team === TEAM_ATTACKERS || team === TEAM_DEFENDERS)) {
         this.activeReveals.push({ team, mask, expiresAtTick: currentTick + def.durationTicks! });
       }
@@ -1028,7 +1118,7 @@ export class ServerHost {
       const def = getAbilityDef(ABL_SONAR_RECON)!;
       const team = this.state.team[evt.owner]!;
       // requireLoS=true: a live Lumen wall blocks Recon Dart's reveal, same as level geometry.
-      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, true);
+      const mask = computeReveal(this.state, this.occlusionBoxes(), team, evt.x, evt.y, evt.z, def.radius!, true, liveSmokeSpheres(this.state));
       if (mask !== 0 && (team === TEAM_ATTACKERS || team === TEAM_DEFENDERS)) {
         this.activeReveals.push({ team, mask, expiresAtTick: currentTick + def.durationTicks! });
       }
@@ -1121,7 +1211,7 @@ export class ServerHost {
     const healthAfter = this.state.health[targetIndex]!;
     const regionCode = hit.region === "head" ? 0 : hit.region === "body" ? 1 : 2;
 
-    this.hits.push({ shooterIndex, targetIndex, serverTick: currentTick, damage, region: regionCode, weaponId: shot.weaponId });
+    appendBounded(this.hits, { shooterIndex, targetIndex, serverTick: currentTick, damage, region: regionCode, weaponId: shot.weaponId });
 
     const hitConfirm: HitConfirmMessage = {
       type: MessageType.HitConfirm,
@@ -1178,7 +1268,7 @@ export class ServerHost {
     }
 
     const record: KillRecord = { killerIndex, victimIndex, weaponId, headshot, assistIndex, serverTick: currentTick };
-    this.kills.push(record);
+    appendBounded(this.kills, record);
 
     const msg: KillEventMessage = { type: MessageType.KillEvent, killerIndex, victimIndex, weaponId, headshot, assistIndex };
     const encoded = encodeMessage(msg);
@@ -1303,6 +1393,58 @@ export class ServerHost {
       });
     }
 
+    // Dead positions are public. Remember them for both teams so a mid-round
+    // revive starts from the last legitimately known location rather than a
+    // stale pre-death sighting.
+    for (let i = 0; i < this.numPlayers; i++) {
+      if (this.state.alive[i] === 1) continue;
+      for (let team = 0; team <= 1; team++) {
+        this.lastVisibleTick[team]![i] = this.state.tick;
+        this.lastVisibleX[team]![i] = this.state.posX[i]!;
+        this.lastVisibleY[team]![i] = this.state.posY[i]!;
+        this.lastVisibleZ[team]![i] = this.state.posZ[i]!;
+      }
+    }
+
+    const playersByTeam: [SnapshotPlayer[], SnapshotPlayer[]] = [players.slice(), players.slice()];
+    if (isMatch) {
+      for (let team = 0; team <= 1; team++) {
+        const visibleMask = this.getVisibilityMask(team);
+        const effective = playersByTeam[team]!;
+        for (let i = 0; i < this.numPlayers; i++) {
+          const row = players[i]!;
+          const currentlyVisible = (visibleMask & (1 << i)) !== 0;
+          const withinGrace = this.state.tick - this.lastVisibleTick[team]![i]! <= VISIBILITY_GRACE_TICKS;
+          const mayKnowPosition = row.team === team || row.alive === false || currentlyVisible || withinGrace;
+          if (mayKnowPosition) continue;
+          effective[i] = {
+            ...row,
+            posX: this.lastVisibleX[team]![i]!,
+            posY: this.lastVisibleY[team]![i]!,
+            posZ: this.lastVisibleZ[team]![i]!,
+            velX: 0,
+            velY: 0,
+            velZ: 0,
+            yaw: 0,
+            pitch: 0,
+            crouching: false,
+            grounded: true,
+            health: 0,
+            armor: 0,
+            weaponPrimary: WEAPON_NONE,
+            weaponSecondary: WEAPON_NONE,
+            magActive: 0,
+            reserveActive: 0,
+            tagTicksLeft: 0,
+            credits: 0,
+            flashedTicksLeft: 0,
+            flashIntensity: FLASH_NONE,
+            abilityCharges: [0, 0, 0, 0],
+          };
+        }
+      }
+    }
+
     const droppedWeapons: SnapshotDroppedWeapon[] = this.drops.map((d) => ({ id: d.id, weaponId: d.weaponId, x: d.x, y: d.y, z: d.z, mag: d.mag }));
 
     const abilityEntities: SnapshotAbilityEntity[] = [];
@@ -1310,12 +1452,17 @@ export class ServerHost {
       if (this.state.entType[e] === ENT_NONE) continue;
       const endTick = this.state.entEndTick[e]!;
       abilityEntities.push({
+        slot: e,
         entType: this.state.entType[e]!,
         owner: this.state.entOwner[e]!,
         abilityId: this.state.entAbilityId[e]!,
         x: this.state.entX[e]!,
         y: this.state.entY[e]!,
         z: this.state.entZ[e]!,
+        velX: this.state.entVelX[e]!,
+        velY: this.state.entVelY[e]!,
+        velZ: this.state.entVelZ[e]!,
+        ageTicks: Math.max(0, Math.min(65535, this.state.tick - this.state.entSpawnTick[e]!)),
         endTicksLeft: endTick === -1 ? 0 : Math.max(0, endTick - this.state.tick),
         param: Math.max(0, this.state.entParam[e]!),
       });
@@ -1334,7 +1481,10 @@ export class ServerHost {
         type: MessageType.Snapshot,
         serverTick: this.state.tick,
         lastProcessedSeq: Math.max(0, record.jitter.lastConsumedSeq),
-        players,
+        players:
+          isMatch && (recipientTeam === TEAM_ATTACKERS || recipientTeam === TEAM_DEFENDERS)
+            ? playersByTeam[recipientTeam]!
+            : players,
         droppedWeapons,
         abilityEntities,
         mode: this.state.mode,

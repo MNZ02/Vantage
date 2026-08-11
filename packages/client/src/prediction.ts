@@ -20,8 +20,9 @@ import { quantizeInputSample } from "@vg/protocol";
 const CORRECTION_DECAY_PER_TICK = 0.85;
 /** Below this, a reconciliation diff is treated as noise and silently kept (no visible correction). */
 const RECONCILE_EPSILON_M = 1e-3;
-/** How many past (seq -> state) entries to retain for reconcile()'s base lookup — generous headroom over any realistic RTT+jitter-buffer depth. */
-const HISTORY_RETENTION = 512;
+/** Three seconds of 64 Hz history: enough for severe jitter without retaining tens of thousands of typed-array objects. */
+const HISTORY_RETENTION = 192;
+const MAX_PENDING_INPUTS = 192;
 
 export interface AuthoritativePlayerState {
   posX: number;
@@ -59,12 +60,17 @@ export interface AuthoritativePlayerState {
 
 /** M4a: one live ability world-entity, mirroring @vg/protocol's SnapshotAbilityEntity. */
 export interface AuthoritativeAbilityEntity {
+  slot: number;
   entType: number;
   owner: number;
   abilityId: number;
   x: number;
   y: number;
   z: number;
+  velX: number;
+  velY: number;
+  velZ: number;
+  ageTicks: number;
   endTicksLeft: number;
   param: number;
 }
@@ -128,6 +134,7 @@ export class PredictedClient {
   private state: SimState;
   private readonly boxes: readonly Box[];
   private readonly localIndex: number;
+  private readonly inputScratch: (InputFrame | undefined)[];
   private readonly inputBuffer = new Map<number, InputFrame>();
   /**
    * The predicted state as it was right after each queueAndPredict() call,
@@ -164,6 +171,7 @@ export class PredictedClient {
     this.state = mode === MODE_MATCH ? createMatchState(seed, numPlayers) : createState(seed, numPlayers);
     this.localIndex = localIndex;
     this.boxes = boxes;
+    this.inputScratch = new Array(numPlayers);
   }
 
   getPredictedState(): SimState {
@@ -188,11 +196,21 @@ export class PredictedClient {
     return this.lastShots;
   }
 
+  /** Recent unacknowledged input count, exposed for diagnostics/retention tests. */
+  getPendingInputCount(): number {
+    return this.inputBuffer.size;
+  }
+
+  /** Recent predicted-state checkpoint count, exposed for diagnostics/retention tests. */
+  getRetainedStateCount(): number {
+    return this.stateHistory.size;
+  }
+
   private stepLocalOnly(state: SimState, input: InputFrame): { state: SimState; shots: ShotEvent[] } {
-    const inputs: (InputFrame | undefined)[] = new Array(state.numPlayers);
-    inputs[this.localIndex] = input;
-    const result = tick(state, inputs as readonly InputFrame[], this.boxes);
-    return { state: result.state, shots: result.shots.filter((s) => s.playerIndex === this.localIndex) };
+    this.inputScratch[this.localIndex] = input;
+    const result = tick(state, this.inputScratch as readonly InputFrame[], this.boxes);
+    this.inputScratch[this.localIndex] = undefined;
+    return { state: result.state, shots: result.shots };
   }
 
   /**
@@ -209,6 +227,13 @@ export class PredictedClient {
     const quantizedInput = quantizeInputSample(input);
     const seq = this.nextSeq++;
     this.inputBuffer.set(seq, quantizedInput);
+    if (this.inputBuffer.size > MAX_PENDING_INPUTS) {
+      const oldestSeq = this.inputBuffer.keys().next().value as number | undefined;
+      if (oldestSeq !== undefined) {
+        this.inputBuffer.delete(oldestSeq);
+        this.stateHistory.delete(oldestSeq);
+      }
+    }
     const result = this.stepLocalOnly(this.state, quantizedInput);
     this.state = result.state;
     this.lastShots = result.shots;
@@ -307,45 +332,37 @@ export class PredictedClient {
     // player's own cast entities, whose position should already match
     // bit-for-bit (mod f32 wire quantization) thanks to determinism.
     //
-    // Deliberately NOT overwritten (documented limitation): entVelX/Y/Z.
-    // The wire format carries no velocity at all (bandwidth), so a
-    // reconciled projectile's true in-flight velocity is unknowable here —
-    // left as whatever `base` already had (the client's own prior
-    // prediction) rather than zeroed, since entVelX/Z is ALSO how a
-    // stationary wall box's long-axis orientation rides along (see @vg/sim
-    // abilities/entities.ts wallBoxFromEntity) and zeroing it would corrupt
-    // a remote-cast wall's collision shape on this client. A brand-new
-    // remote entity this client has never seen before defaults to 0/0/0
-    // (createState's initial fill) — for a wall that means "assume
-    // Z-aligned" until the *next* full state rebuild (e.g. a fresh
-    // PredictedClient), a narrow, accepted gap given the wire budget.
-    // entSpawnTick isn't on the wire either (only ticks-*remaining*,
-    // endTicksLeft) — approximated as "spawned this instant", which only
-    // matters for a still-flying projectile very close to its
-    // maxFlightTicks safety fuse.
+    // Protocol v5 carries stable slots plus velocity/orientation and age, so
+    // sparse server entity arrays cannot remap onto unrelated client slots.
     if (snapshot.abilityEntities) {
       const n = base.entType.length;
       for (let e = 0; e < n; e++) {
-        const ent = snapshot.abilityEntities[e];
-        if (!ent) {
-          base.entType[e] = 0; // ENT_NONE
-          base.entOwner[e] = 255;
-          base.entAbilityId[e] = 0;
-          base.entX[e] = 0;
-          base.entY[e] = 0;
-          base.entZ[e] = 0;
-          base.entSpawnTick[e] = 0;
-          base.entEndTick[e] = -1;
-          base.entParam[e] = 0;
-          continue;
-        }
+        base.entType[e] = 0; // ENT_NONE
+        base.entOwner[e] = 255;
+        base.entAbilityId[e] = 0;
+        base.entX[e] = 0;
+        base.entY[e] = 0;
+        base.entZ[e] = 0;
+        base.entVelX[e] = 0;
+        base.entVelY[e] = 0;
+        base.entVelZ[e] = 0;
+        base.entSpawnTick[e] = 0;
+        base.entEndTick[e] = -1;
+        base.entParam[e] = 0;
+      }
+      for (const ent of snapshot.abilityEntities) {
+        const e = ent.slot;
+        if (!Number.isInteger(e) || e < 0 || e >= n) continue;
         base.entType[e] = ent.entType;
         base.entOwner[e] = ent.owner;
         base.entAbilityId[e] = ent.abilityId;
         base.entX[e] = ent.x;
         base.entY[e] = ent.y;
         base.entZ[e] = ent.z;
-        base.entSpawnTick[e] = snapshot.serverTick;
+        base.entVelX[e] = ent.velX;
+        base.entVelY[e] = ent.velY;
+        base.entVelZ[e] = ent.velZ;
+        base.entSpawnTick[e] = snapshot.serverTick - ent.ageTicks;
         base.entEndTick[e] = ent.endTicksLeft > 0 ? snapshot.serverTick + ent.endTicksLeft : -1;
         base.entParam[e] = ent.param;
       }
@@ -434,10 +451,11 @@ export class PredictedClient {
       base.defuseCheckpointHit = match.activeDefuseProgress >= base.config.defuseCheckpointTicks ? 1 : 0;
     }
 
-    const remaining = Array.from(this.inputBuffer.entries()).sort((a, b) => a[0] - b[0]);
     let replayed = base;
     let replayedShots: ShotEvent[] = [];
-    for (const [seq, input] of remaining) {
+    // Map insertion order is sequence order; avoid allocating and sorting an
+    // entries array on every snapshot (normally 32 times per second).
+    for (const [seq, input] of this.inputBuffer) {
       const result = this.stepLocalOnly(replayed, input);
       replayed = result.state;
       replayedShots = result.shots;

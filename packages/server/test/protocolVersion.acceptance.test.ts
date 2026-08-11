@@ -1,4 +1,4 @@
-import { MessageType, PROTOCOL_VERSION, createLoopbackPair, encodeMessage } from "@vg/protocol";
+import { MessageType, NO_TOKEN, PROTOCOL_VERSION, createLoopbackPair, encodeMessage } from "@vg/protocol";
 import { describe, expect, it } from "vitest";
 import { ServerHost } from "../src/serverHost.js";
 
@@ -14,7 +14,7 @@ describe("Hello protocol-version enforcement", () => {
       closed = true;
     });
 
-    expect(() => client.send(encodeMessage({ type: MessageType.Hello, protocolVersion: PROTOCOL_VERSION + 1 }))).not.toThrow();
+    expect(() => client.send(encodeMessage({ type: MessageType.Hello, protocolVersion: PROTOCOL_VERSION + 1, reconnectToken: NO_TOKEN }))).not.toThrow();
 
     expect(closed).toBe(true);
     expect(host.isConnected(index)).toBe(false);
@@ -25,7 +25,7 @@ describe("Hello protocol-version enforcement", () => {
     const [client, server] = createLoopbackPair();
     const index = host.connect(server);
 
-    client.send(encodeMessage({ type: MessageType.Hello, protocolVersion: PROTOCOL_VERSION }));
+    client.send(encodeMessage({ type: MessageType.Hello, protocolVersion: PROTOCOL_VERSION, reconnectToken: NO_TOKEN }));
 
     expect(host.isConnected(index)).toBe(true);
     expect(() => host.step()).not.toThrow();

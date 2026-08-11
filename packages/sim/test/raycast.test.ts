@@ -4,6 +4,7 @@ import {
   eyePosition,
   raycastBoxes,
   raycastPlayers,
+  raycastSpheres,
   viewDirection,
   type Box,
 } from "../src/index.js";
@@ -35,6 +36,26 @@ describe("raycastBoxes", () => {
     ];
     const dist = raycastBoxes(boxes, { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1 }, 20);
     expect(dist!).toBeCloseTo(3, 6);
+  });
+});
+
+describe("raycastSpheres", () => {
+  it("returns the nearest sphere entry distance", () => {
+    const dist = raycastSpheres(
+      [
+        { x: 0, y: 0, z: 8, radius: 2 },
+        { x: 0, y: 0, z: 4, radius: 1 },
+      ],
+      { x: 0, y: 0, z: 0 },
+      { x: 0, y: 0, z: 1 },
+      20,
+    );
+    expect(dist).toBeCloseTo(3, 6);
+  });
+
+  it("returns null for a miss or a sphere beyond maxDist", () => {
+    expect(raycastSpheres([{ x: 4, y: 0, z: 4, radius: 1 }], { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1 }, 20)).toBeNull();
+    expect(raycastSpheres([{ x: 0, y: 0, z: 8, radius: 1 }], { x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1 }, 5)).toBeNull();
   });
 });
 

@@ -54,10 +54,10 @@ function idle(yaw = 0): InputFrame {
   return defaultInput(yaw, 0);
 }
 
-function runTicks(state: SimState, n: number, inputsFn: (t: number, s: SimState) => readonly InputFrame[]): SimState {
+function runTicks(state: SimState, n: number, inputsFn: (s: SimState) => readonly InputFrame[]): SimState {
   let s = state;
   for (let i = 0; i < n; i++) {
-    s = tick(s, inputsFn(i, s), LEVEL_BOXES).state;
+    s = tick(s, inputsFn(s), LEVEL_BOXES).state;
   }
   return s;
 }
@@ -74,6 +74,15 @@ function advanceToRound(state: SimState): SimState {
   }
   return s;
 }
+
+describe("match configuration validation", () => {
+  it("rejects invalid timers, credit bounds, and defuse checkpoints", () => {
+    expect(() => createMatchState(1, 2, { buyTicks: 0 })).toThrow(RangeError);
+    expect(() => createMatchState(1, 2, { roundTicks: Number.NaN })).toThrow(RangeError);
+    expect(() => createMatchState(1, 2, { maxCredits: 1000, startCredits: 2000 })).toThrow(RangeError);
+    expect(() => createMatchState(1, 2, { defuseTicks: 4, defuseCheckpointTicks: 5 })).toThrow(RangeError);
+  });
+});
 
 describe("match state machine", () => {
   it("startMatch assigns teams alternating by index and enters buy phase", () => {
@@ -287,8 +296,9 @@ describe("half swap and overtime", () => {
     expect(s.scoreTeam1).toBe(1);
   });
 
-  it("matchEnd freezes phase forever (no further ticks change matchPhase)", () => {
-    let s = startMatch(createMatchState(1, 2, { ...TINY_CONFIG, winTarget: 2, halfAtRound: 99 }));
+  it("matchEnd lingers for matchEndTicks (post-match screen) then auto-resets into a fresh match", () => {
+    const cfg = { ...TINY_CONFIG, winTarget: 2, halfAtRound: 99, matchEndTicks: 8 };
+    let s = startMatch(createMatchState(1, 2, cfg));
     s = advanceToRound(s);
     s = applyDamage(s, 1, 1000); // round 1: attacker wins, 1-0
     s = tick(s, allIdle(s), LEVEL_BOXES).state;
@@ -296,9 +306,26 @@ describe("half swap and overtime", () => {
     s = applyDamage(s, 1, 1000); // round 2: attacker wins again, 2-0 (lead by 2) -> match ends
     s = tick(s, allIdle(s), LEVEL_BOXES).state;
     expect(s.matchPhase).toBe(PHASE_MATCH_END);
-    const frozen = runTicks(s, 500, allIdle);
-    expect(frozen.matchPhase).toBe(PHASE_MATCH_END);
-    expect(frozen.scoreTeam0).toBe(s.scoreTeam0);
+    // It must NOT be terminal: a real expiry tick is scheduled matchEndTicks out.
+    expect(s.phaseEndTick).toBe(s.tick + cfg.matchEndTicks);
+
+    // It stays put until the timer expires...
+    const lingering = runTicks(s, cfg.matchEndTicks - 1, allIdle);
+    expect(lingering.matchPhase).toBe(PHASE_MATCH_END);
+    expect(lingering.scoreTeam0).toBe(2);
+
+    // ...then resets into a brand-new match: buy phase, round 1, 0-0, sides restored.
+    const restarted = runTicks(lingering, 1, allIdle);
+    expect(restarted.matchPhase).toBe(PHASE_BUY);
+    expect(restarted.roundNumber).toBe(1);
+    expect(restarted.scoreTeam0).toBe(0);
+    expect(restarted.scoreTeam1).toBe(0);
+    expect(restarted.halvesSwapped).toBe(0);
+    expect(restarted.team[0]).toBe(TEAM_ATTACKERS);
+    expect(restarted.team[1]).toBe(TEAM_DEFENDERS);
+    // Fresh-match economy: everyone back to starting credits.
+    expect(restarted.credits[0]).toBe(restarted.config.startCredits);
+    expect(restarted.credits[1]).toBe(restarted.config.startCredits);
   });
 });
 
@@ -686,7 +713,11 @@ describe("match determinism", () => {
     const TOTAL_TICKS = 2000;
 
     function run(): { snapshots: string[]; finalRoundNumber: number; finalHalvesSwapped: number } {
-      let s = startMatch(createMatchState(777, 4, TINY_CONFIG)); // TINY_CONFIG's halfAtRound: 1 guarantees a swap by round 2
+      // halfAtRound: 1 guarantees a swap by round 2; winTarget: 99 keeps the
+      // match from ending (and auto-restarting) within the window, so this
+      // test stays focused on multi-round + half-swap determinism. Match-end →
+      // reset determinism is covered separately below.
+      let s = startMatch(createMatchState(777, 4, { ...TINY_CONFIG, winTarget: 99 }));
       const snapshots: string[] = [];
       for (let t = 0; t < TOTAL_TICKS; t++) {
         const inputs = Array.from({ length: 4 }, (_, i) => scriptedInput(t, i));

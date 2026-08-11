@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createState, serializeState, tick, type Box, type InputFrame } from "../src/index.js";
+import { createState, defaultInput, serializeState, tick, type Box, type InputFrame } from "../src/index.js";
 
 const boxes: Box[] = [
   { minX: -50, minY: -1, minZ: -50, maxX: 50, maxY: 0, maxZ: 50 }, // floor
@@ -40,6 +40,18 @@ function runTicks(seed: number, count: number): string[] {
 }
 
 describe("determinism", () => {
+  it("stores cloned ECS columns in one backing allocation without aliasing the prior state", () => {
+    const initial = createState(7, 2);
+    const next = tick(initial, [defaultInput(), defaultInput()], []).state;
+    const buffers = new Set(
+      Object.values(next)
+        .filter((value): value is ArrayBufferView => ArrayBuffer.isView(value))
+        .map((view) => view.buffer),
+    );
+    expect(buffers.size).toBe(1);
+    next.posX[0] = 12;
+    expect(initial.posX[0]).toBe(0);
+  });
   it("produces byte-identical serialized states for two runs of the same seed + input script", () => {
     const a = runTicks(12345, 2000);
     const b = runTicks(12345, 2000);

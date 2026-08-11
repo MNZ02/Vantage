@@ -3,7 +3,7 @@ import { FIXED_DT, LEVEL_BOXES } from "@vg/sim";
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
 import { PredictedClient } from "../src/prediction.js";
-import { createScriptedInputSender, idleInput, toAuthoritative } from "./testUtils.js";
+import { createScriptedInputSender, idleInput, observePrediction, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
 
@@ -42,11 +42,12 @@ describe("correction smoothing (acceptance criterion 4)", () => {
 
     let t = 0;
     for (let i = 0; i < 400; i++) {
-      if (predicted) {
+      const active = observePrediction(predicted);
+      if (active) {
         const input = idleInput();
-        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        const { seq, quantizedInput } = active.queueAndPredict(input);
         send(seq, quantizedInput);
-        renderPositions.push(predicted.getRenderPosition());
+        renderPositions.push(active.getRenderPosition());
       }
 
       t++;

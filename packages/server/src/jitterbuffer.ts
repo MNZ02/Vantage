@@ -32,6 +32,11 @@ export interface JitterBufferStats {
 }
 
 export class JitterBuffer<T> {
+  private static readonly MAX_QUEUE_DEPTH = 64;
+  private static readonly MAX_SEQUENCE_LEAD = 128;
+  /** Two minutes of 64 Hz diagnostics without an ever-growing production allocation. */
+  private static readonly HISTORY_CAPACITY = 64 * 120;
+
   private readonly minTargetDepth: number;
   private readonly maxTargetDepth: number;
   private targetDepth: number;
@@ -44,8 +49,8 @@ export class JitterBuffer<T> {
 
   private tickCount = 0;
   private starvedCount = 0;
-  private depthHistory: number[] = [];
-  private starvedHistory: boolean[] = [];
+  private readonly depthHistory = new Uint8Array(JitterBuffer.HISTORY_CAPACITY);
+  private readonly starvedHistory = new Uint8Array(JitterBuffer.HISTORY_CAPACITY);
 
   constructor(minTargetDepth = 1, maxTargetDepth = 3, initialTargetDepth = 2) {
     this.minTargetDepth = minTargetDepth;
@@ -54,13 +59,17 @@ export class JitterBuffer<T> {
   }
 
   /** Called whenever a (possibly redundant, possibly out-of-order) frame arrives. */
-  arrive(seq: number, value: T): void {
-    if (seq < this.nextSeqToAdmit) return; // already consumed or superseded
-    if (this.queue.some((q) => q.seq === seq)) return; // duplicate (redundancy resend)
+  arrive(seq: number, value: T): boolean {
+    if (!Number.isSafeInteger(seq) || seq < 0) return false;
+    if (seq < this.nextSeqToAdmit) return true; // already consumed or superseded
+    if (seq > this.nextSeqToAdmit + JitterBuffer.MAX_SEQUENCE_LEAD) return false;
+    if (this.queue.some((q) => q.seq === seq)) return true; // duplicate (redundancy resend)
+    if (this.queue.length >= JitterBuffer.MAX_QUEUE_DEPTH) return false;
     // Sorted insert (arrays here are tiny — a handful of ticks of buffering).
     let i = this.queue.length;
     while (i > 0 && this.queue[i - 1]!.seq > seq) i--;
     this.queue.splice(i, 0, { seq, value });
+    return true;
   }
 
   get depth(): number {
@@ -79,13 +88,14 @@ export class JitterBuffer<T> {
     // and available when we needed to serve", the quantity acceptance
     // criteria mean by "buffer depth" (ideally never 0, never unbounded).
     const preDepth = this.queue.length;
-    this.depthHistory.push(preDepth);
+    const historyIndex = (this.tickCount - 1) % JitterBuffer.HISTORY_CAPACITY;
+    this.depthHistory[historyIndex] = Math.min(255, preDepth);
 
     if (!this.started) {
       // Warm-up: don't start draining until we've buffered at least
       // targetDepth frames, so early jitter doesn't immediately starve us.
       if (this.queue.length < this.targetDepth) {
-        this.starvedHistory.push(this.lastValue === null);
+        this.starvedHistory[historyIndex] = this.lastValue === null ? 1 : 0;
         return { value: this.lastValue, starved: this.lastValue === null };
       }
       this.started = true;
@@ -101,7 +111,7 @@ export class JitterBuffer<T> {
       // to clear. Input redundancy is what actually absorbs this tick's loss.
       this.targetDepth = Math.min(this.maxTargetDepth, this.targetDepth + 1);
       this.overfullStreak = 0;
-      this.starvedHistory.push(true);
+      this.starvedHistory[historyIndex] = 1;
       return { value: this.lastValue, starved: true };
     }
 
@@ -127,18 +137,29 @@ export class JitterBuffer<T> {
       this.overfullStreak = 0;
     }
 
-    this.starvedHistory.push(false);
+    this.starvedHistory[historyIndex] = 0;
     return { value: this.lastValue, starved: false };
   }
 
   stats(sinceTick = 0): JitterBufferStats {
-    const depths = this.depthHistory.slice(sinceTick);
-    const starves = this.starvedHistory.slice(sinceTick);
-    const starvedRate = starves.length === 0 ? 0 : starves.filter(Boolean).length / starves.length;
+    const oldestRetainedTick = Math.max(0, this.tickCount - JitterBuffer.HISTORY_CAPACITY);
+    const startTick = Math.max(oldestRetainedTick, Math.min(this.tickCount, Math.max(0, Math.floor(sinceTick))));
+    let samples = 0;
+    let starves = 0;
+    let minDepth = Number.POSITIVE_INFINITY;
+    let maxDepth = 0;
+    for (let tick = startTick; tick < this.tickCount; tick++) {
+      const index = tick % JitterBuffer.HISTORY_CAPACITY;
+      const depth = this.depthHistory[index]!;
+      samples++;
+      starves += this.starvedHistory[index]!;
+      minDepth = Math.min(minDepth, depth);
+      maxDepth = Math.max(maxDepth, depth);
+    }
     return {
-      starvedRate,
-      minDepth: depths.length === 0 ? 0 : Math.min(...depths),
-      maxDepth: depths.length === 0 ? 0 : Math.max(...depths),
+      starvedRate: samples === 0 ? 0 : starves / samples,
+      minDepth: samples === 0 ? 0 : minDepth,
+      maxDepth: samples === 0 ? 0 : maxDepth,
       targetDepth: this.targetDepth,
     };
   }

@@ -46,6 +46,11 @@
 // space is extended (100 = ability1 charge, 101 = ability2 charge — see
 // @vg/sim constants.ts BUY_ITEM_ABILITY1/2) but the wire shape is unchanged
 // (itemId was already a plain u8).
+//
+// M5 integrity changes (protocolVersion bumped 4 -> 5): ability snapshot
+// entities now carry their stable simulation slot, velocity/orientation
+// vector, and age. The previous compact array silently remapped sparse entity
+// slots on clients and could reuse stale velocity for a different entity.
 
 export enum MessageType {
   Hello = 1,
@@ -64,11 +69,12 @@ export enum MessageType {
   AbilityEvent = 14,
 }
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** Fixed length (bytes) of a reconnect session token. All-zero = "no token". */
 export const TOKEN_LENGTH = 16;
 export const NO_TOKEN: Uint8Array = new Uint8Array(TOKEN_LENGTH);
+export const MAX_WIRE_MESSAGE_BYTES = 64 * 1024;
 
 export interface HelloMessage {
   readonly type: MessageType.Hello;
@@ -87,17 +93,17 @@ export interface InputSample {
   readonly crouch: boolean;
   readonly walk: boolean;
   readonly fire: boolean;
-  readonly ads: boolean;
-  readonly reload: boolean;
-  readonly slot1: boolean;
-  readonly slot2: boolean;
-  readonly interact: boolean;
-  readonly ping: boolean;
+  readonly ads?: boolean;
+  readonly reload?: boolean;
+  readonly slot1?: boolean;
+  readonly slot2?: boolean;
+  readonly interact?: boolean;
+  readonly ping?: boolean;
   /** M4a, edge-triggered: cast basic1/basic2/signature/ult. */
-  readonly ability1: boolean;
-  readonly ability2: boolean;
-  readonly signature: boolean;
-  readonly ult: boolean;
+  readonly ability1?: boolean;
+  readonly ability2?: boolean;
+  readonly signature?: boolean;
+  readonly ult?: boolean;
 }
 
 export interface InputBatchMessage {
@@ -185,12 +191,17 @@ export interface SnapshotDroppedWeapon {
 
 /** M4a: one live ability world-entity (projectile/smoke/wall/zone/recon dart/orb — see @vg/sim constants.ts ENT_*). */
 export interface SnapshotAbilityEntity {
+  readonly slot: number; // u8, stable SimState entity slot
   readonly entType: number; // u8
   readonly owner: number; // u8, 255 = none (e.g. ult orbs)
   readonly abilityId: number; // u8
   readonly x: number; // f32
   readonly y: number; // f32
   readonly z: number; // f32
+  readonly velX: number; // f32; wall orientation also rides in X/Z
+  readonly velY: number; // f32
+  readonly velZ: number; // f32
+  readonly ageTicks: number; // u16, clamped ticks since spawn
   readonly endTicksLeft: number; // u16, ticks until expiry (0 if n/a, e.g. still-flying projectiles)
   /** Wall HP / recon-dart pulses-remaining / unused — see @vg/sim SimState.entParam. */
   readonly param: number; // u16
@@ -482,12 +493,30 @@ class Reader {
     this.offset += len;
     return out;
   }
+
+  finish<T>(value: T): T {
+    if (this.offset !== this.view.byteLength) {
+      throw new MalformedMessageError(`message has ${this.view.byteLength - this.offset} trailing byte(s)`);
+    }
+    return value;
+  }
 }
 
 function quantizeAxis(v: number): number {
   if (v > 0.5) return 1;
   if (v < -0.5) return -1;
   return 0;
+}
+
+function normalizeYaw(v: number): number {
+  if (!Number.isFinite(v)) throw new RangeError("input yaw must be finite");
+  const twoPi = Math.PI * 2;
+  return ((v + Math.PI) % twoPi + twoPi) % twoPi - Math.PI;
+}
+
+function normalizePitch(v: number): number {
+  if (!Number.isFinite(v)) throw new RangeError("input pitch must be finite");
+  return Math.max(-Math.PI / 2, Math.min(Math.PI / 2, v));
 }
 
 const f32RoundScratch = new Float32Array(1);
@@ -512,8 +541,8 @@ export function quantizeInputSample<T extends { forward: number; right: number; 
     ...input,
     forward: quantizeAxis(input.forward),
     right: quantizeAxis(input.right),
-    yaw: quantizeF32(input.yaw),
-    pitch: quantizeF32(input.pitch),
+    yaw: quantizeF32(normalizeYaw(input.yaw)),
+    pitch: quantizeF32(normalizePitch(input.pitch)),
   };
 }
 
@@ -668,12 +697,17 @@ export function encodeMessage(msg: ProtocolMessage): Uint8Array {
       }
       w.u8(msg.abilityEntities.length);
       for (const e of msg.abilityEntities) {
+        w.u8(e.slot);
         w.u8(e.entType);
         w.u8(e.owner);
         w.u8(e.abilityId);
         w.f32(e.x);
         w.f32(e.y);
         w.f32(e.z);
+        w.f32(e.velX);
+        w.f32(e.velY);
+        w.f32(e.velZ);
+        w.u16(Math.min(65535, e.ageTicks));
         w.u16(Math.min(65535, e.endTicksLeft));
         w.u16(Math.min(65535, e.param));
       }
@@ -761,7 +795,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
     case MessageType.Hello: {
       const protocolVersion = r.u8();
       const reconnectToken = r.bytes(TOKEN_LENGTH);
-      return { type, protocolVersion, reconnectToken };
+      return r.finish({ type, protocolVersion, reconnectToken });
     }
     case MessageType.InputBatch: {
       const firstSeq = r.u32();
@@ -795,15 +829,15 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
           ult: (buttons & ULT_BIT) !== 0,
         });
       }
-      return { type, firstSeq, viewTick, frames };
+      return r.finish({ type, firstSeq, viewTick, frames });
     }
     case MessageType.BuyCmd: {
       const itemId = r.u8();
-      return { type, itemId };
+      return r.finish({ type, itemId });
     }
     case MessageType.SellCmd: {
       const itemId = r.u8();
-      return { type, itemId };
+      return r.finish({ type, itemId });
     }
     case MessageType.Welcome: {
       const playerIndex = r.u8();
@@ -813,7 +847,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const token = r.bytes(TOKEN_LENGTH);
       const team = r.u8();
       const mode = r.u8();
-      return { type, playerIndex, seed, numPlayers, serverTick, token, team, mode };
+      return r.finish({ type, playerIndex, seed, numPlayers, serverTick, token, team, mode });
     }
     case MessageType.Snapshot: {
       const serverTick = r.u32();
@@ -887,15 +921,20 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const entityCount = r.u8();
       const abilityEntities: SnapshotAbilityEntity[] = [];
       for (let i = 0; i < entityCount; i++) {
+        const slot = r.u8();
         const entType = r.u8();
         const owner = r.u8();
         const abilityId = r.u8();
         const x = r.f32();
         const y = r.f32();
         const z = r.f32();
+        const velX = r.f32();
+        const velY = r.f32();
+        const velZ = r.f32();
+        const ageTicks = r.u16();
         const endTicksLeft = r.u16();
         const param = r.u16();
-        abilityEntities.push({ entType, owner, abilityId, x, y, z, endTicksLeft, param });
+        abilityEntities.push({ slot, entType, owner, abilityId, x, y, z, velX, velY, velZ, ageTicks, endTicksLeft, param });
       }
       const mode = r.u8();
       const matchPhase = r.u8();
@@ -914,7 +953,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const activeDefuseProgress = r.u16();
       const defuserIndex = r.u8();
       const visibleEnemyMask = r.u16();
-      return {
+      return r.finish({
         type,
         serverTick,
         lastProcessedSeq,
@@ -938,7 +977,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
         activeDefuseProgress,
         defuserIndex,
         visibleEnemyMask,
-      };
+      });
     }
     case MessageType.KillEvent: {
       const killerIndex = r.u8();
@@ -946,7 +985,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const weaponId = r.u8();
       const flags = r.u8();
       const assistIndex = r.u8();
-      return { type, killerIndex, victimIndex, weaponId, headshot: (flags & HEADSHOT_BIT) !== 0, assistIndex };
+      return r.finish({ type, killerIndex, victimIndex, weaponId, headshot: (flags & HEADSHOT_BIT) !== 0, assistIndex });
     }
     case MessageType.HitConfirm: {
       const shooterIndex = r.u8();
@@ -954,35 +993,35 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const damage = r.u16();
       const region = r.u8();
       const targetHealthAfter = r.u8();
-      return { type, shooterIndex, targetIndex, damage, region, targetHealthAfter };
+      return r.finish({ type, shooterIndex, targetIndex, damage, region, targetHealthAfter });
     }
     case MessageType.DamageTaken: {
       const victimIndex = r.u8();
       const attackerIndex = r.u8();
       const damage = r.u16();
-      return { type, victimIndex, attackerIndex, damage };
+      return r.finish({ type, victimIndex, attackerIndex, damage });
     }
     case MessageType.MapPing: {
       const x = r.f32();
       const z = r.f32();
-      return { type, x, z };
+      return r.finish({ type, x, z });
     }
     case MessageType.TeamPing: {
       const playerIndex = r.u8();
       const x = r.f32();
       const z = r.f32();
-      return { type, playerIndex, x, z };
+      return r.finish({ type, playerIndex, x, z });
     }
     case MessageType.MatchEvent: {
       const kind = r.u8();
       const winnerTeam = r.u8();
       const reason = r.u8();
       const roundNumber = r.u8();
-      return { type, kind, winnerTeam, reason, roundNumber };
+      return r.finish({ type, kind, winnerTeam, reason, roundNumber });
     }
     case MessageType.AgentSelectCmd: {
       const agentId = r.u8();
-      return { type, agentId };
+      return r.finish({ type, agentId });
     }
     case MessageType.AbilityEvent: {
       const kind = r.u8();
@@ -992,7 +1031,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
       const y = r.f32();
       const z = r.f32();
       const targetIndex = r.u8();
-      return { type, kind, owner, abilityId, x, y, z, targetIndex };
+      return r.finish({ type, kind, owner, abilityId, x, y, z, targetIndex });
     }
     default: {
       const exhaustive: never = type;
@@ -1009,6 +1048,7 @@ export function decodeMessage(data: Uint8Array): ProtocolMessage {
  * Returns null for anything that fails to decode.
  */
 export function decodeMessageSafely(data: Uint8Array): ProtocolMessage | null {
+  if (data.byteLength === 0 || data.byteLength > MAX_WIRE_MESSAGE_BYTES) return null;
   try {
     return decodeMessage(data);
   } catch (err) {

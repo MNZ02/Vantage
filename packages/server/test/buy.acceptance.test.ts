@@ -47,7 +47,7 @@ describe("buy (acceptance criterion 11)", () => {
     client.send(encodeMessage({ type: MessageType.BuyCmd, itemId: 201 })); // heavy armor
     host.step();
     expect(host.getState().armor[index]).toBe(50);
-    const creditsAfterHeavy = host.getState().credits[index];
+    const creditsAfterHeavy = host.getState().credits[index]!;
 
     client.send(encodeMessage({ type: MessageType.BuyCmd, itemId: 201 })); // buy heavy again
     host.step();

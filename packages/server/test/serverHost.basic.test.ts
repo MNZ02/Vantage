@@ -1,4 +1,4 @@
-import { createLoopbackPair, decodeMessage, MessageType } from "@vg/protocol";
+import { createLoopbackPair, decodeMessage, MessageType, type ProtocolMessage, type WelcomeMessage } from "@vg/protocol";
 import { RUN_SPEED } from "@vg/sim";
 import { describe, expect, it } from "vitest";
 import { ServerHost } from "../src/serverHost.js";
@@ -8,19 +8,17 @@ describe("ServerHost connect/disconnect", () => {
   it("sends a Welcome with the assigned player index and seed on connect", () => {
     const host = new ServerHost({ seed: 777, numPlayers: 4 });
     const [clientSide, serverSide] = createLoopbackPair();
-    let welcome: ReturnType<typeof decodeMessage> | null = null;
+    const messages: ProtocolMessage[] = [];
     clientSide.onMessage((data) => {
-      welcome = decodeMessage(data);
+      messages.push(decodeMessage(data));
     });
     const index = host.connect(serverSide);
     expect(index).toBe(0);
-    expect(welcome).not.toBeNull();
-    expect(welcome!.type).toBe(MessageType.Welcome);
-    if (welcome!.type === MessageType.Welcome) {
-      expect(welcome!.seed).toBe(777);
-      expect(welcome!.numPlayers).toBe(4);
-      expect(welcome!.playerIndex).toBe(0);
-    }
+    const welcome = messages.find((message): message is WelcomeMessage => message.type === MessageType.Welcome);
+    expect(welcome).toBeDefined();
+    expect(welcome!.seed).toBe(777);
+    expect(welcome!.numPlayers).toBe(4);
+    expect(welcome!.playerIndex).toBe(0);
   });
 
   it("assigns the lowest free slot and frees it again on disconnect", () => {

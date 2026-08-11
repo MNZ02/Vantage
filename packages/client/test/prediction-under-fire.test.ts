@@ -3,7 +3,7 @@ import { FIXED_DT, LEVEL_BOXES, WEAPONS, cloneState, shotDirection, type InputFr
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
 import { PredictedClient } from "../src/prediction.js";
-import { createScriptedInputSender, toAuthoritative } from "./testUtils.js";
+import { createScriptedInputSender, observePrediction, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
 const FALCON = WEAPONS.find((w) => w.name === "Falcon")!;
@@ -75,7 +75,8 @@ describe("prediction exactness under fire (acceptance criterion 4)", () => {
     const TOTAL_TICKS = 500;
     let t = 0;
     for (let i = 0; i < TOTAL_TICKS; i++) {
-      if (predicted) {
+      const active = observePrediction(predicted);
+      if (active) {
         // Reload window: ticks 150-250, stop firing and hold reload.
         // Switch window: ticks 300-320, tap slot2 then slot1.
         let input: InputFrame;
@@ -88,12 +89,12 @@ describe("prediction exactness under fire (acceptance criterion 4)", () => {
         } else {
           input = strafeFireInput(t);
         }
-        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        const { seq, quantizedInput } = active.queueAndPredict(input);
         send(seq, quantizedInput, Math.round(t));
 
-        for (const shot of predicted.getLastShots()) {
+        for (const shot of active.getLastShots()) {
           const weapon = WEAPONS.find((w) => w.id === shot.weaponId)!;
-          const ps = predicted.getPredictedState();
+          const ps = active.getPredictedState();
           const dir = shotDirection(ps, localIndex, weapon, shot.shotIndex, shot.sprayIndex);
           predictedDirections.set(shot.shotIndex, dir);
         }
@@ -116,7 +117,8 @@ describe("prediction exactness under fire (acceptance criterion 4)", () => {
 
     // Settle: stop all input and let remaining buffered/in-flight messages drain.
     for (let i = 0; i < 60; i++) {
-      if (predicted) {
+      const active = observePrediction(predicted);
+      if (active) {
         const idle: InputFrame = {
           forward: 0,
           right: 0,
@@ -131,7 +133,7 @@ describe("prediction exactness under fire (acceptance criterion 4)", () => {
           slot1: false,
           slot2: false,
         };
-        const { seq, quantizedInput } = predicted.queueAndPredict(idle);
+        const { seq, quantizedInput } = active.queueAndPredict(idle);
         send(seq, quantizedInput, Math.round(t));
       }
       t++;

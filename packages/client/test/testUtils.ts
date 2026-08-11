@@ -1,5 +1,11 @@
-import { MessageType, encodeMessage, type InputFrame, type SnapshotMessage, type Transport } from "@vg/protocol";
-import type { AuthoritativeSnapshot } from "../src/prediction.js";
+import { MessageType, encodeMessage, type SnapshotMessage, type Transport } from "@vg/protocol";
+import type { InputFrame } from "@vg/sim";
+import type { AuthoritativeSnapshot, PredictedClient } from "../src/prediction.js";
+
+/** Opaque read for state assigned by synchronous transport callbacks (which TypeScript cannot model in outer-loop flow analysis). */
+export function observePrediction(prediction: PredictedClient | null): PredictedClient | null {
+  return prediction;
+}
 
 /**
  * Mirrors the real client's send cadence: keeps the last <=3 (seq, input)
@@ -63,12 +69,17 @@ export function toAuthoritative(msg: SnapshotMessage): AuthoritativeSnapshot {
       abilityCharges: pl.abilityCharges,
     })),
     abilityEntities: msg.abilityEntities.map((e) => ({
+      slot: e.slot,
       entType: e.entType,
       owner: e.owner,
       abilityId: e.abilityId,
       x: e.x,
       y: e.y,
       z: e.z,
+      velX: e.velX,
+      velY: e.velY,
+      velZ: e.velZ,
+      ageTicks: e.ageTicks,
       endTicksLeft: e.endTicksLeft,
       param: e.param,
     })),

@@ -84,8 +84,7 @@ import { createBuyPhaseBarrierRenderer, createDroppedWeaponRenderer } from "./wo
 import { createAudioEngine } from "./audio/engine.js";
 import type { AbilityCue } from "./audio/synth.js";
 import { ANNOUNCER_LINES, createAnnouncer } from "./audio/announcer.js";
-import { DEFAULT_VOLUME_SETTINGS, loadVolumeSettings, saveVolumeSettings } from "./audio/settings.js";
-import { FOOTSTEP_MAX_AUDIBLE_M, createFootstepTracker, isFootstepAudible, updateFootstepTracker } from "./audio/footsteps.js";
+import { loadVolumeSettings, saveVolumeSettings } from "./audio/settings.js";
 import { createSettingsOverlay } from "./settingsOverlay.js";
 import { connectNetClient, type NetClient } from "./net.js";
 import { getShotPresentationWeapon } from "./shotPresentation.js";
@@ -169,6 +168,7 @@ const abilityEntities = createAbilityEntityRenderer(scene);
 const agentSelect = createAgentSelectOverlay((agentId) => netClient?.selectAgent(agentId));
 
 let netClient: NetClient | null = null;
+let lastHudState: SimState | null = null;
 const remoteProxies = new Map<number, RemotePlayerProxy>();
 interface RemoteWeaponSnapshot {
   magActive: number;
@@ -177,10 +177,6 @@ interface RemoteWeaponSnapshot {
   weaponSecondary: number;
 }
 const remoteLastWeapon = new Map<number, RemoteWeaponSnapshot>();
-
-/** M5: per-remote-player footstep stride trackers (see audio/footsteps.ts) — one persistent accumulator per player index. */
-const remoteFootstepTrackers = new Map<number, ReturnType<typeof createFootstepTracker>>();
-const localFootstepTracker = createFootstepTracker();
 
 /** M5: maps an ability world-event (id + kind: 0 cast/1 detonate/2 pulse/3 expire) to a synthesized cue — see audio/synth.ts's AbilityCue set. Ult-weapon abilities (Blades/Rail) return null: they reuse the ordinary gunplay pipeline, so their audio is just an ordinary gunshot. */
 function abilityCueFor(abilityId: number, kind: number): AbilityCue | null {
@@ -440,7 +436,6 @@ function updateAds(frameSeconds: number): void {
   const localIndex = netClient.getLocalIndex();
   const state = netClient.getPredictedState();
   if (localIndex === null || !state) return;
-
   const weaponId = getActiveWeaponId(state, localIndex);
   const adsAllowed = state.alive[localIndex] === 1 && isGameplayPresentationActive(state);
   const adsStage = adsAllowed ? state.adsStage[localIndex]! : 0;
@@ -529,6 +524,8 @@ function updateHud(): void {
   const localIndex = netClient.getLocalIndex();
   const state = netClient.getPredictedState();
   if (localIndex === null || !state) return;
+  if (state === lastHudState) return;
+  lastHudState = state;
 
   const activeSlot = state.activeSlot[localIndex]!;
   const weaponId = getActiveWeaponId(state, localIndex);
@@ -690,8 +687,10 @@ function updateHud(): void {
 }
 
 /** Item ids purchased THIS buy phase (see @vg/sim's per-buy-phase purchase tracking) — drives sell-button visibility. */
+const purchasedItemIdsScratch = new Set<number>();
 function purchasedItemIds(state: SimState, localIndex: number): Set<number> {
-  const out = new Set<number>();
+  const out = purchasedItemIdsScratch;
+  out.clear();
   if (state.primaryPurchasedItemId[localIndex] !== WEAPON_NONE) out.add(state.primaryPurchasedItemId[localIndex]!);
   if (state.secondaryPurchasedItemId[localIndex] !== WEAPON_NONE) out.add(state.secondaryPurchasedItemId[localIndex]!);
   if (state.armorPurchasedItemId[localIndex] !== NO_PLAYER) out.add(state.armorPurchasedItemId[localIndex]!);
@@ -770,7 +769,8 @@ function frame(now: number): void {
     syncRemoteProxies();
     updateAds(frameSeconds);
     updateHud();
-    reconnectBanner.setVisible(netClient.getHud().reconnecting);
+    const networkHud = netClient.getHud();
+    reconnectBanner.setState(networkHud.connected ? "connected" : networkHud.reconnecting ? "reconnecting" : "disconnected");
 
     // M3 spectate: while dead, replace the local (frozen) camera with a
     // living teammate's interpolated pose. Never spectates enemies (see
@@ -835,21 +835,21 @@ function frame(now: number): void {
   syncWorldGameplayVisuals(now / 1000);
   renderer.render(scene, camera);
 
-  if (frameSeconds > 0) {
-    fpsCounter.update(1 / frameSeconds);
-  }
-  if (netClient && netClient.isOnline()) {
-    const hud = netClient.getHud();
-    const hitreg = netClient.getHitRegStats();
-    fpsCounter.updateExtra([
-      `rtt: ${hud.rttMs !== null ? hud.rttMs.toFixed(0) + "ms" : "--"}`,
-      `snapshot age: ${hud.snapshotAgeMs.toFixed(0)}ms`,
-      `corrections/s: ${hud.correctionsPerSecond.toFixed(1)}`,
-      `interp starved frames: ${hud.starvedFrames}`,
-      `hitreg agree: ${hitreg.agreementPercent.toFixed(1)}% (n=${hitreg.totalResolved})`,
-    ]);
-  } else {
-    fpsCounter.updateExtra(["offline (single-player)"]);
+  if (fpsCounter.isVisible()) {
+    if (frameSeconds > 0) fpsCounter.update(1 / frameSeconds);
+    if (netClient && netClient.isOnline()) {
+      const hud = netClient.getHud();
+      const hitreg = netClient.getHitRegStats();
+      fpsCounter.updateExtra([
+        `rtt: ${hud.rttMs !== null ? hud.rttMs.toFixed(0) + "ms" : "--"}`,
+        `snapshot age: ${hud.snapshotAgeMs.toFixed(0)}ms`,
+        `corrections/s: ${hud.correctionsPerSecond.toFixed(1)}`,
+        `interp starved frames: ${hud.starvedFrames}`,
+        `hitreg agree: ${hitreg.agreementPercent.toFixed(1)}% (n=${hitreg.totalResolved})`,
+      ]);
+    } else {
+      fpsCounter.updateExtra(["offline (single-player)"]);
+    }
   }
 }
 
@@ -857,13 +857,3 @@ requestAnimationFrame((first) => {
   lastFrameTime = first;
   requestAnimationFrame(frame);
 });
-
-// Spawn the (stub) net-pump worker now so the plumbing exists ahead of a
-// future move of network I/O off the main thread; it only posts a heartbeat
-// today (see netpump.worker.ts) — deliberately unchanged/out of scope for
-// M1 (spec: "netpump worker remains a stub").
-const netWorker = new Worker(new URL("./netpump.worker.ts", import.meta.url), { type: "module" });
-netWorker.onmessage = (e: MessageEvent) => {
-  // eslint-disable-next-line no-console
-  console.debug("[netpump]", e.data);
-};

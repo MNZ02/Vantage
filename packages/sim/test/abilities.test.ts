@@ -361,6 +361,15 @@ describe("Sonar", () => {
     expect(mask).toBe(0);
   });
 
+  it("LoS-gated reveals are blocked by smoke spheres", () => {
+    const s = createState(1, 2);
+    s.team[0] = TEAM_ATTACKERS;
+    s.team[1] = TEAM_DEFENDERS;
+    s.posZ[1] = 10;
+    const mask = computeReveal(s, [], TEAM_ATTACKERS, 0, 1, 0, 20, true, [{ x: 0, y: 1, z: 5, radius: 2 }]);
+    expect(mask).toBe(0);
+  });
+
   it("recon dart pulses exactly 3 times at the tuned interval, LoS-gated", () => {
     let s = setup();
     grantCharge(s, 0, 2, 1); // signature
@@ -556,6 +565,15 @@ describe("flash", () => {
     const wall = { minX: -10, maxX: 10, minY: -1, maxY: 3, minZ: -1, maxZ: 1 };
     const result = computeFlash(s, [wall], 0, s.posY[0]! + 1.65, 5);
     expect(result.length).toBe(0);
+  });
+
+  it("is blocked by a live smoke sphere", () => {
+    const s = createState(1, 1);
+    s.posZ[0] = -5;
+    s.yaw[0] = 0;
+    const eyeY = s.posY[0]! + 1.65;
+    const result = computeFlash(s, [], 0, eyeY, 5, [{ x: 0, y: eyeY, z: 0, radius: 2 }]);
+    expect(result).toEqual([]);
   });
 
   it("cuts off beyond 30m", () => {

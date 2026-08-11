@@ -13,7 +13,7 @@ export function createPrngState(seed: number): number {
 }
 
 export function nextRandom(state: number): PrngResult {
-  let a = (state + 0x6d2b79f5) | 0;
+  const a = (state + 0x6d2b79f5) | 0;
   const nextState = a >>> 0;
   let t = a;
   t = imul32(t ^ (t >>> 15), t | 1);

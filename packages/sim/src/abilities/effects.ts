@@ -27,7 +27,7 @@ import {
   TEAM_NONE,
 } from "../constants.js";
 import { clamp } from "../math.js";
-import { eyePosition, raycastBoxes, viewDirection } from "../raycast.js";
+import { eyePosition, raycastBoxes, raycastSpheres, viewDirection, type SphereLike } from "../raycast.js";
 import { cloneState, type Box, type SimState } from "../state.js";
 import { removeEntity, wallBoxFromEntity } from "./entities.js";
 import { abilityIdForSlot, getAbilityDef } from "./data.js";
@@ -55,7 +55,14 @@ export interface FlashResult {
  * EVERY living player regardless of team (flash is FF-independent per spec —
  * it affects teammates too). Pure query, no mutation.
  */
-export function computeFlash(state: SimState, boxes: readonly Box[], detX: number, detY: number, detZ: number): FlashResult[] {
+export function computeFlash(
+  state: SimState,
+  boxes: readonly Box[],
+  detX: number,
+  detY: number,
+  detZ: number,
+  smokeSpheres: readonly SphereLike[] = [],
+): FlashResult[] {
   const out: FlashResult[] = [];
   for (let i = 0; i < state.numPlayers; i++) {
     if (state.alive[i] === 0) continue;
@@ -74,7 +81,8 @@ export function computeFlash(state: SimState, boxes: readonly Box[], detX: numbe
       toDetY = dy / dist;
       toDetZ = dz / dist;
       const blocked = raycastBoxes(boxes, eye, { x: toDetX, y: toDetY, z: toDetZ }, dist);
-      if (blocked !== null) continue;
+      const smokeBlocked = raycastSpheres(smokeSpheres, eye, { x: toDetX, y: toDetY, z: toDetZ }, dist);
+      if (blocked !== null || smokeBlocked !== null) continue;
     }
 
     const view = viewDirection(state.yaw[i]!, state.pitch[i]!);
@@ -110,6 +118,7 @@ export function computeReveal(
   originZ: number,
   radius: number,
   requireLoS: boolean,
+  smokeSpheres: readonly SphereLike[] = [],
 ): number {
   if (viewerTeam !== TEAM_ATTACKERS && viewerTeam !== TEAM_DEFENDERS) return 0;
   const enemyTeam = viewerTeam === TEAM_ATTACKERS ? TEAM_DEFENDERS : TEAM_ATTACKERS;
@@ -123,7 +132,8 @@ export function computeReveal(
     if (dist > radius) continue;
     if (requireLoS && dist > 1e-6) {
       const blocked = raycastBoxes(boxes, { x: originX, y: originY, z: originZ }, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
-      if (blocked !== null) continue;
+      const smokeBlocked = raycastSpheres(smokeSpheres, { x: originX, y: originY, z: originZ }, { x: dx / dist, y: dy / dist, z: dz / dist }, dist);
+      if (blocked !== null || smokeBlocked !== null) continue;
     }
     mask |= 1 << i;
   }

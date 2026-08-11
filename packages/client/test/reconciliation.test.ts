@@ -3,7 +3,7 @@ import { FIXED_DT, LEVEL_BOXES, type InputFrame } from "@vg/sim";
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
 import { PredictedClient } from "../src/prediction.js";
-import { createScriptedInputSender, toAuthoritative } from "./testUtils.js";
+import { createScriptedInputSender, observePrediction, toAuthoritative } from "./testUtils.js";
 
 const FIXED_DT_MS = FIXED_DT * 1000;
 
@@ -65,9 +65,10 @@ describe("reconciliation correctness (acceptance criterion 3)", () => {
       // Client side: build + predict + send this tick's input, once the
       // local predicted sim exists (i.e. once Welcome has arrived) — before
       // that there's nothing to predict or buffer against yet.
-      if (predicted) {
+      const active = observePrediction(predicted);
+      if (active) {
         const input = scriptedInput(t);
-        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        const { seq, quantizedInput } = active.queueAndPredict(input);
         send(seq, quantizedInput);
       }
       t++;

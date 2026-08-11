@@ -2,6 +2,7 @@
 // mute-when-tab-hidden checkbox, toggled by a gear icon (top-right) or the
 // N key. Persists via audio/settings.ts's loadVolumeSettings/saveVolumeSettings.
 import type { VolumeSettings } from "./audio/settings.js";
+import { trapModalFocus } from "./focusTrap.js";
 import {
   DEBUG_HUD_EVENT,
   dispatchDebugHudVisibility,
@@ -175,6 +176,9 @@ export function createSettingsOverlay(
 
   let previouslyFocused: HTMLElement | null = null;
   let open = false;
+  panel.addEventListener("keydown", (event) => {
+    if (open) trapModalFocus(event, panel);
+  });
 
   function setOpen(requestedOpen: boolean): void {
     const nextOpen = requestedOpen && canOpen();

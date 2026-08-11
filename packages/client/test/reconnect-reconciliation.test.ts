@@ -3,7 +3,7 @@ import { LEVEL_BOXES, type InputFrame } from "@vg/sim";
 import { ServerHost } from "@vg/server";
 import { describe, expect, it } from "vitest";
 import { PredictedClient } from "../src/prediction.js";
-import { createScriptedInputSender, idleInput, toAuthoritative } from "./testUtils.js";
+import { createScriptedInputSender, idleInput, observePrediction, toAuthoritative } from "./testUtils.js";
 
 // Acceptance criterion 12 (reconnect) / 13 (prediction exactness): after a
 // mid-match disconnect and a token-carrying reattach, the client's own
@@ -45,9 +45,10 @@ describe("reconnect reconciliation re-convergence (acceptance criterion 12)", ()
 
     // Build up some real, non-trivial state before disconnecting.
     for (let t = 0; t < 100; t++) {
-      if (predicted) {
+      const active = observePrediction(predicted);
+      if (active) {
         const input: InputFrame = { ...idleInput((t * 0.02) % 1), forward: 1, right: t % 20 < 10 ? 1 : -1 };
-        const { seq, quantizedInput } = predicted.queueAndPredict(input);
+        const { seq, quantizedInput } = active.queueAndPredict(input);
         send(seq, quantizedInput, t);
       }
       host.step();

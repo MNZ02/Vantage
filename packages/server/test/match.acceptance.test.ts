@@ -110,7 +110,7 @@ describe("match mode: friendly fire off", () => {
   it("a teammate shot deals 0 damage and is never a hit", () => {
     const { host, conns, indices } = connectMatch(2, 2);
     // Force both players onto the same team for this test.
-    host.getState().team[indices[1]!] = host.getState().team[indices[0]!];
+    host.getState().team[indices[1]!] = host.getState().team[indices[0]!]!;
 
     const [client0] = conns[0]!;
     const send0 = createScriptedInputSender(client0);

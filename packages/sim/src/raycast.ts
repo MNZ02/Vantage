@@ -22,6 +22,10 @@ export interface Vec3Like {
   z: number;
 }
 
+export interface SphereLike extends Vec3Like {
+  radius: number;
+}
+
 /** World-space eye position for a player, accounting for stand/crouch eye height. */
 export function eyePosition(state: SimState, playerIndex: number): Vec3Like {
   const crouching = state.crouching[playerIndex] === 1;
@@ -133,6 +137,34 @@ function raycastSphere(
   if (t < 0) t = -b + sq;
   if (t < 0 || t > maxDist) return null;
   return t;
+}
+
+/** Nearest distance to any sphere the ray hits within maxDist, or null. */
+export function raycastSpheres(
+  spheres: readonly SphereLike[],
+  origin: Vec3Like,
+  dir: Vec3Like,
+  maxDist: number,
+): number | null {
+  let best: number | null = null;
+  for (const sphere of spheres) {
+    if (!(sphere.radius > 0)) continue;
+    const hit = raycastSphere(
+      sphere.x,
+      sphere.y,
+      sphere.z,
+      sphere.radius,
+      origin.x,
+      origin.y,
+      origin.z,
+      dir.x,
+      dir.y,
+      dir.z,
+      maxDist,
+    );
+    if (hit !== null && (best === null || hit < best)) best = hit;
+  }
+  return best;
 }
 
 /**

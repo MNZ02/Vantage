@@ -128,12 +128,17 @@ function expectMessagesEqual(a: ProtocolMessage, b: ProtocolMessage): void {
       expect(a.abilityEntities.length).toBe(bb.abilityEntities.length);
       a.abilityEntities.forEach((ent, i) => {
         const f = bb.abilityEntities[i]!;
+        expect(ent.slot).toBe(f.slot);
         expect(ent.entType).toBe(f.entType);
         expect(ent.owner).toBe(f.owner);
         expect(ent.abilityId).toBe(f.abilityId);
         expect(approxEqual(ent.x, f.x)).toBe(true);
         expect(approxEqual(ent.y, f.y)).toBe(true);
         expect(approxEqual(ent.z, f.z)).toBe(true);
+        expect(approxEqual(ent.velX, f.velX)).toBe(true);
+        expect(approxEqual(ent.velY, f.velY)).toBe(true);
+        expect(approxEqual(ent.velZ, f.velZ)).toBe(true);
+        expect(ent.ageTicks).toBe(f.ageTicks);
         expect(ent.endTicksLeft).toBe(f.endTicksLeft);
         expect(ent.param).toBe(f.param);
       });
@@ -285,7 +290,22 @@ function sampleDrop(overrides: Partial<SnapshotDroppedWeapon> = {}): SnapshotDro
 }
 
 function sampleAbilityEntity(overrides: Partial<SnapshotAbilityEntity> = {}): SnapshotAbilityEntity {
-  return { entType: 1, owner: 2, abilityId: 3, x: 1.5, y: 0, z: -2.5, endTicksLeft: 100, param: 400, ...overrides };
+  return {
+    slot: 7,
+    entType: 1,
+    owner: 2,
+    abilityId: 3,
+    x: 1.5,
+    y: 0,
+    z: -2.5,
+    velX: 3,
+    velY: 1,
+    velZ: -4,
+    ageTicks: 12,
+    endTicksLeft: 100,
+    param: 400,
+    ...overrides,
+  };
 }
 
 function sampleSnapshot(overrides: Partial<ProtocolMessage & { type: MessageType.Snapshot }> = {}): ProtocolMessage {
@@ -439,9 +459,9 @@ describe("protocol message round-trip", () => {
   it("Snapshot with a live ability-entity section (projectile, wall, recon dart)", () => {
     const msg = sampleSnapshot({
       abilityEntities: [
-        sampleAbilityEntity({ entType: 1, owner: 0, abilityId: 1, endTicksLeft: 0 }), // in-flight projectile
-        sampleAbilityEntity({ entType: 3, owner: 1, abilityId: 13, param: 400, endTicksLeft: 1920 }), // wall box
-        sampleAbilityEntity({ entType: 5, owner: 2, abilityId: 10, param: 2, endTicksLeft: 40 }), // recon dart, 2 pulses left
+        sampleAbilityEntity({ slot: 2, entType: 1, owner: 0, abilityId: 1, endTicksLeft: 0 }), // in-flight projectile
+        sampleAbilityEntity({ slot: 9, entType: 3, owner: 1, abilityId: 13, param: 400, endTicksLeft: 1920 }), // wall box
+        sampleAbilityEntity({ slot: 17, entType: 5, owner: 2, abilityId: 10, param: 2, endTicksLeft: 40 }), // recon dart, 2 pulses left
       ],
     });
     expectMessagesEqual(decodeMessage(encodeMessage(msg)), msg);
@@ -453,7 +473,7 @@ describe("protocol message round-trip", () => {
     expectMessagesEqual(decodedEmpty, empty);
 
     const sixtyFour = sampleSnapshot({
-      abilityEntities: Array.from({ length: 64 }, (_, i) => sampleAbilityEntity({ owner: i % 16, abilityId: i % 16 })),
+      abilityEntities: Array.from({ length: 64 }, (_, i) => sampleAbilityEntity({ slot: i, owner: i % 16, abilityId: i % 16 })),
     });
     const decodedFull = decodeMessage(encodeMessage(sixtyFour));
     expectMessagesEqual(decodedFull, sixtyFour);
@@ -589,12 +609,17 @@ describe("protocol message fuzz round-trip", () => {
           // Deliberately covers both edges: 0 and 64 (MAX_ABILITY_ENTITIES).
           const entityCount = randBool() ? (randBool() ? 0 : 64) : randInt(65);
           const abilityEntities = Array.from({ length: entityCount }, () => ({
+            slot: randInt(64),
             entType: randInt(256),
             owner: randInt(256),
             abilityId: randInt(256),
             x: randF32(),
             y: randF32(),
             z: randF32(),
+            velX: randF32(),
+            velY: randF32(),
+            velZ: randF32(),
+            ageTicks: randInt(65536),
             endTicksLeft: randInt(65536),
             param: randInt(65536),
           }));
@@ -743,6 +768,14 @@ describe("malformed-frame safety for new/changed messages", () => {
     expect(decodeMessageSafely(new Uint8Array([]))).toBeNull();
   });
 
+  it("rejects otherwise-valid messages with trailing bytes", () => {
+    const valid = encodeMessage({ type: MessageType.BuyCmd, itemId: 3 });
+    const withTrailingGarbage = new Uint8Array(valid.length + 2);
+    withTrailingGarbage.set(valid);
+    withTrailingGarbage.set([9, 9], valid.length);
+    expect(decodeMessageSafely(withTrailingGarbage)).toBeNull();
+  });
+
   it("drops a truncated AgentSelectCmd (no agentId byte)", () => {
     expect(decodeMessageSafely(new Uint8Array([MessageType.AgentSelectCmd]))).toBeNull();
   });
@@ -761,7 +794,7 @@ describe("malformed-frame safety for new/changed messages", () => {
 });
 
 describe("protocol version", () => {
-  it("a v2-shaped Hello (old 1-byte body, no token) is rejected as malformed by a v4 decoder", () => {
+  it("a v2-shaped Hello (old 1-byte body, no token) is rejected as malformed by a v5 decoder", () => {
     // Old Hello was exactly [type, protocolVersion] — 2 bytes total. A v4
     // decoder additionally expects a 16-byte token and must treat the
     // missing bytes as a truncated (thus malformed, thus safely-dropped)
@@ -769,8 +802,8 @@ describe("protocol version", () => {
     expect(decodeMessageSafely(new Uint8Array([MessageType.Hello, 2]))).toBeNull();
   });
 
-  it("is bumped to 4 for M4a (abilities/agents)", () => {
-    expect(PROTOCOL_VERSION).toBe(4);
+  it("is bumped to 5 for authoritative ability snapshots", () => {
+    expect(PROTOCOL_VERSION).toBe(5);
   });
 
   it("a v3 Hello (protocolVersion byte = 3) decodes structurally but carries the OLD version value, so the server-side version-gate (see @vg/server) correctly rejects it", () => {

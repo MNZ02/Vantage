@@ -28,7 +28,14 @@ describe("match soak (acceptance criterion 14)", () => {
       matchConfig: {
         buyTicks: 120,
         firstRoundBuyTicks: 120,
-        roundTicks: 900,
+        // Shrunk, but it still has to be long enough for a bot to actually
+        // walk to a site and channel a plant, so it is sized off RUN_SPEED:
+        // the router's spawn-to-site path is ~74 m, which is ~990 ticks at
+        // 4.8 m/s, plus 64 to plant, plus slack for combat stops. At the old
+        // 900 the carrier arrived after the round had already ended and this
+        // suite reported zero plants — a fixture artifact, not a game problem
+        // (real rounds are DEFAULT_ROUND_TICKS = 6400).
+        roundTicks: 1400,
         spikeTicks: 200,
         plantTicks: 64,
         defuseTicks: 128,
@@ -85,10 +92,13 @@ describe("match soak (acceptance criterion 14)", () => {
       matchConfig: {
         buyTicks: 80,
         firstRoundBuyTicks: 80,
-        // ~17s rounds: the Crossing v2 layout's spawn→site run is ~7.5s
-        // (72 m map), so the old 700-tick value left no time to fight AND
-        // plant; still far shrunk from the real 100 s round.
-        roundTicks: 1100,
+        // Sized off RUN_SPEED, and raised again with it: the Crossing v2
+        // spawn→site run is ~74 m of routed path, which was ~7.5 s at the
+        // original 6.75 m/s (hence 700 → 1100 the first time) and is ~10.5 s
+        // at 4.8. Leaving it at 1100 meant the carrier reached the site after
+        // the round had already ended, and this assertion saw zero plants.
+        // Still far shrunk from the real 100 s round.
+        roundTicks: 1400,
         spikeTicks: 150,
         plantTicks: 48,
         defuseTicks: 96,
