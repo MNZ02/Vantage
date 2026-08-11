@@ -23,7 +23,7 @@ import bpy
 from mathutils import Euler, Matrix, Vector
 
 REPO = Path(__file__).resolve().parents[2] if "__file__" in globals() else Path(
-    "/Users/mnz/dev/valorant-clone")
+    "/Users/mnz/dev/vantage")
 
 PAL = {
     "gunmetal":  ("#3A414E", 0.80, 0.45),

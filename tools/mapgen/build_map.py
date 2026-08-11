@@ -40,7 +40,7 @@ import numpy as np
 from mathutils import Euler, Vector
 
 TOOLS = Path(__file__).resolve().parent if "__file__" in globals() else Path(
-    "/Users/mnz/dev/valorant-clone/tools/mapgen")
+    "/Users/mnz/dev/vantage/tools/mapgen")
 REPO = TOOLS.parents[1]
 DATA = json.loads((TOOLS / "level_data.json").read_text())
 

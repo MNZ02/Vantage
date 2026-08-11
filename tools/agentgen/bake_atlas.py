@@ -15,7 +15,7 @@ import bpy
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2] if "__file__" in globals() else Path(
-    "/Users/mnz/dev/valorant-clone")
+    "/Users/mnz/dev/vantage")
 
 
 def bake_vertex_ao(agent_key, strength=0.55):

@@ -21,7 +21,7 @@ import bpy
 from mathutils import Vector
 
 REPO = Path(__file__).resolve().parents[2] if "__file__" in globals() else Path(
-    "/Users/mnz/dev/valorant-clone")
+    "/Users/mnz/dev/vantage")
 PREVIEWS = REPO / "assets" / "models" / "previews"
 
 LIGHT_RIG = (

@@ -37,7 +37,7 @@ import bpy
 from mathutils import Matrix, Vector
 
 TOOLS = Path(__file__).resolve().parent if "__file__" in globals() else Path(
-    "/Users/mnz/dev/valorant-clone/tools/agentgen")
+    "/Users/mnz/dev/vantage/tools/agentgen")
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 REPO = TOOLS.parents[1]
