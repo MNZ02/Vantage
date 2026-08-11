@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.playwright-mcp
+playwright-report
+test-results
+assets
+pnpm-lock.yaml
+*.blend
+*.blend1
+*.glb
+*.png
+*.jpg
+*.jpeg
+*.wasm

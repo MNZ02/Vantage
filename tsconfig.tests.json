@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["node"]
+  },
+  "include": ["packages/*/test/**/*.ts", "e2e/**/*.ts", "playwright.config.ts"],
+  "exclude": ["packages/server/test/**/*.manual.ts"]
+}

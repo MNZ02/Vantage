@@ -24,13 +24,13 @@
   "dependencies": {
     "@vg/protocol": "workspace:*",
     "@vg/sim": "workspace:*",
-    "ws": "^8.18.0"
+    "ws": "^8.21.1"
   },
   "devDependencies": {
-    "@types/node": "^22.9.0",
+    "@types/node": "^24.13.3",
     "@types/ws": "^8.5.12",
-    "tsx": "^4.19.2",
-    "typescript": "^5.6.3",
-    "vitest": "^2.1.4"
+    "tsx": "^4.23.5",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }

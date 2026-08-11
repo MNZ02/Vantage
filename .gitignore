@@ -3,8 +3,10 @@ dist/
 *.log
 .DS_Store
 .claude/
+.codex/
 .playwright-mcp/
+playwright-report/
+test-results/
 __pycache__/
 assets/blender/vendor/
 _tmp_*
-

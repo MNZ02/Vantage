@@ -20,7 +20,7 @@
     "@vg/sim": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^5.6.3",
-    "vitest": "^2.1.4"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
   }
 }
