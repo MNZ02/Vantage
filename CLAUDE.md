@@ -1,4 +1,4 @@
-# valorant-clone
+# Vantage
 
 A browser tactical FPS (Valorant-like) built on Three.js with a deterministic
 shared simulation and authoritative-server netcode (client prediction +

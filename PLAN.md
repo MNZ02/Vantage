@@ -1,4 +1,4 @@
-# Browser Valorant Clone — Master Plan (v3)
+# Vantage — Master Plan (v3)
 
 A 5v5 round-based tactical FPS running entirely in the browser, replicating Valorant's
 gameplay systems (movement, gunplay, abilities, economy, spike rounds) as faithfully as

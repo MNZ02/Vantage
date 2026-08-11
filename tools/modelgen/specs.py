@@ -1,4 +1,4 @@
-"""Model specs for the valorant-clone low-poly asset set.
+"""Model specs for the Vantage low-poly asset set.
 
 Each model is a list of parts. A part is a dict:
   type:  box | cyl | cone | sphere

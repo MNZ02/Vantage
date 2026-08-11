@@ -1,6 +1,6 @@
-# Valorant-like browser FPS
+# Vantage
 
-An original browser tactical FPS prototype built with Three.js, a deterministic shared TypeScript simulation, and an authoritative WebSocket server. It includes client prediction/reconciliation, lag compensation, round and economy systems, bots, agents and abilities, audio, and generated 3D assets.
+An original browser tactical FPS prototype — Valorant-like in genre — built with Three.js, a deterministic shared TypeScript simulation, and an authoritative WebSocket server. It includes client prediction/reconciliation, lag compensation, round and economy systems, bots, agents and abilities, audio, and generated 3D assets.
 
 This is an independent learning project. It is not affiliated with or endorsed by Riot Games, and it should not ship Riot-owned names, art, audio, maps, or other assets.
 

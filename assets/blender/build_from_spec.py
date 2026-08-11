@@ -1,4 +1,4 @@
-"""Rebuild all valorant-clone models inside Blender from assets/models/specs.json.
+"""Rebuild all Vantage models inside Blender from assets/models/specs.json.
 
 Run headless:
     blender --background --python assets/blender/build_from_spec.py -- [--export]
