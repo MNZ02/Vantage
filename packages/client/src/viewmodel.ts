@@ -183,6 +183,19 @@ export interface ViewmodelComposition {
   z: number;
 }
 
+/** render.ts builds the world camera at this vertical FOV (three.js fov is vertical). */
+export const WORLD_BASE_FOV_DEG = 90;
+
+/**
+ * Landscape viewmodel scale. The world camera runs a 90 degree VERTICAL FOV,
+ * which is about 122 degrees horizontal at 16:9 — far wider than the ~103 a
+ * tactical shooter frames at — so a correctly sized weapon still renders small.
+ * Rather than narrow the world FOV (that would change peripheral vision, and
+ * ADS zoom is defined as 90/zoom against it), scale the rig by the ratio of the
+ * two framings: tan(90/2) / tan(70.5/2), where 70.5 is 103 horizontal at 16:9.
+ */
+export const VIEWMODEL_SCALE = 1.5;
+
 /**
  * Portrait/narrow canvases have a much smaller horizontal field of view when
  * vertical FOV stays fixed. Pull and scale the first-person rig inward so it
@@ -192,11 +205,29 @@ export function viewmodelCompositionForAspect(aspect: number): ViewmodelComposit
   const safeAspect = Number.isFinite(aspect) && aspect > 0 ? aspect : 16 / 9;
   const narrow = Math.max(0, Math.min(1, (1.2 - safeAspect) / 0.75));
   return {
-    scale: 1 - narrow * 0.38,
+    // steeper falloff than the old 0.38 so the larger base does not undo the
+    // whole point of pulling the rig in on a phone
+    scale: VIEWMODEL_SCALE * (1 - narrow * 0.5),
     x: 0.16 - narrow * 0.085,
     y: -0.13 - narrow * 0.04,
     z: -0.35 - narrow * 0.07,
   };
+}
+
+/**
+ * Keep the rig a constant size on screen as the world camera zooms.
+ *
+ * The viewmodel is a child of the world camera, so narrowing the FOV for ADS
+ * magnifies it along with the world — 1.4x on a rifle, and 6.3x at the Longbow's
+ * 5x stage, where the weapon swells across the whole scope aperture. Undoing
+ * that is what a separate "viewmodel FOV" buys in other engines, and it is what
+ * makes a larger hip-fire rig safe: without it the support hand sits on top of
+ * the crosshair the moment you aim.
+ */
+export function viewmodelFovCompensation(fovDeg: number): number {
+  if (!Number.isFinite(fovDeg) || fovDeg <= 0 || fovDeg >= 180) return 1;
+  const half = (d: number) => Math.tan((d * Math.PI) / 360);
+  return half(fovDeg) / half(WORLD_BASE_FOV_DEG);
 }
 
 /** DOM canvas overlay: dark vignette + crosshair lines for Longbow ADS stage 1/2. Stage 0 = hidden. */
@@ -427,7 +458,8 @@ export function createViewmodel(camera: THREE.PerspectiveCamera): ViewmodelHandl
       const adsFrac = info.ads ? 1 : 0;
       const zoomVisualPull = info.ads ? Math.min(0.06, (info.adsZoom - 1) * 0.02) : 0;
       const composition = viewmodelCompositionForAspect(camera.aspect);
-      anchor.scale.setScalar(composition.scale);
+      // camera.fov is the ADS-smoothed value main.ts writes each frame
+      anchor.scale.setScalar(composition.scale * viewmodelFovCompensation(camera.fov));
 
       anchor.position.set(
         (1 - adsFrac) * composition.x + adsFrac * 0.02 + sway.x + bob.x,

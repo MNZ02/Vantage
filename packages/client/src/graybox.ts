@@ -103,10 +103,6 @@ export interface LevelDressingHandle {
   dispose(scene: THREE.Scene): void;
 }
 
-function box(w: number, h: number, d: number, material: THREE.Material): THREE.Mesh {
-  return new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
-}
-
 const ZONES_FOR_FILL_LIGHTS: readonly Zone[] = ["attackerSide", "defenderSide", "mid", "siteA", "siteB"];
 
 /** Representative world position for a zone's fill light — site centers from SITE_ZONES, spawn centers from ATTACKER/DEFENDER_SPAWNS, origin for mid. */
@@ -426,21 +422,33 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
   add(contactInstanced);
   meshCount++;
 
-  // ---- Skybox: multi-band dusk dome (zenith → warm horizon → ground haze)
-  // with a soft sun disc aligned to the scene's directional light, plus soft
-  // layered cloud billboards. Visual-only; does not affect collision. ----
+  // ---- Skybox: clear high-altitude daylight dome (deep blue zenith → pale
+  // atmospheric haze at the horizon) with a tight sun disc aligned to the
+  // scene's directional light, plus soft cloud billboards. Visual-only; does
+  // not affect collision.
+  //
+  // Was a red/orange dusk. Cold blue daylight is both what was asked for and
+  // what the map now needs: the courtyard is snow, and snow under a warm dusk
+  // horizon reads as sand. It also puts the facades' warm window emissives on
+  // the opposite side of the colour wheel from the sky, so they read as lit
+  // rooms rather than blending into the backdrop. ----
   const sunDir = new THREE.Vector3(20, 30, 10).normalize();
   const skyGeometry = new THREE.SphereGeometry(180, 48, 32);
   const skyMaterial = new THREE.ShaderMaterial({
     uniforms: {
-      zenithColor: { value: new THREE.Color(0x0c1028) },
-      midColor: { value: new THREE.Color(0x2a3560) },
-      horizonColor: { value: new THREE.Color(0xff8a5c) },
-      groundColor: { value: new THREE.Color(0x3a2838) },
-      sunColor: { value: new THREE.Color(0xffe6b0) },
+      // Kept off true navy: three.js converts these from sRGB to linear and the
+      // Rayleigh falloff below already darkens the top of the dome, so a deep
+      // 0x1b4a87 zenith rendered as near-black overhead.
+      zenithColor: { value: new THREE.Color(0x2f66ab) },
+      midColor: { value: new THREE.Color(0x76a8d2) },
+      horizonColor: { value: new THREE.Color(0xd8e6ee) },
+      groundColor: { value: new THREE.Color(0x9db0bc) },
+      sunColor: { value: new THREE.Color(0xfff6e4) },
       sunDir: { value: sunDir.clone() },
-      sunSize: { value: 0.035 },
-      sunBloom: { value: 0.22 },
+      // Tighter and less bloomed than the dusk sun: a high sun is a small hard
+      // disc, and the big warm corona was most of what read as "sunset".
+      sunSize: { value: 0.022 },
+      sunBloom: { value: 0.13 },
     },
     vertexShader: /* glsl */ `
       varying vec3 vWorldDir;
@@ -471,41 +479,45 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
       void main() {
         vec3 dir = normalize(vWorldDir);
         float elev = dir.y; // -1..1
-
-        // Elevation remap: ground band below horizon, sky above.
-        float skyT = clamp(elev * 0.5 + 0.5, 0.0, 1.0);
-        // Bias so the warm band sits near the horizon (Valorant-style dusk).
-        float h = pow(skyT, 0.72);
+        vec3 sunN = normalize(sunDir);
 
         vec3 col;
         if (elev < 0.0) {
           // Below horizon: quick fade into ground haze (map walls occlude most of this).
           float g = clamp(-elev * 2.5, 0.0, 1.0);
-          col = mix(horizonColor * 0.55, groundColor, g);
+          col = mix(horizonColor * 0.92, groundColor, g);
         } else {
-          // Three-stop sky: horizon → mid → zenith.
-          float toMid = smoothstep(0.0, 0.35, elev);
-          float toZenith = smoothstep(0.25, 0.95, elev);
-          col = mix(horizonColor, midColor, toMid);
-          col = mix(col, zenithColor, toZenith);
-          // Slight azimuth warm bias toward the sun so the lit side of the sky is richer.
-          float sunAz = max(0.0, dot(normalize(vec3(dir.x, 0.0, dir.z)), normalize(vec3(sunDir.x, 0.0, sunDir.z))));
-          col = mix(col, col * vec3(1.08, 1.0, 0.95), sunAz * (1.0 - elev) * 0.35);
+          // Rayleigh-flavoured falloff instead of the old pair of smoothsteps:
+          // nearly all of the colour change belongs in the first ~25 degrees
+          // above the horizon, which is what makes a clear sky read as deep
+          // overhead and hazy at the rim rather than as a flat ramp.
+          float k = pow(1.0 - clamp(elev, 0.0, 1.0), 1.8);   // 1 at horizon, 0 at zenith
+          col = mix(zenithColor, midColor, smoothstep(0.0, 0.58, k));
+          col = mix(col, horizonColor, smoothstep(0.46, 1.0, k));
+          // Mie forward scatter: a broad, faint warm lobe around the sun that
+          // fades with height. Cheap, and it stops the sun looking pasted on.
+          float mie = pow(max(0.0, dot(dir, sunN)), 3.0) * 0.11 * k;
+          col += sunColor * mie;
+          // Anti-sun side sits a touch deeper, for depth across the dome.
+          float away = 1.0 - max(0.0, dot(normalize(vec3(dir.x, 0.0, dir.z)),
+                                          normalize(vec3(sunN.x, 0.0, sunN.z))));
+          col *= mix(1.0, 0.94, away * (1.0 - k) * 0.8);
         }
 
-        // Soft sun disc + bloom (matches createScene sun direction).
-        float sunDot = max(0.0, dot(dir, normalize(sunDir)));
-        float disc = smoothstep(1.0 - sunSize, 1.0 - sunSize * 0.35, sunDot);
-        float bloom = pow(sunDot, 24.0) * sunBloom;
-        float corona = pow(sunDot, 6.0) * 0.12;
-        col += sunColor * (disc * 1.4 + bloom + corona);
+        // Sun disc + bloom (matches createScene sun direction).
+        float sunDot = max(0.0, dot(dir, sunN));
+        float disc = smoothstep(1.0 - sunSize, 1.0 - sunSize * 0.3, sunDot);
+        float bloom = pow(sunDot, 40.0) * sunBloom;
+        float corona = pow(sunDot, 9.0) * 0.06;
+        col += sunColor * (disc * 1.7 + bloom + corona);
 
-        // Horizon glow strip.
-        float hz = exp(-abs(elev) * 8.0);
-        col += horizonColor * hz * 0.18;
+        // Pale haze band hugging the horizon — the aerial-perspective cue that
+        // sells distance on a snow map.
+        float hz = exp(-abs(elev) * 11.0);
+        col += horizonColor * hz * 0.16;
 
         // Subtle film grain so the dome doesn't read as a flat shader ball.
-        float grain = (hash(dir.xz * 40.0 + dir.y * 11.0) - 0.5) * 0.025;
+        float grain = (hash(dir.xz * 40.0 + dir.y * 11.0) - 0.5) * 0.02;
         col += grain;
 
         // Cheap dither against large-area banding on the gradient.
@@ -527,18 +539,42 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
   // Soft multi-lobe cloud billboards (shader-tinted, horizon-hugging).
   const cloudMaterial = new THREE.ShaderMaterial({
     uniforms: {
-      cloudColor: { value: new THREE.Color(0xffd4b8) },
-      opacity: { value: 0.42 },
+      cloudColor: { value: new THREE.Color(0xf4f8fb) },
+      // Denser than the dusk version: warm haze read fine against an orange
+      // horizon at 0.42, but white cloud against a blue sky needs the opacity
+      // or it disappears.
+      opacity: { value: 0.5 },
+      shadeColor: { value: new THREE.Color(0x9fb4c8) },
     },
     vertexShader: /* glsl */ `
       varying vec2 vUv;
       void main() {
         vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        // instanceMatrix is NOT applied for us here. three.js only folds it in
+        // for its built-in materials; a raw ShaderMaterial on an InstancedMesh
+        // has to do it by hand. Without this every instance drew at the group
+        // origin, stacked inside the courtyard floor — which is why these
+        // clouds were never visible on screen at all.
+        //
+        // They also billboard toward the camera rather than sitting on a fixed
+        // ring facing map centre: a player is almost never AT the centre, so a
+        // fixed ring is seen edge-on and the quads read as thin bright slivers.
+        #ifdef USE_INSTANCING
+          vec4 mv = modelViewMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+          float sx = length(instanceMatrix[0].xyz);
+          float sy = length(instanceMatrix[1].xyz);
+        #else
+          vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+          float sx = 1.0;
+          float sy = 1.0;
+        #endif
+        mv.xy += position.xy * vec2(sx, sy);
+        gl_Position = projectionMatrix * mv;
       }
     `,
     fragmentShader: /* glsl */ `
       uniform vec3 cloudColor;
+      uniform vec3 shadeColor;
       uniform float opacity;
       varying vec2 vUv;
 
@@ -561,9 +597,10 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
                    * smoothstep(0.0, 0.18, vUv.y) * smoothstep(1.0, 0.75, vUv.y);
         a *= edge;
         if (a < 0.02) discard;
-        // Slight undershadow so clouds read volume against the bright horizon.
-        float shade = mix(0.75, 1.05, smoothstep(0.3, 0.7, vUv.y));
-        gl_FragColor = vec4(cloudColor * shade, a * opacity);
+        // Cool undershadow so clouds read as volume, not flat white cutouts:
+        // a lit crown over a blue-grey base is what daylight cumulus does.
+        vec3 body = mix(shadeColor, cloudColor, smoothstep(0.28, 0.72, vUv.y));
+        gl_FragColor = vec4(body, a * opacity);
       }
     `,
     transparent: true,
@@ -571,12 +608,14 @@ export function buildLevelDressing(scene: THREE.Scene, boxes: readonly Box[], ma
     side: THREE.DoubleSide,
     fog: false,
   });
-  const cloudCount = 8;
+  const cloudCount = 12;
   const clouds = new THREE.InstancedMesh(new THREE.PlaneGeometry(28, 10), cloudMaterial, cloudCount);
   for (let i = 0; i < cloudCount; i++) {
     const angle = (i / cloudCount) * Math.PI * 2 + i * 0.35;
     const radius = 95 + (i % 3) * 12;
-    const elev = 18 + (i % 4) * 7 + (i % 2) * 3;
+    // Raised out of the old 18-39 band so the ring clears the backdrop
+    // village's roofline (~10 m tall at ~45 m out) instead of sitting behind it.
+    const elev = 32 + (i % 4) * 9 + (i % 2) * 4;
     const scale = 0.75 + (i % 3) * 0.35;
     m.compose(
       new THREE.Vector3(Math.cos(angle) * radius, elev, Math.sin(angle) * radius),

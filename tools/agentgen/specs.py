@@ -1,10 +1,10 @@
-"""Per-agent build specs (v4). Meters, Blender Z-up, character faces +Y.
+"""Per-agent build specs (v6). Meters, Blender Z-up, character faces +Y.
 
-ZEPHYR v4 — full redesign (wind duelist): cropped white jacket over a
-graphite compression suit, asymmetric left pauldron + bracer, utility belt
-with canisters, split tail panel off the belt, high swept ponytail, smooth
-masked faceplate with a glowing chevron visor, compact 3-blade wind unit on
-the back, teal glow seams. Faces stay fully masked (IP/style constraint).
+ZEPHYR v6 — clean-slate human wind runner built by build_zephyr_scratch.py on
+the CC0 realistic female base with fitted eyes: lean athletic proportions,
+pearl swept hair and high ponytail, sea-glass sleeveless shell over a petrol
+compression top, loose tactical trousers, fingerless wraps, low runners and
+two hip streamers. No helmet, faceplate, armor stack, fan pack or robot parts.
 
 RECRUIT — the generic placeholder agent (every non-Zephyr agentId): clean
 trooper read, full helmet with glow visor, vest, pads. Accent materials keep
@@ -14,19 +14,26 @@ the v2_teal / v2_glow_teal names the client retints for ally/enemy IFF.
 ZEPHYR = {
     "name": "zephyr",
     "height": 1.72,
-    "head_scale": 0.94,
+    "head_scale": 0.92,
+    "exposed_face": True,
+    "builder": "scratch_human",
     "max_height": 1.80,          # client AGENT_MODEL_HEIGHT contract (bbox top)
     "tri_budget": 50000,
     "palette": {
-        "suit":      ("#2B303B", 0.10, 0.72),
-        "jacket":    ("#F2F5F7", 0.05, 0.50),
-        "jacket_in": ("#157F74", 0.15, 0.55),
-        "pants":     ("#3C4456", 0.08, 0.68),
-        "gear":      ("#1C2028", 0.15, 0.65),
-        "hair":      ("#EAF0F3", 0.05, 0.35),
-        "accent":    ("#2FB7A8", 0.25, 0.50),   # ag_zephyr_accent (IFF retint)
-        "glow":      ("#5FF2DE", 0.00, 0.35, "#33E0CC"),  # ag_zephyr_glow
-        "metal":     ("#9AA6B2", 0.80, 0.35),
+        "suit":      ("#222A36", 0.02, 0.78),
+        "jacket":    ("#E9F0EE", 0.00, 0.72),
+        "jacket_in": ("#245E61", 0.00, 0.78),
+        "pants":     ("#313C4B", 0.02, 0.80),
+        "gear":      ("#17212B", 0.04, 0.76),
+        "hair":      ("#D7EEE8", 0.00, 0.55),
+        "hair_dark": ("#4AAFA7", 0.00, 0.62),
+        "skin":      ("#A66F52", 0.00, 0.72),
+        "skin_warm": ("#7A4137", 0.00, 0.78),
+        "eye":       ("#173238", 0.00, 0.45),
+        "eye_white": ("#E8EEE9", 0.00, 0.65),
+        "accent":    ("#35BFAE", 0.02, 0.68),   # ag_zephyr_accent (IFF retint)
+        "glow":      ("#78E6D5", 0.00, 0.48, "#3ED8C3"),  # ag_zephyr_glow
+        "metal":     ("#82969B", 0.35, 0.52),
     },
     "gear": [
         # layered shells, inner→outer (region, offset, thick, mat)
@@ -34,9 +41,8 @@ ZEPHYR = {
         {"region": "boots",  "offset": 0.013, "thick": 0.010, "mat": "gear"},
         {"region": "gloves", "offset": 0.008, "thick": 0.007, "mat": "gear"},
         {"region": "jacket", "offset": 0.010, "thick": 0.009, "mat": "jacket"},
-        {"region": "mask",   "offset": 0.007, "thick": 0.005, "mat": "gear"},
     ],
-    "addons": "zephyr_v4",
+    "addons": "zephyr_v5",
 }
 
 RECRUIT = {

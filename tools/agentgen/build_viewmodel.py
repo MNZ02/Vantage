@@ -38,28 +38,50 @@ VENDOR = REPO / "assets/blender/vendor/human-base-meshes-bundle-v1.4.1/human_bas
 HAND_SRC = "Hand  - Realistic"
 FPS = 24
 CAMERA_POS = (-0.16, -0.35, 0.13)
+# The client's eye in anchor space, exactly: viewmodel.ts anchors at
+# (0.16,-0.13,-0.35) with rotation.y = 0.06, so the camera sits at
+# R_y(-0.06) * (-0.16, 0.13, 0.35) (three.js) mapped to Blender's Z-up.
+CLIENT_CAM = (-0.1807, -0.3398, 0.13)
+CLIENT_FWD = (0.05996, 0.9982, 0.0)
 
+# Tactical-glove values: the glove is nearly black and the sleeve carries the
+# colour, so the hand reads by silhouette against the weapon the way the
+# reference does. A mid-grey glove on a grey weapon is why the old fists
+# dissolved into the receiver.
+# Hues track Zephyr's agent palette (tools/agentgen/specs.py): the sleeve is the
+# character's jacket, the glove its gear, the cuff its accent.
 PAL = {
-    "white": ("#EDF1F4", 0.05, 0.55),
-    "teal":  ("#2FB7A8", 0.25, 0.50),
-    "dark":  ("#1A1E26", 0.10, 0.80),
-    "glove": ("#23272F", 0.08, 0.72),
-    "strap": ("#3A414E", 0.45, 0.55),
-    "glow":  ("#5FF2DE", 0.0, 0.35, "#33E0CC"),
+    # Zephyr's jacket is #E9F0EE, but at full value the sleeve out-reads the
+    # weapon and becomes the brightest thing on screen — the reverse of the
+    # reference, where the gun is the highlight and the arm sits under it.
+    "white": ("#B7C0C2", 0.05, 0.58),   # sleeve shell  (agent jacket, dimmed)
+    "teal":  ("#35BFAE", 0.25, 0.50),   # cuff          (agent accent)
+    "dark":  ("#101519", 0.12, 0.72),   # ribs
+    "glove": ("#17212B", 0.06, 0.68),   # the glove     (agent gear)
+    "strap": ("#2B333D", 0.30, 0.60),   # wrist band
+    "glow":  ("#78E6D5", 0.0, 0.35, "#3ED8C3"),
 }
 GENERIC_PAL = {  # viewmodel_arms.glb (non-Zephyr agents)
-    "white": ("#8E969F", 0.05, 0.65),
-    "teal":  ("#5A646E", 0.20, 0.55),
-    "dark":  ("#20242A", 0.10, 0.80),
-    "glove": ("#2A2E35", 0.08, 0.75),
-    "strap": ("#4A5058", 0.45, 0.55),
-    "glow":  ("#9AA4AE", 0.0, 0.45),
+    "white": ("#6F777F", 0.05, 0.66),
+    "teal":  ("#464E58", 0.20, 0.58),
+    "dark":  ("#0E1115", 0.12, 0.74),
+    "glove": ("#1B1F25", 0.06, 0.70),
+    "strap": ("#333A43", 0.30, 0.62),
+    "glow":  ("#8A939C", 0.0, 0.45),
 }
 
 
 def hex_rgba(h):
+    """sRGB hex -> linear, which is what a Principled base colour actually
+    wants. Feeding the raw hex in (as the weapon builder does) lifts every dark
+    value by roughly a factor of three — it is why a #191D24 glove was still
+    rendering as mid grey and dissolving into the receiver behind it."""
     h = h.lstrip("#")
-    return [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)] + [1.0]
+    out = []
+    for i in (0, 2, 4):
+        c = int(h[i:i + 2], 16) / 255
+        out.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+    return out + [1.0]
 
 
 def mat(key, palette=PAL, prefix=None):
@@ -76,6 +98,14 @@ def mat(key, palette=PAL, prefix=None):
     b.inputs["Base Color"].default_value = hex_rgba(spec[0])
     b.inputs["Metallic"].default_value = spec[1]
     b.inputs["Roughness"].default_value = spec[2]
+    if key == "glove":
+        # A near-black glove under a strong key is carried almost entirely by
+        # its specular lobe, which is what makes it read mid-grey. Tactical
+        # gloves are matte; drop the default 4% reflectance to about 2%.
+        for n in ("Specular IOR Level", "Specular"):
+            if n in b.inputs:
+                b.inputs[n].default_value = 0.25
+                break
     if len(spec) > 3:
         for n in ("Emission Color", "Emission"):
             if n in b.inputs:
@@ -185,6 +215,50 @@ def load_hand(tag, detail=1):
 
 CURL_SIGN = 1.0  # flipped if auto-roll makes +X rotation extend instead of curl
 
+KNUCKLE_BUMP = 0.0036
+TENDON_RIDGE = 0.0014
+VALLEY = 0.0022
+
+
+def sculpt_hand_detail(hand, mirrored):
+    """Cut the landmarks a hand is recognised by into the back of the glove.
+
+    The vendor cast is 3300 verts with a single multires level and almost no
+    relief above the metacarpals, so from the player's viewpoint — which looks
+    straight at the back of the support hand — it reads as a smooth mitten. Add
+    what should be there: MCP and finger-joint heads raised, tendons running
+    back over the metacarpals, valleys sunk between them. Done on the rest pose
+    before rigging, so it rides the grip like the rest of the skin."""
+    s = -1.0 if mirrored else 1.0
+    me = hand.data
+    heads = []                       # (x, z, sigma_x, sigma_z, amplitude)
+    for name in DIGITS:
+        chain = _digit_chain(name)
+        m = chain[0]
+        heads.append((m.x * s, m.z, 0.0125, 0.0135, KNUCKLE_BUMP))
+        for j, amp in ((1, KNUCKLE_BUMP * 0.55), (2, KNUCKLE_BUMP * 0.30)):
+            q = chain[j]
+            heads.append((q.x * s, q.z, 0.0076, 0.0082, amp))
+    xs = sorted(Vector(DIGITS[n][0]).x * s for n in DIGITS)
+    valleys = [(xs[i] + xs[i + 1]) / 2 for i in range(len(xs) - 1)]
+    for v in me.vertices:
+        n = v.normal
+        back = max(0.0, -n.y)        # the palm side stays smooth
+        if back < 0.04:
+            continue
+        p = v.co
+        d = 0.0
+        for kx, kz, sx, sz, amp in heads:
+            d += amp * math.exp(-(((p.x - kx) / sx) ** 2 + ((p.z - kz) / sz) ** 2))
+        w = math.exp(-((p.z + 0.062) / 0.032) ** 2)   # over the metacarpals only
+        for tx in xs:
+            d += TENDON_RIDGE * w * math.exp(-((p.x - tx) / 0.0075) ** 2)
+        for vx in valleys:
+            d -= VALLEY * w * math.exp(-((p.x - vx) / 0.0070) ** 2)
+        v.co = p + n * (d * back)
+    me.update()
+    return hand
+
 
 def rig_hand(hand, mirrored):
     """Temp armature: root + palm + 4 finger chains + thumb chain, auto-weights
@@ -218,6 +292,14 @@ def rig_hand(hand, mirrored):
     bone("thumb1", t[0], t[1], parent="palm")
     bone("thumb2", t[1], t[2], parent="thumb1")
     bone("thumb3", t[2], t[3], parent="thumb2")
+    # One flex convention for every digit incl. the thumb and both hands: roll
+    # each bone so its local +Z faces the palm (+Y). Local +Y is always the bone
+    # itself, so local +X becomes the flexion axis and a POSITIVE rotation
+    # always bends toward the palm; local +Z stays the splay axis. Without this
+    # each digit inherits Blender's auto-roll and curls in its own tilted plane.
+    for b in eb:
+        if b.name not in ("root", "palm"):
+            b.align_roll(Vector((0.0, 1.0, 0.0)))
     bpy.ops.object.mode_set(mode="OBJECT")
 
     bpy.ops.object.select_all(action="DESELECT")
@@ -269,52 +351,73 @@ def procedural_weights(hand, arm):
             groups[n].add([v.index], w / tot, "REPLACE")
 
 
-def weight_islands_to_nearest(hand, arm):
-    """Accent islands (knuckle plate / strap / cuff, joined after the skin was
-    heat-weighted): each connected island rides ONE bone — palm or root — so
-    finger curls never tear the plates apart."""
+def weight_like_skin(hand, n_skin):
+    """Every vertex joined on after skinning (the glove plates) inherits the
+    weights of the nearest original skin vertex. The old version pinned each
+    accent island to a single palm/root bone, so anything sitting on a finger
+    stayed put while the finger curled out from under it."""
+    from mathutils import kdtree
     me = hand.data
-    cand = [(b.name, (Vector(b.head_local) + Vector(b.tail_local)) / 2)
-            for b in arm.data.bones if b.name in ("palm", "root")]
-    vg = hand.vertex_groups
-    unweighted = set()
-    for v in me.vertices:
-        if sum(g.weight for g in v.groups) < 1e-4:
-            unweighted.add(v.index)
-    if not unweighted:
+    extra = len(me.vertices) - n_skin
+    if extra <= 0:
         return 0
-    # connected components within the unweighted set
-    adj = {i: [] for i in unweighted}
-    for e in me.edges:
-        a, b = e.vertices
-        if a in unweighted and b in unweighted:
-            adj[a].append(b)
-            adj[b].append(a)
-    seen = set()
-    for seed in list(unweighted):
-        if seed in seen:
-            continue
-        stack, comp = [seed], []
-        while stack:
-            x = stack.pop()
-            if x in seen:
-                continue
-            seen.add(x)
-            comp.append(x)
-            stack += adj[x]
-        ctr = Vector((0, 0, 0))
-        for vi in comp:
-            ctr += me.vertices[vi].co
-        ctr /= len(comp)
-        best = min(cand, key=lambda bn: (ctr - bn[1]).length_squared)
-        g = vg.get(best[0]) or vg.new(name=best[0])
-        g.add(comp, 1.0, "REPLACE")
-    return len(unweighted)
+    tree = kdtree.KDTree(n_skin)
+    for i in range(n_skin):
+        tree.insert(me.vertices[i].co, i)
+    tree.balance()
+    src = [[(g.group, g.weight) for g in me.vertices[i].groups] for i in range(n_skin)]
+    by_index = {g.index: g for g in hand.vertex_groups}
+    for i in range(n_skin, len(me.vertices)):
+        _, j, _ = tree.find(me.vertices[i].co)
+        for gi, w in src[j]:
+            by_index[gi].add([i], w, "REPLACE")
+    return extra
+
+
+def _surface_patch(hand, name, material, pick, thickness=0.0024, lift=0.0005,
+                   bevel_w=0.0009):
+    """A plate cut from the glove's OWN surface: keep the faces `pick(center,
+    normal)` wants, push them out along their normals and solidify. Floating
+    cuboids read as stickers pasted on a curved hand — these bend with it."""
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(hand.data)
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
+    drop = [f for f in bm.faces if not pick(f.calc_center_median(), f.normal)]
+    if len(drop) >= len(bm.faces):
+        bm.free()
+        return None
+    bmesh.ops.delete(bm, geom=drop, context="FACES")
+    bm.normal_update()
+    for v in bm.verts:
+        v.co += v.normal * lift
+    me = bpy.data.meshes.new(name)
+    bm.to_mesh(me)
+    bm.free()
+    if not me.polygons:
+        bpy.data.meshes.remove(me)
+        return None
+    o = bpy.data.objects.new(name, me)
+    bpy.context.scene.collection.objects.link(o)
+    me.materials.append(material)
+    W._activate(o)
+    md = o.modifiers.new("sol", "SOLIDIFY")
+    md.thickness = thickness
+    md.offset = 1.0
+    W._apply(o, md)
+    W.bevel(o, bevel_w, 2, 50)
+    return o
 
 
 def pose_hand(hand, arm, curls, mirrored):
     """curls: {digit: (mcp, pip, dip)} degrees + optional 'splay' {digit: deg}
-    and 'thumb': (cmc_bend, cmc_twist, mcp, ip). Applies pose into the mesh."""
+    and 'thumb': (cmc_flex, cmc_abduct, mcp, ip). Applies pose into the mesh.
+
+    Bone-local +X flexes toward the palm and +Z splays within the palm plane
+    for every digit (rig_hand rolls them that way), so the thumb's second value
+    swings it across the palm — which is what actually places a thumb — rather
+    than rolling it about its own length as it used to."""
     s = -1.0 if mirrored else 1.0
     W._activate(arm)
     bpy.ops.object.mode_set(mode="POSE")
@@ -328,9 +431,9 @@ def pose_hand(hand, arm, curls, mirrored):
             math.radians(a1) * k, 0, math.radians(splay.get(name, 0.0)) * s)
         arm.pose.bones[f"{name}2"].rotation_euler = (math.radians(a2) * k, 0, 0)
         arm.pose.bones[f"{name}3"].rotation_euler = (math.radians(a3) * k, 0, 0)
-    cmc, twist, tm, ti = curls["thumb"]
+    cmc, abduct, tm, ti = curls["thumb"]
     arm.pose.bones["thumb1"].rotation_euler = (
-        math.radians(cmc) * k, math.radians(twist) * s, 0)
+        math.radians(cmc) * k, 0, math.radians(abduct) * s)
     arm.pose.bones["thumb2"].rotation_euler = (math.radians(tm) * k, 0, 0)
     arm.pose.bones["thumb3"].rotation_euler = (math.radians(ti) * k, 0, 0)
     bpy.ops.object.mode_set(mode="OBJECT")
@@ -345,23 +448,7 @@ def pose_hand(hand, arm, curls, mirrored):
     return hand
 
 
-def orient_hand(hand, wrist_world, finger_dir, palm_dir, scale=0.92):
-    """Map hand-local (fingers -Z, palm +Y) onto the target frame."""
-    Zl = -Vector(finger_dir).normalized()          # local +Z target
-    Yl = Vector(palm_dir)
-    Yl = (Yl - Zl * Yl.dot(Zl)).normalized()       # local +Y target
-    Xl = Yl.cross(Zl)
-    M = Matrix.Identity(4)
-    M.col[0][:3], M.col[1][:3], M.col[2][:3] = Xl, Yl, Zl
-    xf = (Matrix.Translation(Vector(wrist_world)) @ M
-          @ Matrix.Scale(scale, 4) @ Matrix.Translation(-WRIST_LOCAL))
-    hand.matrix_world = xf @ hand.matrix_world
-    W._activate(hand)
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    return hand
-
-
-def trim_forearm(hand, keep_below_z=0.052):
+def trim_forearm(hand, keep_below_z=0.042):
     """Drop the bundled forearm stub above the glove cuff (local space)."""
     import bmesh
     bm = bmesh.new()
@@ -373,93 +460,232 @@ def trim_forearm(hand, keep_below_z=0.052):
             f"trim_forearm would delete {len(kill)}/{len(bm.verts)} verts — "
             "hand mesh is not in landmark space")
     bmesh.ops.delete(bm, geom=kill, context="VERTS")
+    # cap the stump — an open wrist shows through the sleeve cuff as a black
+    # slit whenever the camera catches the seam at a grazing angle
+    border = [e for e in bm.edges if len(e.link_faces) == 1]
+    if border:
+        bmesh.ops.holes_fill(bm, edges=border)
     bm.to_mesh(hand.data)
     bm.free()
     hand.data.update()
 
 
+# ---------------------------------------------------------- grip solver
+# Every digit flexes about its bone-local +X (see rig_hand), so a phalanx never
+# leaves its own hand-local YZ plane. That makes a grip a 2D problem: the thing
+# being held is a cylinder, it cuts a circle in each finger's plane, and a
+# convincing grip is just "lay the phalanges onto that circle". Phalanges 2/3
+# become chords of it, phalanx 1 reaches in from the knuckle. The alternative —
+# hand-tuning 15 angles per hand per weapon — is what produced the melted fists.
+FINGER_R = 0.0115   # bone chain -> skin, i.e. half a phalanx
+MCP_Z = -0.098      # fingers start here; everything above is palm
+HAND_SCALE = 0.92
+DEFAULT_CURL = {"pinky": (66, 78, 40), "ring": (64, 76, 38),
+                "middle": (60, 72, 34), "index": (52, 62, 30)}
+
+
+def _digit_chain(name):
+    """Rest-pose joint positions (MCP, PIP, DIP, TIP) in hand-local space."""
+    mcp, tip = Vector(DIGITS[name][0]), Vector(DIGITS[name][1])
+    return [mcp, mcp.lerp(tip, 0.42), mcp.lerp(tip, 0.72), tip]
+
+
+def _yz(p):
+    """Into the flex plane. +X bone rotation is a CCW turn in these coords."""
+    return Vector((p.y, p.z))
+
+
+def _rot2(v, a):
+    c, s = math.cos(a), math.sin(a)
+    return Vector((v.x * c - v.y * s, v.x * s + v.y * c))
+
+
+def _signed(a, b):
+    return math.atan2(a.x * b.y - a.y * b.x, a.x * b.x + a.y * b.y)
+
+
+def wrap_digit(name, seat, radius, clearance=FINGER_R, max_mcp=92.0):
+    """(mcp, pip, dip) flexion in degrees that wraps one finger onto a cylinder
+    whose axis runs along hand-local X through `seat` = (y, z).
+
+    Phalanx 1 swings until the PIP knuckle lands on the circle of radius
+    `radius + clearance` (circle/circle intersection, near branch); 2 and 3 then
+    step around that circle as chords. Returns None when the cylinder is out of
+    reach or would need a hyperextended knuckle — caller falls back."""
+    C = Vector(seat)
+    rho = radius + clearance
+    P = [_yz(p) for p in _digit_chain(name)]
+    L = [(P[i + 1] - P[i]).length for i in range(3)]
+    to_c = C - P[0]
+    d = to_c.length
+    if d < 1e-6 or L[0] < 1e-6:
+        return None
+    cos_b = (d * d + L[0] * L[0] - rho * rho) / (2.0 * d * L[0])
+    if not -1.0 <= cos_b <= 1.0:
+        return None                       # knuckle inside it, or can't reach
+    d1 = _rot2(to_c / d, -math.acos(cos_b))
+    mcp = _signed(P[1] - P[0], d1)
+    if mcp < 0.0 or math.degrees(mcp) > max_mcp:
+        return None
+    pts = [P[0], P[0] + d1 * L[0]]
+    phi = math.atan2(pts[1].y - C.y, pts[1].x - C.x)
+    for i in (1, 2):
+        phi += 2.0 * math.asin(min(1.0, L[i] / (2.0 * rho)))
+        pts.append(C + Vector((math.cos(phi), math.sin(phi))) * rho)
+    seg = [pts[i + 1] - pts[i] for i in range(3)]
+    return (math.degrees(mcp), math.degrees(_signed(seg[0], seg[1])),
+            math.degrees(_signed(seg[1], seg[2])))
+
+
+def _seat_y(hand, cz, radius, half_x=0.046, clear=0.0012, band=0.034):
+    """How high the held cylinder rides: the lowest axis height at which no
+    vertex of the distal palm ends up inside it. Measured off the real mesh, so
+    a fatter handguard pushes the hand out on its own. Only the pad below the
+    knuckles counts — the thenar bulge further up the palm never touches a
+    handguard, and letting it vote parked the whole grip a centimetre out."""
+    best = None
+    for v in hand.data.vertices:
+        p = v.co
+        if abs(p.x) > half_x or not (MCP_Z <= p.z <= MCP_Z + band) or p.y < -0.004:
+            continue
+        dz = p.z - cz
+        if abs(dz) >= radius:
+            continue
+        y = p.y + math.sqrt(radius * radius - dz * dz)
+        if best is None or y > best:
+            best = y
+    return (radius if best is None else best) + clear
+
+
+def solve_curls(hand, cfg):
+    """Grip config -> the curls dict pose_hand() consumes, plus the seat point.
+    Radius stays the weapon's true radius: canting the hand makes each finger
+    plane cut the cylinder as a slightly wider ellipse, but compensating for
+    that lifted the fingers clear of the surface, and a glove biting a
+    millimetre into a handguard reads as grip while a gap reads as broken."""
+    cz = cfg["seat_z"]
+    radius = cfg["radius"]
+    cy = cfg.get("seat_y") or _seat_y(hand, cz, radius)
+    slack = cfg.get("slack", {})
+    override = cfg.get("override", {})
+    curls = {"thumb": cfg["thumb"], "splay": dict(cfg.get("splay", {}))}
+    for name in DIGITS:
+        if name in override:
+            curls[name] = override[name]
+            continue
+        got = wrap_digit(name, (cy, cz), radius,
+                         cfg.get("finger_r", FINGER_R) + slack.get(name, 0.0))
+        curls[name] = got or DEFAULT_CURL[name]
+    return curls, (cy, cz)
+
+
+def seat_hand(hand, cfg, seat, scale=HAND_SCALE):
+    """Drop the solved hand onto the weapon: its local grip axis (+X) lands on
+    the weapon's `axis`, the palm ends up on the `out` side of that axis, and
+    `cant` spins the hand about `out` to swing the forearm back off
+    perpendicular the way a real grip sits. Returns the wrist in world space."""
+    axis = Vector(cfg["axis"]).normalized()
+    out = Vector(cfg["out"])
+    out = (out - axis * out.dot(axis)).normalized()
+    Xw = (Matrix.Rotation(math.radians(cfg.get("cant", 0.0)), 3, out) @ axis).normalized()
+    Yw = -out                                  # palm faces the held cylinder
+    Zw = Xw.cross(Yw).normalized()             # fingers are -Z, so wrist is +Z
+    M = Matrix.Identity(4)
+    M.col[0][:3], M.col[1][:3], M.col[2][:3] = Xw, Yw, Zw
+    xf = (Matrix.Translation(Vector(cfg["center"])) @ M @ Matrix.Scale(scale, 4)
+          @ Matrix.Translation(-Vector((0.0, seat[0], seat[1]))))
+    hand.matrix_world = xf @ hand.matrix_world
+    W._activate(hand)
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    return xf @ WRIST_LOCAL, Zw
+
+
+# Shoulders in anchor space: the client's eye sits at CAMERA_POS, so the torso
+# hangs off that, not off the weapon.
+SHOULDER = {"L": (-0.34, -0.40, -0.14), "R": (0.03, -0.40, -0.14)}
+FOREARM = 0.30
+
+
+def elbow_for(side, wrist, wrist_dir, cfg):
+    """Put the elbow a forearm's length back from the wrist, along a direction
+    that leaves the wrist straight (no kink at the glove cuff) but aims at the
+    shoulder. The old configs hardcoded an elbow ~0.60m from the wrist, which
+    is what turned the sleeve into a giant white cone."""
+    if cfg.get("elbow"):
+        return Vector(cfg["elbow"])
+    w = Vector(wrist)
+    to_body = (Vector(SHOULDER[side]) - w).normalized()
+    d = (Vector(wrist_dir).normalized() * 0.45 + to_body * 0.55).normalized()
+    return w + d * cfg.get("forearm", FOREARM)
+
+
 # ---------------------------------------------------------- grip configs
-# One pose per weapon CLASS (the client swaps arms by weaponClassFor()):
-#   rifle  — right fist on the raked grip, left C-clamps the v3 handguard
-#            (weapon_rifle: grip (0,-0.095,-0.050) axis (0,-.34,-1), guard
-#             octagon r=0.030 centered (0, 0.315, 0.010)). Also used for smg.
-#   sniper — same hold, left wrist dropped to the deeper forend
-#            (weapon_sniper chassis bottom ≈ -0.036 vs rifle guard -0.021).
-#   pistol — two-handed: left palm cups the right hand at the grip.
+# One grip per weapon CLASS (the client swaps arms by weaponClassFor()). Each
+# names the cylinder the hand closes on, in weapon space, straight off
+# tools/weapongen/build_weapons.py:
+#   rifle  — guard = cyl(r 0.030) along +Y at (0, 0.315, 0.010); grip = loft
+#            from (0,-0.095,-0.050) along (0,-.34,-1), ~0.022 girth. Also smg.
+#   sniper — same firing hand, support hand out on the deeper forend.
+#   pistol — two-handed: support hand wraps the firing hand's fingers.
 #   knife  — one-handed: no left arm at all (vm_l_hand group stays empty).
+_GRIP_AXIS = (0.0, -0.3218, -0.9468)      # rifle grip rake (0,-.34,-1), normalized
+_BACKSTRAP = (0.0, -0.9468, 0.3218)       # ⊥ to it, pointing at the palm
+_PGRIP_AXIS = (0.0, -0.3873, -0.9221)     # pistol grip rake (0,-.42,-1)
+_PBACKSTRAP = (0.0, -0.9221, 0.3873)
+
+# firing hand on the rifle's raked pistol grip: local +X (the pinky side once
+# mirrored) runs down the grip, so the index lands at the trigger and the thumb
+# rides up toward the receiver. Index is overridden — it's on the trigger, not
+# wrapped around anything.
+# `cant` is the one free DOF once the fingers are perpendicular to what they
+# hold: it spins the hand about `out`, swinging the forearm off perpendicular
+# and back toward the shoulder the way a real grip sits.
 _R_ON_GRIP = {
-    "elbow": (0.17, -0.47, -0.38),
-    "wrist": (0.060, -0.132, -0.104),
-    "finger_dir": (-0.84, 0.18, -0.51),
-    "palm_dir": (-0.70, 0.36, -0.62),
-    "curls": {
-        "pinky": (80, 90, 48), "ring": (76, 88, 46), "middle": (68, 84, 42),
-        "index": (14, 12, 8),
-        "splay": {"index": -6, "pinky": 5},
-        "thumb": (16, 30, 16, 10),
-    },
+    "axis": _GRIP_AXIS, "out": _BACKSTRAP, "center": (0.0, -0.1128, -0.1017),
+    "radius": 0.021, "cant": -35.0, "seat_z": -0.074,
+    "thumb": (12, 24, 14, 8),
+    "override": {"index": (26, 16, 6)},
+    "slack": {"pinky": 0.0015},
+    "splay": {"index": -4, "pinky": 3},
 }
+# support hand C-clamps the handguard from the left: palm on the left flank,
+# fingers over the top, thumb forward, canted so the forearm swings back-left.
 _L_ON_GUARD = {
-    "elbow": (-0.40, -0.40, -0.36),
-    "wrist": (-0.068, 0.300, -0.055),
-    "finger_dir": (0.88, 0.08, 0.47),
-    "palm_dir": (0.12, 0.10, 0.99),
-    "curls": {
-        "pinky": (64, 76, 40), "ring": (62, 74, 38), "middle": (58, 70, 34),
-        "index": (48, 58, 28),
-        "splay": {"index": 2, "pinky": -5},
-        "thumb": (10, -35, 10, 8),
-    },
+    # seated at the BACK of the guard (it spans y 0.165..0.465): a support hand
+    # out at mid-barrel is both wrong for the hold and half a metre from the
+    # camera, where it shrinks to an unreadable speck.
+    "axis": (0.0, 1.0, 0.0), "out": (-0.94, 0.0, 0.34), "center": (0.0, 0.196, 0.010),
+    "radius": 0.030, "cant": 32.0, "seat_z": -0.082,
+    "thumb": (-14, 30, 10, 6),
+    "slack": {"pinky": 0.002, "ring": 0.001},
+    "splay": {"index": 3, "pinky": -4},
 }
-POSES = {
+GRIPS = {
     "rifle": {"R": _R_ON_GRIP, "L": _L_ON_GUARD},
     "sniper": {"R": _R_ON_GRIP,
-               "L": {**_L_ON_GUARD, "wrist": (-0.068, 0.315, -0.075),
-                     "elbow": (-0.40, -0.40, -0.38),
-                     "curls": {
-                         "pinky": (58, 68, 36), "ring": (56, 66, 34),
-                         "middle": (52, 60, 30), "index": (44, 52, 24),
-                         "splay": {"index": 2, "pinky": -5},
-                         "thumb": (10, -35, 10, 8),
-                     }}},
+               "L": {**_L_ON_GUARD, "center": (0.0, 0.262, -0.004),
+                     "radius": 0.032, "cant": 30.0}},
+    # the pistol has its OWN rake — grip_p lofts from (0,-0.048,-0.008) along
+    # (0,-.42,-1), narrower than the rifle's (hw 0.013, hd 0.023). Reusing the
+    # rifle's axis and centre here is what left both hands clutching at air.
     "pistol": {
-        # tighter fist for the slimmer grip; index rests on the guard front
-        "R": {**_R_ON_GRIP, "curls": {
-            "pinky": (86, 96, 52), "ring": (82, 94, 50), "middle": (74, 90, 46),
-            "index": (22, 20, 10),
-            "splay": {"index": -6, "pinky": 5},
-            "thumb": (16, 30, 16, 10),
-        }},
-        # support hand cups from the left flank: palm pressing the grip and
-        # the right-hand fingers, left fingers overlaying them up-across
-        "L": {
-            "elbow": (-0.34, -0.44, -0.36),
-            "wrist": (-0.058, -0.052, -0.122),
-            "finger_dir": (0.78, 0.26, 0.57),
-            "palm_dir": (0.60, 0.22, 0.77),
-            "curls": {
-                "pinky": (58, 68, 36), "ring": (56, 66, 34), "middle": (50, 58, 28),
-                "index": (46, 56, 28),
-                "splay": {"index": 4, "pinky": -4},
-                "thumb": (-6, -28, 10, 8),
-            },
-        },
+        "R": {**_R_ON_GRIP, "axis": _PGRIP_AXIS, "out": _PBACKSTRAP,
+              "center": (0.0, -0.0693, -0.0587), "radius": 0.019,
+              "seat_z": -0.072, "override": {"index": (30, 18, 6)}},
+        # support hand wraps the firing hand itself: same axis, a cylinder fat
+        # enough to be grip + right-hand fingers, approached from the left
+        "L": {"axis": _PGRIP_AXIS, "out": (-1.0, 0.0, 0.0),
+              "center": (0.0, -0.0770, -0.0772), "radius": 0.040, "cant": -40.0,
+              "seat_z": -0.078, "thumb": (-10, 26, 14, 8),
+              "splay": {"index": 3, "pinky": -3}},
     },
     "knife": {
-        # hammer grip on the horizontal handle (axis ≈ (0,-1,-0.1), girth
-        # r≈0.013 with wraps; handle spans y -0.006..-0.135 at z≈0.005)
-        "R": {
-            "elbow": (0.19, -0.47, -0.34),
-            "wrist": (0.058, -0.128, -0.020),
-            "finger_dir": (-0.86, -0.06, -0.50),
-            "palm_dir": (-0.48, -0.10, -0.87),
-            "curls": {
-                "pinky": (84, 92, 50), "ring": (82, 92, 48), "middle": (76, 88, 46),
-                "index": (66, 80, 40),
-                "splay": {"index": -3, "pinky": 4},
-                "thumb": (18, 34, 20, 12),
-            },
-        },
+        # hammer grip: handle lofts from (0,-0.006,0.013) along (0,-1,-0.1),
+        # hw 0.0115 / hd 0.018 at the grip, plus ~2mm of cord wrap
+        "R": {"axis": (0.0, -0.995, -0.0995), "out": (0.0, -0.0995, 0.995),
+              "center": (0.0, -0.0657, 0.0070), "radius": 0.0175, "cant": -28.0,
+              "seat_z": -0.070, "thumb": (16, 30, 18, 10),
+              "splay": {"index": -3, "pinky": 3}},
         "L": None,
     },
 }
@@ -474,47 +700,51 @@ def build_hand(side, palette, cfg):
         bpy.ops.object.transform_apply(scale=True)
         hand.data.flip_normals()
     trim_forearm(hand)
+    sculpt_hand_detail(hand, mirrored)
     hand.data.materials.clear()
     hand.data.materials.append(mat("glove", palette))
+    curls, seat = solve_curls(hand, cfg)   # needs the mesh unposed
     arm = rig_hand(hand, mirrored)
     add_glove_gear_post(hand, arm, palette, mirrored)
-    pose_hand(hand, arm, cfg["curls"], mirrored)
-    orient_hand(hand, cfg["wrist"], cfg["finger_dir"], cfg["palm_dir"])
+    pose_hand(hand, arm, curls, mirrored)
+    wrist, wrist_dir = seat_hand(hand, cfg, seat)
     W._smooth(hand, 62)
-    return hand
+    return hand, wrist, elbow_for(side, wrist, wrist_dir, cfg)
 
 
+# glove plating, in hand-local landmark space (palm +Y, fingers -Z, wrist +Z).
+# Cut from the hand's surface, so a band that spans all four fingers arrives as
+# four separate islands — the mesh has no geometry in the gaps between them.
 def add_glove_gear_post(hand, arm, palette, mirrored):
-    """Join accents after auto-weights, then weight them to nearest bones."""
-    s = -1.0 if mirrored else 1.0
+    """Dress the glove, then give the new geometry the skin's own weights so it
+    curls with the hand. Runs before pose_hand: the plates are authored on the
+    rest pose and ride the armature into the grip like the skin does.
+
+    Only the wrist band survives here. Anything cut from this mesh's surface
+    inherits its quad boundary, and at 3300 verts that boundary is coarse enough
+    that knuckle plates came out as jagged pixel crosses stuck to the fingers —
+    worse than bare glove. The knuckles read from the form instead, which is
+    what sculpt_hand_detail is for, and matches how plain the reference gloves
+    actually are."""
+    n_skin = len(hand.data.vertices)
     gear = [
-        W.plate("knuckle", (0.050, 0.009, 0.032), (-0.004 * s, -0.0170, -0.076),
-                mat("teal", palette), rot=(8, 0, 0), bevel_w=0.002),
-        W.plate("strap", (0.056, 0.006, 0.013), (-0.002 * s, -0.0145, -0.046),
-                mat("strap", palette), rot=(6, 0, 0), bevel_w=0.0012),
+        _surface_patch(hand, "gv_cuff", mat("dark", palette),
+                       lambda c, n: 0.026 <= c.z <= 0.040,
+                       thickness=0.0030, bevel_w=0.0012),
     ]
-    bpy.ops.mesh.primitive_torus_add(major_radius=0.036, minor_radius=0.011,
-                                     major_segments=22, minor_segments=10,
-                                     location=(0.002 * s, 0.003, 0.034))
-    cuff = bpy.context.object
-    cuff.name = "glovecuff"
-    cuff.scale = (1.0, 0.85, 1.15)
-    bpy.ops.object.transform_apply(scale=True)
-    cuff.data.materials.append(mat("dark", palette))
-    bpy.ops.object.shade_smooth()
-    gear.append(cuff)
-    W._activate(hand)
-    for g in gear:
-        g.select_set(True)
-    bpy.ops.object.join()
-    n = weight_islands_to_nearest(hand, arm)
-    return n
+    gear = [g for g in gear if g]
+    if gear:
+        W._activate(hand)
+        for g in gear:
+            g.select_set(True)
+        bpy.ops.object.join()
+    return weight_like_skin(hand, n_skin)
 
 
-def build_sleeve(side, palette, cfg):
+def build_sleeve(side, palette, elbow, wrist):
     """Sleeve lofted straight along +Y, then rotated onto the elbow->wrist
     axis (the loft helper only tilts about X, arms run diagonally)."""
-    e, w = Vector(cfg["elbow"]), Vector(cfg["wrist"])
+    e, w = Vector(elbow), Vector(wrist)
     d = (w - e).normalized()
     L = (w - e).length
     q = d.to_track_quat("Z", "Y")  # loft rings live in the XY plane (⊥ Z)
@@ -529,25 +759,43 @@ def build_sleeve(side, palette, cfg):
         bpy.ops.object.transform_apply(location=True, rotation=True)
         return o
 
+    # Fitted, not tubular: a forearm is ~9cm across at the elbow and ~6cm at the
+    # wrist. The old profile started at 11.6cm over a 60cm "forearm", which is
+    # what made the sleeve read as a giant white cone filling the frame.
+    def rad(t):
+        return 0.042 - 0.015 * t ** 0.8
+
     parts = []
+    # runs past t=1 (the wrist) so it sleeves over the hand's trim edge instead
+    # of leaving a black hole where the two meet
     parts.append(place(W.loft(f"sleeve.{side}", [
-        ring(0.00, 0.058, 0.062), ring(0.22, 0.054, 0.058), ring(0.48, 0.048, 0.051),
-        ring(0.68, 0.042, 0.045), ring(0.84, 0.037, 0.039), ring(0.97, 0.032, 0.033),
-    ], mat("white", palette), ring=12, round_k=0.42, subsurf=1)))
+        ring(t, rad(t), rad(t) * 1.06)
+        for t in (0.0, 0.18, 0.40, 0.62, 0.80, 0.93, 1.0, 1.14)
+    ], mat("white", palette), ring=14, round_k=0.45, subsurf=1)))
+    # armour ribs banding the forearm — the segmented look of the reference.
+    # Kept shallow: proud rings this size turn the arm into a caterpillar.
+    for i, t in enumerate((0.26, 0.52)):
+        r = rad(t) + 0.0016
+        parts.append(place(W.loft(f"rib{i}.{side}", [
+            ring(t, r * 0.985, r * 1.045), ring(t + 0.085, r, r * 1.06),
+            ring(t + 0.115, r * 0.97, r * 1.03)],
+            mat("dark", palette), ring=14, round_k=0.45, subsurf=1)))
+    # cuff where the sleeve meets the glove. Four rings, not two: subsurf pulls
+    # a loft toward its control cage, and a 2-ring cage collapses far harder
+    # than the 8-ring shell it is supposed to cover — which is what tore the
+    # white through the cuff in a jagged line.
+    cr = [rad(0.86) + 0.0050, rad(0.92) + 0.0052, rad(1.0) + 0.0054,
+          rad(1.04) + 0.0046]
     parts.append(place(W.loft(f"cuff.{side}", [
-        ring(0.30, 0.0555, 0.059), ring(0.40, 0.0545, 0.058)],
-        mat("teal", palette), ring=12, round_k=0.42, subsurf=1)))
-    for i, t in enumerate((0.62, 0.76)):
-        parts.append(place(W.loft(f"wrap{i}.{side}", [
-            ring(t, 0.047 - i * 0.003, 0.050 - i * 0.003),
-            ring(t + 0.055, 0.0465 - i * 0.003, 0.0495 - i * 0.003)],
-            mat("dark", palette), ring=12, round_k=0.42, subsurf=1)))
-    wl = e.lerp(w, 0.55)
+        ring(t, r, r * 1.06) for t, r in
+        zip((0.86, 0.94, 1.08, 1.18), cr)],
+        mat("teal", palette), ring=14, round_k=0.45, subsurf=1)))
+    # identity stripe along the outside of the forearm
     n_up = (q @ Vector((0, 0, 1))).normalized()
-    wp = W.plate(f"windline.{side}", (0.006, L * 0.20, 0.012), (0, 0, 0),
+    wp = W.plate(f"windline.{side}", (0.007, L * 0.26, 0.010), (0, 0, 0),
                  mat("glow", palette), bevel_w=0.001)
     wp.rotation_euler = q.to_euler()
-    wp.location = wl + n_up * 0.050
+    wp.location = e.lerp(w, 0.52) + n_up * (rad(0.52) + 0.001)
     W._activate(wp)
     bpy.ops.object.transform_apply(location=True, rotation=True)
     parts.append(wp)
@@ -573,29 +821,48 @@ def _ease(action):
             kp.handle_left_type = kp.handle_right_type = "AUTO_CLAMPED"
 
 
-# per-pose left-hand choreography for the reload clip (bone-local deltas)
-RELOAD_L_KEYS = {
-    "rifle": [
-        (1,  (0, 0, 0), (0, 0, 0)),
-        (6,  (0.03, -0.11, -0.05), (-16, 0, -8)),
-        (12, (0.05, -0.22, -0.10), (-28, 0, -14)),
-        (16, (0.06, -0.23, -0.11), (-30, 0, -14)),
-        (19, (0.05, -0.21, -0.095), (-26, 0, -12)),
-        (30, (0.02, -0.08, -0.035), (-9, 0, -5)),
-        (38, (0, 0, 0), (0, 0, 0)),
-    ],
-    # pistol: support hand peels off, dips to meet the fresh mag, re-cups
-    "pistol": [
-        (1,  (0, 0, 0), (0, 0, 0)),
-        (7,  (-0.03, -0.05, -0.09), (-22, 0, 10)),
-        (14, (-0.04, -0.03, -0.13), (-30, 0, 14)),
-        (20, (-0.035, -0.02, -0.11), (-26, 0, 12)),
-        (32, (-0.01, -0.005, -0.03), (-8, 0, 4)),
-        (38, (0, 0, 0), (0, 0, 0)),
-    ],
-    "knife": [],
+# Where the support hand reaches on a reload. The MAGWELL, not the base of the
+# magazine: the client's eye sits at z 0.13 with a 90° vertical FOV, so the
+# bottom of the frame near the weapon is about z -0.21, and a hand sent to the
+# mag base (z -0.254) plays the whole reload underneath the screen. The root
+# bone's own reload dip adds roughly another -0.05 on top of these.
+MAG_TARGET = {
+    "rifle": (0.0, 0.048, -0.135),
+    "sniper": (0.0, 0.048, -0.135),
+    "pistol": (0.015, -0.078, -0.118),
+    "knife": None,
 }
-RELOAD_L_KEYS["sniper"] = RELOAD_L_KEYS["rifle"]
+# frame, vm_l_hand rotation (deg), how far along the reach
+RELOAD_L_PROFILE = (
+    (1,  (0, 0, 0), 0.0),
+    (6,  (-8, 0, -5), 0.45),
+    (12, (-13, 0, -8), 0.92),
+    (16, (-14, 0, -8), 1.0),
+    (19, (-12, 0, -7), 0.88),
+    (30, (-4, 0, -2), 0.28),
+    (38, (0, 0, 0), 0.0),
+)
+
+
+def _reload_l_keys(arm, centroid, target):
+    """Solve the bone-local translations that actually put the support hand on
+    the magazine, given where its geometry starts.
+
+    These used to be hand-typed offsets, which silently stopped meaning anything
+    the moment the grip moved: with the hand reseated on the guard, the old
+    numbers threw it a quarter-metre below the receiver and out of frame."""
+    if target is None:
+        return []
+    bone = arm.data.bones["vm_l_hand"]
+    inv = bone.matrix_local.to_3x3().inverted()
+    head = Vector(bone.head_local)
+    c0 = Vector(centroid)
+    keys = []
+    for frame, rot, along in RELOAD_L_PROFILE:
+        rot_m = Euler([math.radians(d) for d in rot], "XYZ").to_matrix()
+        want = c0.lerp(Vector(target), along)
+        keys.append((frame, tuple(inv @ (want - head - rot_m @ (c0 - head))), rot))
+    return keys
 
 INSPECT_L_KEYS = {
     "rifle": [
@@ -635,9 +902,12 @@ def rig_and_animate(mesh, left_verts, pose="rifle"):
     vg_l = mesh.vertex_groups.get("vm_l_hand") or mesh.vertex_groups.new(name="vm_l_hand")
     all_idx = list(range(len(mesh.data.vertices)))
     vg_root.add(all_idx, 1.0, "REPLACE")
+    l_centroid = None
     if left_verts:
         vg_root.remove(left_verts)
         vg_l.add(left_verts, 1.0, "REPLACE")
+        pts = [mesh.data.vertices[i].co for i in left_verts]
+        l_centroid = sum(pts, Vector()) / len(pts)
     bpy.ops.object.select_all(action="DESELECT")
     mesh.select_set(True)
     arm.select_set(True)
@@ -685,7 +955,7 @@ def rig_and_animate(mesh, left_verts, pose="rifle"):
         (26, (-0.014, -0.022, -0.07), (-17, 0, 14)),
         (34, (0.004, 0.008, 0.016), (3, 0, -2)),
         (40, (0, 0, 0), (0, 0, 0)),
-    ], keys_l=RELOAD_L_KEYS.get(pose, RELOAD_L_KEYS["rifle"]))
+    ], keys_l=_reload_l_keys(arm, l_centroid, MAG_TARGET.get(pose)))
     make("inspect", [
         (1,  (0, 0, 0), (0, 0, 0)),
         (14, (0.02, -0.06, 0.02), (7, -20, 26)),
@@ -702,15 +972,15 @@ def build_arms_mesh(palette=PAL, out_name="viewmodel_zephyr", pose="rifle"):
     old = bpy.data.objects.get(out_name)
     if old:
         bpy.data.objects.remove(old, do_unlink=True)
-    cfgs = POSES[pose]
+    cfgs = GRIPS[pose]
     parts = []
     left_parts = []
     for side in ("R", "L"):
         cfg = cfgs[side]
         if cfg is None:  # one-handed pose (knife): no left arm at all
             continue
-        hand = build_hand(side, palette, cfg)
-        sleeves = build_sleeve(side, palette, cfg)
+        hand, wrist, elbow = build_hand(side, palette, cfg)
+        sleeves = build_sleeve(side, palette, elbow, wrist)
         parts += [hand] + sleeves
         if side == "L":
             left_parts += [hand] + sleeves
@@ -773,8 +1043,12 @@ def build_variants():
 
 
 def render_fp(name="viewmodel_fp", rifle="weapon_rifle_v3", arms_name="viewmodel_zephyr"):
-    """Game-camera check: camera at the client anchor inverse, FOV 90, plus
-    side/top diagnostics. Renders arms + the actual rifle."""
+    """Game-camera check plus close-up diagnostics, arms + the actual weapon.
+
+    `game_cam` reproduces the client exactly, which the old version did not:
+    render.ts builds PerspectiveCamera(90, ...) and three.js reads fov as
+    VERTICAL, and viewmodel.ts yaws the anchor by 0.06 rad — so framing tuned
+    against a 90° horizontal shot at 16:10 was never what a player sees."""
     import harness, importlib
     importlib.reload(harness)
     harness._ensure_studio()
@@ -786,19 +1060,30 @@ def render_fp(name="viewmodel_fp", rifle="weapon_rifle_v3", arms_name="viewmodel
     state = harness._solo(objs)
     out = harness.PREVIEWS / name
     out.mkdir(parents=True, exist_ok=True)
-    scn.render.resolution_x, scn.render.resolution_y = 1280, 800
-    shots = [
-        ("game_cam", Vector(CAMERA_POS), Vector((0, 0.4, -0.02)), math.radians(90)),
-        ("side", Vector((-0.85, 0.05, 0.05)), Vector((0, 0.05, -0.08)), math.radians(45)),
-        ("top", Vector((0.02, 0.05, 0.85)), Vector((0, 0.05, -0.05)), math.radians(45)),
-        ("grip_close", Vector((-0.28, -0.34, 0.02)), Vector((0.03, -0.10, -0.06)), math.radians(40)),
-        ("lhand_close", Vector((-0.30, 0.02, -0.06)), Vector((-0.02, 0.28, -0.02)), math.radians(40)),
-    ]
     paths = []
-    for nm, pos, tgt, ang in shots:
-        cam.data.angle = ang
+
+    # the player's view
+    scn.render.resolution_x, scn.render.resolution_y = 1280, 720
+    cam.data.sensor_fit = "VERTICAL"
+    cam.data.angle_y = math.radians(90)
+    cam.location = Vector(CLIENT_CAM)
+    cam.rotation_euler = Vector(CLIENT_FWD).to_track_quat("-Z", "Y").to_euler()
+    scn.render.filepath = str(out / "game_cam.png")
+    bpy.ops.render.render(write_still=True)
+    paths.append(scn.render.filepath)
+
+    cam.data.sensor_fit = "AUTO"
+    scn.render.resolution_x, scn.render.resolution_y = 1280, 800
+    for nm, pos, tgt, ang in [
+        ("side", (-0.85, 0.05, 0.05), (0, 0.05, -0.08), 45),
+        ("top", (0.02, 0.05, 0.85), (0, 0.05, -0.05), 45),
+        ("grip_close", (0.34, -0.34, 0.03), (0.01, -0.11, -0.09), 38),
+        ("lhand_close", (-0.34, 0.08, 0.28), (-0.03, 0.20, 0.00), 40),
+        ("back_of_hand", (-0.26, -0.11, 0.14), (-0.045, 0.20, -0.005), 40),
+    ]:
+        cam.data.angle = math.radians(ang)
         cam.location = pos
-        cam.rotation_euler = (tgt - pos).to_track_quat("-Z", "Y").to_euler()
+        cam.rotation_euler = (Vector(tgt) - Vector(pos)).to_track_quat("-Z", "Y").to_euler()
         scn.render.filepath = str(out / f"{nm}.png")
         bpy.ops.render.render(write_still=True)
         paths.append(scn.render.filepath)

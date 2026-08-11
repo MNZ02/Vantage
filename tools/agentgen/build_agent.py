@@ -1,10 +1,9 @@
 """Build an agent from the CC0 stylized base body + spec-driven gear shells.
 
-v4: Zephyr redesigned (see specs.py) and a proper RECRUIT placeholder. The
-proven v3 machinery stays — normalize base, UV-island face labeling, garment
-shells via Solidify — with a new hard-surface addon kit borrowed from
-tools/weapongen (beveled prisms/lofts instead of raw boxes), procedural hair
-(scalp shell + swept ponytail), and Subsurf smoothing on body+shells.
+v6: Zephyr dispatches to build_zephyr_scratch.py, a clean-slate realistic
+human wind-runner build. RECRUIT remains on the proven normalized stylized
+base, UV-island face labeling and garment-shell machinery below. The legacy
+v5 addon code stays readable for older saved sessions but is not production.
 
 Headless: blender --background --python tools/agentgen/build_agent.py -- --agent zephyr
 Live: import and call build(agent_key) — the MCP session does this.
@@ -86,7 +85,8 @@ def _body_master():
     return o
 
 
-def normalize_base(height, head_scale, curl=True):
+def normalize_base(height, head_scale, curl=True, flatten_face=True,
+                   flatten_chest=True):
     master = _body_master()
     o = master.copy()
     o.data = master.data.copy()
@@ -110,10 +110,12 @@ def normalize_base(height, head_scale, curl=True):
     # face +Y: bundle bodies face -Y; flip
     for v in me.vertices:
         v.co.x, v.co.y = -v.co.x, -v.co.y
-    # armor-silhouette chest flatten on the BASE so every shell inherits it
-    for v in me.vertices:
-        if v.co.y > 0.04 and 1.14 < v.co.z < 1.42 and abs(v.co.x) < 0.17:
-            v.co.y = 0.04 + (v.co.y - 0.04) * 0.35
+    if flatten_chest:
+        # Recruit's armor vest needs a flatter base silhouette. Zephyr keeps
+        # the natural torso volume so the jacket reads as cloth on a person.
+        for v in me.vertices:
+            if v.co.y > 0.04 and 1.14 < v.co.z < 1.42 and abs(v.co.x) < 0.17:
+                v.co.y = 0.04 + (v.co.y - 0.04) * 0.35
     if head_scale != 1.0:
         hc = Vector((0, 0, 1.62))
         for v in me.vertices:
@@ -121,15 +123,16 @@ def normalize_base(height, head_scale, curl=True):
                 w = min(1.0, (v.co.z - 1.50) / 0.06)
                 f = 1.0 + (head_scale - 1.0) * w
                 v.co = hc + (v.co - hc) * f
-    # faces are always masked (IP/style constraint) — flatten nose/lips/chin
-    for v in me.vertices:
-        if v.co.y > 0.045 and 1.45 < v.co.z < 1.70 and abs(v.co.x) < 0.10:
-            v.co.y = 0.045
-    # tuck the ears hard (helmet/haircap shells would tent over them otherwise)
-    for v in me.vertices:
-        ax = abs(v.co.x)
-        if ax > 0.058 and 1.53 < v.co.z < 1.68 and abs(v.co.y) < 0.09:
-            v.co.x = math.copysign(0.058 + (ax - 0.058) * 0.08, v.co.x)
+    if flatten_face:
+        # The generic recruit is fully masked, so simplify features beneath
+        # the faceplate and tuck ears beneath the helmet shell.
+        for v in me.vertices:
+            if v.co.y > 0.045 and 1.45 < v.co.z < 1.70 and abs(v.co.x) < 0.10:
+                v.co.y = 0.045
+        for v in me.vertices:
+            ax = abs(v.co.x)
+            if ax > 0.058 and 1.53 < v.co.z < 1.68 and abs(v.co.y) < 0.09:
+                v.co.x = math.copysign(0.058 + (ax - 0.058) * 0.08, v.co.x)
     # merge the toes into a boot-wedge so boot shells + toe caps seal the foot
     for v in me.vertices:
         if v.co.z < 0.06 and v.co.y > 0.10:
@@ -239,6 +242,8 @@ GARMENTS = {
                "not_y_z": (0.05, 1.66), "not_x_z": (0.055, 1.65)},
     "haircap": {"parts": ("scalp", "ear.L", "ear.R", "head"), "z": (1.56, 9),
                 "not_y_z": (0.015, 1.72)},
+    "haircap_open": {"parts": ("scalp", "head"), "z": (1.585, 9),
+                     "not_y_z": (0.018, 1.715)},
 }
 
 
@@ -369,148 +374,222 @@ def ring(name, R, r, loc, material, scale=None, rot=None, segs=(24, 10)):
     return o
 
 
-# ================= ZEPHYR v4 addons =================
-def addons_zephyr_v4(M, body, labels):
-    A = []
-    gear, accent, glow, jacket, jacket_in, hair, metal, pants = (
-        M["gear"], M["accent"], M["glow"], M["jacket"], M["jacket_in"],
-        M["hair"], M["metal"], M["pants"])
-    # ---- masked face: smooth plate + chevron visor
-    bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=14, radius=0.105)
-    fp = bpy.context.object
-    fp.name = "z_faceplate"
-    fp.scale = (1.0, 0.8, 1.4)
-    fp.location = (0, 0.048, 1.585)
-    bpy.ops.object.transform_apply(scale=True)
-    fp.data.materials.append(gear)
+# ---------------- soft-form helpers (Zephyr v5)
+def ellipsoid(name, loc, scale, material, rot=None, segs=20, rings=12):
+    """Smooth low-poly ellipsoid used for facial and hair forms."""
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=segs, ring_count=rings, radius=1,
+                                         location=loc)
+    o = bpy.context.object
+    o.name = name
+    o.scale = scale
+    if rot:
+        o.rotation_euler = [math.radians(d) for d in rot]
+    bpy.ops.object.transform_apply(rotation=True, scale=True)
+    o.data.materials.append(material)
     bpy.ops.object.shade_smooth()
-    A.append(fp)
-    for s, x in (("L", 0.032), ("R", -0.032)):
-        A.append(W.plate(f"z_visor.{s}", (0.062, 0.016, 0.020), (x * 1.0, 0.118, 1.606),
-                         glow, rot=(-8, 0, -22 if s == "L" else 22), bevel_w=0.002))
-    A.append(W.plate("z_visor_dot", (0.014, 0.014, 0.012), (0, 0.124, 1.588), glow,
-                     rot=(-8, 0, 45), bevel_w=0.002))
-    # brow ridge over the visor
-    A.append(W.plate("z_brow", (0.15, 0.03, 0.018), (0, 0.095, 1.652), gear,
-                     rot=(-14, 0, 0), taper=(0.85, 0.7), bevel_w=0.003))
-    # ---- hair: scalp cap shell + swept bangs + high ponytail
-    cap = shell(body, labels, "haircap", "z_haircap", 0.013, 0.013, hair)
-    smooth_open_boundary(cap)
-    A.append(cap)
-    A.append(chain("z_bang", [(0.045, 0.095, 1.735), (-0.01, 0.115, 1.71),
-                              (-0.062, 0.10, 1.66), (-0.085, 0.075, 1.615)],
-                   [0.030, 0.026, 0.018, 0.008], hair))
-    pony = [(0.01, -0.115, 1.745), (0.02, -0.21, 1.69), (0.005, -0.275, 1.56),
-            (-0.015, -0.26, 1.40), (0.0, -0.20, 1.26), (0.01, -0.16, 1.17)]
-    A.append(chain("z_ponytail", pony, [0.040, 0.048, 0.036, 0.024, 0.014, 0.006], hair))
-    A.append(ring("z_tie", 0.030, 0.009, (0.013, -0.145, 1.735), accent,
-                  rot=(65, 0, 0), segs=(16, 8)))
-    A.append(ring("z_braid1", 0.024, 0.006, (0.002, -0.268, 1.50), metal,
-                  rot=(80, 0, 0), segs=(14, 6)))
-    A.append(ring("z_braid2", 0.017, 0.005, (-0.006, -0.235, 1.335), metal,
-                  rot=(70, 0, 0), segs=(14, 6)))
-    # ---- collar cowl
-    A.append(ring("z_collar", 0.098, 0.024, (0, 0.005, 1.505), jacket,
-                  scale=(1.0, 1.15, 0.55), rot=(8, 0, 0)))
-    A.append(ring("z_collar_in", 0.085, 0.012, (0, 0.008, 1.515), jacket_in,
-                  scale=(1.0, 1.1, 0.5), rot=(8, 0, 0), segs=(20, 8)))
-    # ---- asymmetric pauldron (left shoulder, x > 0)
-    A.append(W.plate("z_pauldron1", (0.145, 0.115, 0.030), (0.186, -0.005, 1.448),
-                     metal, rot=(0, 26, 4), taper=(0.72, 0.80), bevel_w=0.003))
-    A.append(W.plate("z_pauldron2", (0.125, 0.100, 0.026), (0.213, -0.010, 1.408),
-                     jacket, rot=(0, 38, 4), taper=(0.75, 0.82), bevel_w=0.003))
-    A.append(W.plate("z_pauldron3", (0.105, 0.088, 0.022), (0.233, -0.014, 1.368),
-                     gear, rot=(0, 50, 4), taper=(0.78, 0.85), bevel_w=0.003))
-    A.append(W.plate("z_pauldron_glow", (0.10, 0.012, 0.010), (0.194, 0.046, 1.452),
-                     glow, rot=(0, 26, 4), bevel_w=0.0015))
-    # ---- chest strap L-shoulder -> R-hip + buckle
-    A.append(chain("z_strap", [(0.13, 0.068, 1.445), (0.045, 0.092, 1.32),
-                               (-0.045, 0.085, 1.20), (-0.115, 0.045, 1.09)],
-                   [0.012, 0.013, 0.013, 0.012], gear, subsurf=1))
-    A.append(W.plate("z_buckle", (0.045, 0.018, 0.055), (0.005, 0.098, 1.30), accent,
-                     rot=(-4, 0, -32), bevel_w=0.002))
-    # ---- left forearm bracer + glow inlay
-    A.append(W.loft("z_bracer", [
-        ((0.264, -0.022, 1.095), 0.045, 0.042, 0),
-        ((0.286, -0.028, 1.020), 0.042, 0.039, 0),
-        ((0.305, -0.034, 0.950), 0.038, 0.035, 0),
-    ], gear, ring=10, round_k=0.45, subsurf=1))
-    A.append(W.plate("z_bracer_glow", (0.012, 0.014, 0.11), (0.318, -0.030, 1.023),
-                     glow, rot=(0, -12, 0), bevel_w=0.0015))
-    # ---- belt + buckle + canisters (right hip) + pouch (left hip)
-    A.append(ring("z_belt", 0.128, 0.020, (0, -0.002, 1.048), gear, scale=(1, 0.74, 1)))
-    A.append(W.plate("z_beltbuckle", (0.052, 0.016, 0.038), (0, 0.092, 1.048), glow,
+    return o
+
+
+def ribbon(name, pts, widths, material, thick=0.004, bevel_w=0.002):
+    """Tapered fabric strip following a centerline.
+
+    Ribbons face roughly along Y (front/back of the character), which covers
+    coat tails, shoulder streamers and embroidered wind marks without giving
+    them the rigid cuboid language of the weapon helper plates.
+    """
+    pts = [Vector(p) for p in pts]
+    if isinstance(widths, (int, float)):
+        widths = [float(widths)] * len(pts)
+    if len(pts) != len(widths):
+        raise ValueError("ribbon needs one width per point")
+    verts = []
+    normal = Vector((0, 1, 0))
+    for i, (p, width) in enumerate(zip(pts, widths)):
+        tangent = pts[min(i + 1, len(pts) - 1)] - pts[max(i - 1, 0)]
+        side = normal.cross(tangent)
+        if side.length < 1e-6:
+            side = Vector((1, 0, 0))
+        else:
+            side.normalize()
+        verts += [p - side * width * 0.5, p + side * width * 0.5]
+    faces = [(i * 2, i * 2 + 1, i * 2 + 3, i * 2 + 2)
+             for i in range(len(pts) - 1)]
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    me.materials.append(material)
+    o = bpy.data.objects.new(name, me)
+    bpy.context.scene.collection.objects.link(o)
+    W._activate(o)
+    md = o.modifiers.new("sol", "SOLIDIFY")
+    md.thickness = thick
+    md.offset = 0
+    bpy.ops.object.modifier_apply(modifier=md.name)
+    if bevel_w:
+        W.bevel(o, bevel_w, segs=2, deg=20)
+    bpy.ops.object.shade_smooth()
+    return o
+
+
+# ================= ZEPHYR v5 addons =================
+def addons_zephyr_v5(M, body, labels):
+    A = []
+    (gear, accent, glow, jacket, jacket_in, hair, hair_dark, skin, skin_warm,
+     eye, eye_white, metal) = (
+        M["gear"], M["accent"], M["glow"], M["jacket"], M["jacket_in"],
+        M["hair"], M["hair_dark"], M["skin"], M["skin_warm"], M["eye"],
+        M["eye_white"], M["metal"])
+
+    # ---- expressive human face; the base mesh supplies nose, cheeks and jaw
+    for s, x in (("L", 0.055), ("R", -0.048)):
+        rz = -4 if s == "L" else 4
+        A.append(ellipsoid(f"z_eye_white.{s}", (x, 0.102, 1.568),
+                           (0.030, 0.006, 0.013), eye_white, rot=(0, 0, rz)))
+        A.append(ellipsoid(f"z_iris.{s}", (x, 0.109, 1.568),
+                           (0.0085, 0.003, 0.0085), eye))
+        A.append(ellipsoid(f"z_eye_glint.{s}", (x + 0.002, 0.112, 1.571),
+                           (0.0022, 0.0012, 0.0022), glow, segs=12, rings=8))
+    A.append(chain("z_brow.L", [(0.010, 0.114, 1.596), (0.033, 0.116, 1.601),
+                                 (0.055, 0.110, 1.596)],
+                   [0.0025, 0.0030, 0.0015], hair_dark, subsurf=1))
+    A.append(chain("z_brow.R", [(-0.010, 0.114, 1.596), (-0.033, 0.116, 1.600),
+                                 (-0.055, 0.110, 1.593)],
+                   [0.0025, 0.0030, 0.0015], hair_dark, subsurf=1))
+    A.append(chain("z_lips", [(-0.026, 0.119, 1.500), (-0.009, 0.123, 1.497),
+                               (0.009, 0.123, 1.497), (0.026, 0.119, 1.500)],
+                   [0.0015, 0.0027, 0.0027, 0.0015], skin_warm, subsurf=1))
+    # A tiny painted wind stroke under her left eye becomes the hero face mark.
+    A.append(chain("z_face_mark", [(0.045, 0.115, 1.548), (0.055, 0.112, 1.539),
+                                    (0.067, 0.107, 1.542)],
+                   [0.0018, 0.0022, 0.0008], accent, subsurf=1))
+
+    # ---- mint-white hair with a swept fringe and an off-center ponytail
+    A.append(chain("z_fringe_main", [(-0.050, 0.020, 1.726), (-0.026, 0.082, 1.704),
+                                      (0.018, 0.107, 1.682), (0.065, 0.090, 1.647)],
+                   [0.016, 0.014, 0.010, 0.0025], hair))
+    A.append(chain("z_fringe_side", [(-0.070, 0.010, 1.708), (-0.079, 0.069, 1.665),
+                                      (-0.082, 0.074, 1.608), (-0.073, 0.060, 1.566)],
+                   [0.012, 0.010, 0.006, 0.002], hair_dark))
+    A.append(chain("z_fringe_light", [(0.005, 0.052, 1.724), (0.045, 0.100, 1.700),
+                                       (0.083, 0.072, 1.668)],
+                   [0.010, 0.007, 0.002], hair))
+    for s, x in (("L", 0.080), ("R", -0.080)):
+        A.append(chain(f"z_side_lock.{s}", [(x, 0.047, 1.650),
+                                             (x, 0.064, 1.615),
+                                             (x * 0.96, 0.052, 1.575)],
+                       [0.010, 0.008, 0.002],
+                       hair_dark if s == "L" else hair, subsurf=1))
+    A.append(ellipsoid("z_hair_knot", (0.040, -0.112, 1.692),
+                       (0.050, 0.043, 0.046), hair_dark, rot=(12, 0, -18)))
+    pony = [(0.045, -0.135, 1.688), (0.073, -0.205, 1.640),
+            (0.100, -0.255, 1.545), (0.082, -0.270, 1.430),
+            (0.040, -0.245, 1.325), (0.020, -0.205, 1.270)]
+    A.append(chain("z_ponytail", pony,
+                   [0.044, 0.050, 0.042, 0.030, 0.016, 0.004], hair))
+    A.append(chain("z_ponytail_streak", [(0.073, -0.218, 1.625),
+                                          (0.096, -0.272, 1.530),
+                                          (0.075, -0.285, 1.430),
+                                          (0.046, -0.250, 1.348)],
+                   [0.009, 0.008, 0.005, 0.0015], hair_dark, subsurf=1))
+    A.append(ring("z_hair_tie", 0.028, 0.006, (0.047, -0.143, 1.681), accent,
+                  rot=(63, 0, -15), segs=(16, 6)))
+
+    # ---- soft neckline and hood fold, close to the body rather than a halo
+    A.append(ring("z_neckline", 0.074, 0.011, (0, -0.002, 1.498), jacket_in,
+                  scale=(1.0, 1.14, 0.48), rot=(7, 0, 0), segs=(20, 8)))
+    A.append(chain("z_hood_fold", [(-0.075, -0.030, 1.500),
+                                    (0.000, -0.100, 1.520),
+                                    (0.075, -0.030, 1.500)],
+                   [0.015, 0.021, 0.015], jacket, subsurf=1))
+
+    # ---- asymmetric fabric sash and wind-streamer shoulder tails
+    A.append(ribbon("z_sash", [(0.145, 0.080, 1.445), (0.080, 0.101, 1.365),
+                                (0.020, 0.108, 1.285), (-0.055, 0.090, 1.190),
+                                (-0.110, 0.060, 1.108)],
+                    [0.060, 0.057, 0.052, 0.045, 0.032], accent,
+                    thick=0.005, bevel_w=0.0025))
+    A.append(ellipsoid("z_sash_knot", (0.156, 0.030, 1.445),
+                       (0.029, 0.019, 0.025), accent, rot=(0, 18, -15)))
+    A.append(ribbon("z_streamer_outer", [(0.170, -0.015, 1.430),
+                                          (0.195, -0.052, 1.397),
+                                          (0.220, -0.088, 1.350),
+                                          (0.238, -0.116, 1.300),
+                                          (0.247, -0.134, 1.245),
+                                          (0.243, -0.142, 1.195),
+                                          (0.225, -0.145, 1.155)],
+                    [0.062, 0.060, 0.055, 0.046, 0.035, 0.022, 0.008], accent,
+                    thick=0.004, bevel_w=0.002))
+    A.append(ribbon("z_streamer_inner", [(0.145, -0.022, 1.425),
+                                          (0.128, -0.064, 1.380),
+                                          (0.118, -0.106, 1.330),
+                                          (0.130, -0.132, 1.275),
+                                          (0.145, -0.146, 1.225),
+                                          (0.143, -0.151, 1.180),
+                                          (0.130, -0.150, 1.145)],
+                    [0.046, 0.044, 0.040, 0.034, 0.027, 0.016, 0.006], jacket_in,
+                    thick=0.004, bevel_w=0.002))
+
+    # ---- jacket tailoring and one textile forearm wrap
+    A.append(W.plate("z_zipper", (0.007, 0.007, 0.195),
+                     (0, 0.102, 1.303), jacket_in, bevel_w=0.0012))
+    A.append(W.loft("z_forearm_wrap", [
+        ((0.275, -0.025, 1.100), 0.042, 0.040, 0),
+        ((0.291, -0.030, 1.035), 0.040, 0.038, 0),
+        ((0.307, -0.034, 0.975), 0.037, 0.035, 0),
+    ], gear, ring=10, round_k=0.60, subsurf=1))
+    A.append(ribbon("z_wrap_glyph", [(0.307, 0.002, 1.072),
+                                      (0.320, 0.004, 1.040),
+                                      (0.313, 0.003, 1.008)],
+                    [0.007, 0.010, 0.003], glow, thick=0.002,
+                    bevel_w=0.001))
+
+    # ---- low-profile utility belt, one pouch and a dangling wind charm
+    A.append(ring("z_belt", 0.124, 0.012, (0, -0.002, 1.046), gear,
+                  scale=(1.0, 0.74, 0.72), segs=(24, 8)))
+    A.append(W.plate("z_belt_clasp", (0.038, 0.012, 0.026),
+                     (0, 0.088, 1.046), accent, taper=(0.82, 0.82),
                      bevel_w=0.002))
-    for i, (bx, by) in enumerate(((-0.155, 0.020), (-0.125, 0.075))):
-        A.append(W.cyl(f"z_can{i}", 0.020, 0.075, (bx, by, 0.995), metal, axis="Z",
-                       segs=14, bevel_w=0.002))
-        A.append(ring(f"z_canband{i}", 0.021, 0.004, (bx, by, 0.985), glow,
-                      rot=(0, 0, 0), segs=(14, 6)))
-    A.append(W.plate("z_pouch", (0.075, 0.055, 0.095), (0.152, 0.045, 0.995), gear,
-                     rot=(0, 0, -8), taper=(0.9, 0.85), bevel_w=0.003))
-    # ---- split tail panel off the back of the belt (glow strips joined in
-    # BEFORE the S-curve deform so they follow the cloth)
-    tail = W.plate("z_tail", (0.15, 0.012, 0.42), (0, -0.155, 0.83), jacket,
-                   rot=(12, 0, 0), taper=(1.35, 1.0), bevel_w=0.002)
-    strips = [W.plate(f"z_tail_glow.{s}", (0.005, 0.007, 0.30), (x, -0.164, 0.84),
-                      glow, rot=(12, 0, 0), bevel_w=0.001)
-              for s, x in (("L", 0.062), ("R", -0.062))]
-    W._activate(tail)
-    for st in strips:
-        st.select_set(True)
-    bpy.ops.object.join()
-    tail = bpy.context.object
-    for v in tail.data.vertices:
-        t = max(0.0, min(1.0, (1.04 - v.co.z) / 0.42))
-        v.co.y += 0.035 * math.sin(t * math.pi)
-    tail.data.update()
-    md = tail.modifiers.new("ss", "SUBSURF")
-    md.levels = 1
-    W._activate(tail)
-    bpy.ops.object.modifier_apply(modifier="ss")
-    A.append(tail)
-    # ---- legs: knee guards, white shin plates, boot soles + toes
+    A.append(W.plate("z_pouch", (0.064, 0.045, 0.082),
+                     (-0.145, 0.018, 0.995), gear, rot=(0, 0, 7),
+                     taper=(0.88, 0.86), bevel_w=0.004))
+    A.append(ring("z_wind_charm", 0.021, 0.0035, (0.145, 0.075, 1.002), metal,
+                  rot=(90, 0, 0), segs=(18, 6)))
+    A.append(chain("z_charm_swirl", [(0.134, 0.080, 1.005),
+                                      (0.145, 0.082, 1.013),
+                                      (0.155, 0.081, 1.003)],
+                   [0.0012, 0.0018, 0.0006], glow, subsurf=1))
+
+    # ---- two lightweight, wind-swept coat tails
+    A.append(ribbon("z_coattail.L", [(0.050, -0.092, 1.055),
+                                      (0.078, -0.135, 0.955),
+                                      (0.090, -0.145, 0.825),
+                                      (0.065, -0.120, 0.705)],
+                    [0.075, 0.082, 0.060, 0.012], jacket,
+                    thick=0.005, bevel_w=0.0025))
+    A.append(ribbon("z_coattail.R", [(-0.045, -0.090, 1.052),
+                                      (-0.070, -0.125, 0.970),
+                                      (-0.050, -0.150, 0.860),
+                                      (-0.015, -0.138, 0.760)],
+                    [0.068, 0.073, 0.050, 0.010], jacket_in,
+                    thick=0.005, bevel_w=0.0025))
+
+    # ---- minimal boots: grounded soles and a single smooth shoe volume
     for s, x in (("L", 0.082), ("R", -0.082)):
-        A.append(W.plate(f"z_knee.{s}", (0.095, 0.048, 0.105), (x, 0.026, 0.535), gear,
-                         rot=(-10, 0, 0), taper=(0.80, 0.70), bevel_w=0.003))
-        A.append(W.plate(f"z_shin.{s}", (0.070, 0.030, 0.190), (x, 0.030, 0.315),
-                         jacket, taper=(0.85, 0.80), bevel_w=0.003))
-        A.append(W.plate(f"z_sole.{s}", (0.090, 0.255, 0.026), (x, 0.052, 0.013), gear,
-                         bevel_w=0.004))
-        A.append(W.plate(f"z_toe.{s}", (0.084, 0.100, 0.056), (x, 0.160, 0.048), gear,
-                         taper=(0.85, 0.60), bevel_w=0.003))
-        A.append(W.plate(f"z_heel.{s}", (0.080, 0.050, 0.070), (x, -0.075, 0.045), gear,
-                         taper=(0.9, 0.8), bevel_w=0.003))
-    # ---- back wind unit: core + glow ring + 3 fan blades (proud of the jacket)
-    A.append(W.cyl("z_windcore", 0.056, 0.065, (0, -0.160, 1.295), gear, axis="Y",
-                   segs=24, bevel_w=0.003))
-    A.append(ring("z_windglow", 0.046, 0.007, (0, -0.196, 1.295), glow,
-                  rot=(90, 0, 0), segs=(24, 8)))
-    for i, (bx, ang) in enumerate(((-0.060, 18), (0, 0), (0.060, -18))):
-        A.append(W.plate(f"z_blade{i}", (0.015, 0.020, 0.185), (bx, -0.190, 1.372),
-                         metal, rot=(22, ang, 0), taper=(0.35, 0.60), bevel_w=0.002))
-        A.append(W.plate(f"z_bladeglow{i}", (0.006, 0.008, 0.15),
-                         (bx * 1.06, -0.200, 1.372), glow, rot=(22, ang, 0),
-                         taper=(0.35, 0.6), bevel_w=0.001))
-    # ---- glow seams + zipper + emblem
-    for s, x in (("L", 0.107), ("R", -0.107)):
-        A.append(W.plate(f"z_seam_leg.{s}", (0.005, 0.012, 0.30), (x, 0.004, 0.78),
-                         glow, bevel_w=0.001))
-    A.append(W.plate("z_zipper", (0.010, 0.012, 0.21), (0, 0.086, 1.315), accent,
-                     bevel_w=0.0015))
-    # teal presence: sleeve cuffs, jacket hem, boot-top bands
-    for s, x in (("L", 0.272), ("R", -0.272)):
-        A.append(ring(f"z_cuff.{s}", 0.052, 0.011, (x, -0.024, 1.118), accent,
-                      scale=(1, 1, 1.2), rot=(0, 10 if s == "L" else -10, 0),
-                      segs=(18, 8)))
-    A.append(W.plate("z_hem", (0.21, 0.014, 0.016), (0, 0.058, 1.098), accent,
-                     bevel_w=0.002))
-    for s, x in (("L", 0.086), ("R", -0.086)):
-        A.append(ring(f"z_boottop.{s}", 0.057, 0.010, (x, 0.010, 0.290), accent,
-                      scale=(1, 1.22, 0.7), segs=(18, 8)))
-    for i, r in enumerate((28, -28)):
-        A.append(W.plate(f"z_emblem{i}", (0.0035, 0.022, 0.007), (0.075 + i * 0.001, 0.088, 1.392),
-                         glow, rot=(0, 0, r), bevel_w=0.001))
+        A.append(W.plate(f"z_sole.{s}", (0.086, 0.235, 0.018),
+                         (x, 0.045, 0.012), gear, bevel_w=0.005))
+        A.append(ellipsoid(f"z_boot_toe.{s}", (x, 0.120, 0.052),
+                           (0.061, 0.075, 0.030), gear,
+                           rot=(6, 0, 0), segs=18, rings=10))
+
+    # ---- embroidered wind signature on the back; this replaces the fan pack
+    A.append(chain("z_back_wind_top", [(-0.070, -0.132, 1.355),
+                                        (-0.030, -0.142, 1.378),
+                                        (0.015, -0.144, 1.372),
+                                        (0.055, -0.136, 1.350)],
+                   [0.0020, 0.0030, 0.0020, 0.0007], accent, subsurf=1))
+    A.append(chain("z_back_wind_low", [(-0.045, -0.135, 1.325),
+                                        (-0.010, -0.144, 1.340),
+                                        (0.030, -0.140, 1.332)],
+                   [0.0015, 0.0024, 0.0006], glow, subsurf=1))
     return A
 
 
@@ -570,10 +649,16 @@ def addons_recruit(M, body, labels):
     return A
 
 
-ADDONS = {"zephyr_v4": addons_zephyr_v4, "recruit": addons_recruit}
+ADDONS = {"zephyr_v5": addons_zephyr_v5, "recruit": addons_recruit}
 
 
 def build(agent_key):
+    if agent_key == "zephyr":
+        # Zephyr's current production model is a clean-slate human build on the
+        # realistic CC0 base. Keep the legacy shell builder below for RECRUIT
+        # and for opening older saved sessions.
+        import build_zephyr_scratch
+        return build_zephyr_scratch.build()
     spec = AGENTS[agent_key]
     pal = spec["palette"]
     mn = spec.get("mat_names")
@@ -586,10 +671,24 @@ def build(agent_key):
     for m in list(bpy.data.materials):
         if m.name.startswith(f"ag_{agent_key}_"):
             bpy.data.materials.remove(m)
-    body = normalize_base(spec["height"], spec.get("head_scale", 1.0))
+    exposed_face = spec.get("exposed_face", False)
+    body = normalize_base(spec["height"], spec.get("head_scale", 1.0),
+                          flatten_face=not exposed_face,
+                          flatten_chest=not exposed_face)
     labels, parts = label_faces(body.data)
     body.data.materials.clear()
     body.data.materials.append(mat(agent_key, "suit", pal["suit"], mn))
+    if exposed_face:
+        body.data.materials.append(mat(agent_key, "skin", pal["skin"], mn))
+        body.data.materials.append(mat(agent_key, "hair", pal["hair"], mn))
+        for p in body.data.polygons:
+            part = labels.get(p.index)
+            c = p.center
+            if part == "scalp" or (part == "head" and
+                                   (c.y < 0.012 or c.z > 1.675)):
+                p.material_index = 2
+            elif part in ("head", "ear.L", "ear.R"):
+                p.material_index = 1
     made = [body]
     shells = []
     for g in spec["gear"]:
@@ -598,7 +697,7 @@ def build(agent_key):
                   g["offset"], g["thick"], m)
         if g["region"] in ("jacket", "gloves", "pants", "helmet"):
             smooth_open_boundary(s)
-        if g["region"] == "jacket":
+        if g["region"] == "jacket" and not exposed_face:
             flatten_jacket_chest(s)
         shells.append(s)
     made += shells
@@ -610,6 +709,13 @@ def build(agent_key):
     md.levels = 1
     W._activate(body)
     bpy.ops.object.modifier_apply(modifier="ss")
+    if exposed_face:
+        # Re-establish a clean hairline after subdivision. Material indices
+        # inherited from coarse source faces otherwise leave patchy bald areas.
+        for p in body.data.polygons:
+            c = p.center
+            if c.z > 1.645 or (c.z > 1.565 and c.y < 0.012):
+                p.material_index = 2
     W._smooth(body, 55)
     for o in shells:
         W._smooth(o, 55)

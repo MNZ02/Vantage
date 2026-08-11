@@ -5,6 +5,7 @@
 // placeholder AND the permanent fallback if a load fails, so the game never
 // renders nothing while (or because) a .glb is unavailable.
 import * as THREE from "three";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 
@@ -19,6 +20,7 @@ export type ModelName =
   | "prop_wall"
   | "agent"
   | "agent_zephyr"
+  | "agent_sonar"
   | "viewmodel_arms"
   | "viewmodel_arms_pistol"
   | "viewmodel_arms_knife"
@@ -33,39 +35,50 @@ export type ModelName =
 // dev (via /@fs) and fingerprints+bundles the .glb files on build — no
 // vite.config publicDir wiring and no copy of the assets into the package.
 const MODEL_URLS: Record<ModelName, string> = {
-  weapon_rifle: new URL("../../../assets/models/weapon_rifle.glb", import.meta.url).href,
-  weapon_pistol: new URL("../../../assets/models/weapon_pistol.glb", import.meta.url).href,
-  weapon_sniper: new URL("../../../assets/models/weapon_sniper.glb", import.meta.url).href,
-  weapon_knife: new URL("../../../assets/models/weapon_knife.glb", import.meta.url).href,
-  prop_barrel: new URL("../../../assets/models/prop_barrel.glb", import.meta.url).href,
-  prop_spike: new URL("../../../assets/models/prop_spike.glb", import.meta.url).href,
-  prop_crate: new URL("../../../assets/models/prop_crate.glb", import.meta.url).href,
-  prop_wall: new URL("../../../assets/models/prop_wall.glb", import.meta.url).href,
+  weapon_rifle: new URL("../../../assets/models/compressed/weapon_rifle.glb", import.meta.url).href,
+  weapon_pistol: new URL("../../../assets/models/compressed/weapon_pistol.glb", import.meta.url).href,
+  weapon_sniper: new URL("../../../assets/models/compressed/weapon_sniper.glb", import.meta.url).href,
+  weapon_knife: new URL("../../../assets/models/compressed/weapon_knife.glb", import.meta.url).href,
+  prop_barrel: new URL("../../../assets/models/compressed/prop_barrel.glb", import.meta.url).href,
+  prop_spike: new URL("../../../assets/models/compressed/prop_spike.glb", import.meta.url).href,
+  prop_crate: new URL("../../../assets/models/compressed/prop_crate.glb", import.meta.url).href,
+  prop_wall: new URL("../../../assets/models/compressed/prop_wall.glb", import.meta.url).href,
   // agent_placeholder.glb: skinned humanoid (18-bone rig). Clone with
   // cloneSkinnedModel below — never cloneModel — so the skeleton is rebound.
   // agent_zephyr.glb: the Zephyr hero (agentId 0), same 18-bone rig, so it
   // drives through the identical bone code — placeholder covers other agents.
-  agent: new URL("../../../assets/models/agent_placeholder.glb", import.meta.url).href,
-  agent_zephyr: new URL("../../../assets/models/agent_zephyr.glb", import.meta.url).href,
+  // agent_sonar.glb: an externally generated character fitted to the same
+  // 18-bone rig by tools/agentgen/import_agent.py — textured body material plus
+  // flat ag_sonar_accent/_glow regions for IFF retinting.
+  agent: new URL("../../../assets/models/compressed/agent_placeholder.glb", import.meta.url).href,
+  agent_zephyr: new URL("../../../assets/models/compressed/agent_zephyr.glb", import.meta.url).href,
+  agent_sonar: new URL("../../../assets/models/compressed/agent_sonar.glb", import.meta.url).href,
   // FP arms are authored per weapon CLASS (one grip pose can't serve a rifle
   // handguard, a pistol cup-grip and a one-handed knife). The base file is
   // the rifle/smg pose; _pistol/_knife/_sniper are selected by
   // viewmodel.ts armsModelFor(agentId, weaponClass).
-  viewmodel_arms: new URL("../../../assets/models/viewmodel_arms.glb", import.meta.url).href,
-  viewmodel_arms_pistol: new URL("../../../assets/models/viewmodel_arms_pistol.glb", import.meta.url).href,
-  viewmodel_arms_knife: new URL("../../../assets/models/viewmodel_arms_knife.glb", import.meta.url).href,
-  viewmodel_arms_sniper: new URL("../../../assets/models/viewmodel_arms_sniper.glb", import.meta.url).href,
-  viewmodel_zephyr: new URL("../../../assets/models/viewmodel_zephyr.glb", import.meta.url).href,
-  viewmodel_zephyr_pistol: new URL("../../../assets/models/viewmodel_zephyr_pistol.glb", import.meta.url).href,
-  viewmodel_zephyr_knife: new URL("../../../assets/models/viewmodel_zephyr_knife.glb", import.meta.url).href,
-  viewmodel_zephyr_sniper: new URL("../../../assets/models/viewmodel_zephyr_sniper.glb", import.meta.url).href,
+  viewmodel_arms: new URL("../../../assets/models/compressed/viewmodel_arms.glb", import.meta.url).href,
+  viewmodel_arms_pistol: new URL("../../../assets/models/compressed/viewmodel_arms_pistol.glb", import.meta.url).href,
+  viewmodel_arms_knife: new URL("../../../assets/models/compressed/viewmodel_arms_knife.glb", import.meta.url).href,
+  viewmodel_arms_sniper: new URL("../../../assets/models/compressed/viewmodel_arms_sniper.glb", import.meta.url).href,
+  viewmodel_zephyr: new URL("../../../assets/models/compressed/viewmodel_zephyr.glb", import.meta.url).href,
+  viewmodel_zephyr_pistol: new URL("../../../assets/models/compressed/viewmodel_zephyr_pistol.glb", import.meta.url).href,
+  viewmodel_zephyr_knife: new URL("../../../assets/models/compressed/viewmodel_zephyr_knife.glb", import.meta.url).href,
+  viewmodel_zephyr_sniper: new URL("../../../assets/models/compressed/viewmodel_zephyr_sniper.glb", import.meta.url).href,
   // map_crossing.glb: visual-only level mesh generated from the SAME
   // @vg/sim LEVEL_BOXES that drive collision (tools/mapgen/build_map.py),
   // with baked vertex-color AO. Collision never reads this file.
-  map_crossing: new URL("../../../assets/models/map_crossing.glb", import.meta.url).href,
+  map_crossing: new URL("../../../assets/models/compressed/map_crossing.glb", import.meta.url).href,
 };
 
+// Every glb in MODEL_URLS is Draco-compressed (tools/compress_assets.mjs —
+// the uncompressed canonical exports stay in assets/models/ for the Python
+// tooling). The decoder wasm lives in public/draco/, served at /draco/ by
+// Vite in dev and copied into dist/ at build.
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath("/draco/");
 const loader = new GLTFLoader();
+loader.setDRACOLoader(dracoLoader);
 const pending = new Map<ModelName, Promise<THREE.Group | null>>();
 const loaded = new Map<ModelName, THREE.Group>();
 const loadedAnimations = new Map<ModelName, THREE.AnimationClip[]>();

@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import bpy
+from mathutils import Vector
 
 TOOLS = Path(__file__).resolve().parent if "__file__" in globals() else Path(
     "/Users/mnz/dev/valorant-clone/tools/agentgen")
@@ -43,6 +44,33 @@ for s, x in (("L", 1), ("R", -1)):
         (f"thigh.{s}", (x * 0.085, 0, 0.96), (x * 0.095, 0.005, 0.53), "hips", False),
         (f"shin.{s}", (x * 0.095, 0.005, 0.53), (x * 0.10, -0.01, 0.12), f"thigh.{s}", True),
         (f"foot.{s}", (x * 0.10, -0.01, 0.12), (x * 0.10, 0.16, 0.03), f"shin.{s}", True),
+    ]
+
+# The clean-slate realistic Zephyr has longer, more open A-pose arms than the
+# legacy stylized body. Bone names/hierarchy are identical; only joint centers
+# change so runtime bone driving rotates around the visible elbows and wrists.
+ZEPHYR_BONES = [
+    ("root", (0, 0, 0), (0, 0.25, 0), None, False),
+    ("hips", (0, 0, 0.98), (0, 0, 1.09), "root", False),
+    ("spine", (0, 0, 1.09), (0, 0, 1.28), "hips", True),
+    ("chest", (0, 0, 1.28), (0, 0, 1.45), "spine", True),
+    ("neck", (0, 0, 1.45), (0, 0, 1.52), "chest", True),
+    ("head", (0, 0, 1.52), (0, 0, 1.72), "neck", True),
+]
+for s, x in (("L", 1), ("R", -1)):
+    ZEPHYR_BONES += [
+        (f"upper_arm.{s}", (x * 0.18, -0.005, 1.41),
+         (x * 0.30, -0.015, 1.14), "chest", False),
+        (f"forearm.{s}", (x * 0.30, -0.015, 1.14),
+         (x * 0.39, -0.025, 0.91), f"upper_arm.{s}", True),
+        (f"hand.{s}", (x * 0.39, -0.025, 0.91),
+         (x * 0.43, -0.030, 0.78), f"forearm.{s}", True),
+        (f"thigh.{s}", (x * 0.085, 0, 0.96),
+         (x * 0.100, 0.005, 0.53), "hips", False),
+        (f"shin.{s}", (x * 0.100, 0.005, 0.53),
+         (x * 0.108, -0.010, 0.13), f"thigh.{s}", True),
+        (f"foot.{s}", (x * 0.108, -0.010, 0.13),
+         (x * 0.108, 0.17, 0.04), f"shin.{s}", True),
     ]
 
 
@@ -102,8 +130,48 @@ def _segment_weights(mesh, arm, top=2):
             groups[n].add([v.index], w / tot, "REPLACE")
 
 
+def _pin_zephyr_accessories(mesh):
+    """Give small layered accessories stable, intentional rigid parents.
+
+    The ivory tail has a unique material.  The teal tail shares the accent
+    material, so its rest-space bounds distinguish it from the jacket/soles.
+    Pinning the tails avoids a long stretched triangle when the walk cycle
+    swings the left leg and arm in opposite directions. Low gear/accent/ivory
+    polygons are the complete shoes, cuffs, soles and laces; pin each set to
+    its foot so their overlapping layers cannot separate in a stride.
+    """
+    streamers = set()
+    footwear = {"foot.L": set(), "foot.R": set()}
+    slots = [s.material.name if s.material else "" for s in mesh.material_slots]
+    for poly in mesh.data.polygons:
+        name = slots[poly.material_index] if poly.material_index < len(slots) else ""
+        c = sum((mesh.data.vertices[i].co for i in poly.vertices), Vector()) / len(poly.vertices)
+        if (name in {"ag_zephyr_gear", "ag_zephyr_accent", "ag_zephyr_ivory"}
+                and c.z < 0.25):
+            footwear["foot.L" if c.x >= 0 else "foot.R"].update(poly.vertices)
+            continue
+        if name == "ag_zephyr_ivory" and c.z > 0.50:
+            streamers.update(poly.vertices)
+        elif (name == "ag_zephyr_accent" and c.x < -0.14
+              and c.y < -0.025 and 0.55 < c.z < 1.15):
+            streamers.update(poly.vertices)
+
+    assignments = {"hips": streamers, **footwear}
+    assigned = 0
+    for bone, vertices in assignments.items():
+        if not vertices:
+            continue
+        indices = sorted(vertices)
+        for group in mesh.vertex_groups:
+            group.remove(indices)
+        mesh.vertex_groups[bone].add(indices, 1.0, "REPLACE")
+        assigned += len(indices)
+    return assigned
+
+
 def rig_and_export(agent_key, bake_ao=True):
     spec = AGENTS[agent_key]
+    bones = ZEPHYR_BONES if agent_key == "zephyr" else BONES
     coll = bpy.data.collections[f"agent_{agent_key}"]
     dups = []
     bpy.ops.object.select_all(action="DESELECT")
@@ -132,58 +200,79 @@ def rig_and_export(agent_key, bake_ao=True):
         md.use_collapse_triangulate = True
         bpy.ops.object.modifier_apply(modifier="dec")
 
-    # exact height: client scales by its hardcoded AGENT_MODEL_HEIGHT
+    # Exact floor-to-top height: client scales by AGENT_MODEL_HEIGHT. The old
+    # max(z) calculation left beveled soles about 2.3 cm below the floor.
     want = spec.get("max_height")
+    mesh_scale = 1.0
+    mesh_lift = 0.0
     if want:
         zs = [v.co.z for v in mesh.data.vertices]
-        h = max(zs)
+        lo, hi = min(zs), max(zs)
+        h = hi - lo
         if abs(h - want) > 1e-4:
-            f = want / h
+            mesh_scale = want / h
+            mesh_lift = -lo * mesh_scale
             for v in mesh.data.vertices:
-                v.co *= f
+                v.co.x *= mesh_scale
+                v.co.y *= mesh_scale
+                v.co.z = (v.co.z - lo) * mesh_scale
             mesh.data.update()
 
     if bake_ao:
         bake_vertex_ao(mesh)
 
     # armature
-    old = bpy.data.objects.get(f"{agent_key}_rig_v4")
+    rig_name = f"{agent_key}_rig_v6" if agent_key == "zephyr" else f"{agent_key}_rig_v4"
+    old = bpy.data.objects.get(rig_name)
     if old:
         bpy.data.objects.remove(old, do_unlink=True)
-    arm_data = bpy.data.armatures.new(f"{agent_key}_rig_v4")
-    arm = bpy.data.objects.new(f"{agent_key}_rig_v4", arm_data)
+    arm_data = bpy.data.armatures.new(rig_name)
+    arm = bpy.data.objects.new(rig_name, arm_data)
     bpy.context.scene.collection.objects.link(arm)
     bpy.ops.object.select_all(action="DESELECT")
     arm.select_set(True)
     bpy.context.view_layer.objects.active = arm
     bpy.ops.object.mode_set(mode="EDIT")
     eb = arm_data.edit_bones
-    sc = (want / 1.76) if want else 1.0  # bones measured on ~1.76-top base
-    for name, head, tail, parent, connect in BONES:
+    sc = mesh_scale if agent_key == "zephyr" else ((want / 1.76) if want else 1.0)
+    for name, head, tail, parent, connect in bones:
         b = eb.new(name)
-        b.head = [c * sc for c in head]
-        b.tail = [c * sc for c in tail]
+        b.head = [head[0] * sc, head[1] * sc, head[2] * sc + mesh_lift]
+        b.tail = [tail[0] * sc, tail[1] * sc, tail[2] * sc + mesh_lift]
         if parent:
             b.parent = eb[parent]
             b.use_connect = connect
     bpy.ops.object.mode_set(mode="OBJECT")
 
-    # auto weights, with a deterministic nearest-segment fallback (heat can
-    # fail on tightly layered gear — "Bone Heat Weighting: failed ...")
-    bpy.ops.object.select_all(action="DESELECT")
-    mesh.select_set(True)
-    arm.select_set(True)
-    bpy.context.view_layer.objects.active = arm
-    bpy.ops.object.parent_set(type="ARMATURE_AUTO")
-    has_arm_mod = any(md.type == "ARMATURE" for md in mesh.modifiers)
-    weighted = sum(1 for v in mesh.data.vertices if v.groups) if mesh.vertex_groups else 0
-    if not has_arm_mod or weighted < len(mesh.data.vertices) * 0.9:
+    # Zephyr is assembled from closely layered body/garment shells. Bone heat
+    # can give those adjacent surfaces materially different weights, opening
+    # holes during a walk pose. The segment solver depends only on position,
+    # so matching layers bend together. Keep heat weights for the legacy
+    # recruit, with the same deterministic fallback on failure.
+    if agent_key == "zephyr":
         bpy.ops.object.select_all(action="DESELECT")
         mesh.select_set(True)
         arm.select_set(True)
         bpy.context.view_layer.objects.active = arm
         bpy.ops.object.parent_set(type="ARMATURE_NAME")
         _segment_weights(mesh, arm)
+        _pin_zephyr_accessories(mesh)
+    else:
+        bpy.ops.object.select_all(action="DESELECT")
+        mesh.select_set(True)
+        arm.select_set(True)
+        bpy.context.view_layer.objects.active = arm
+        bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+        has_arm_mod = any(md.type == "ARMATURE" for md in mesh.modifiers)
+        weighted = (sum(1 for v in mesh.data.vertices if v.groups)
+                    if mesh.vertex_groups else 0)
+        if not has_arm_mod or weighted < len(mesh.data.vertices) * 0.9:
+            bpy.ops.object.select_all(action="DESELECT")
+            mesh.select_set(True)
+            arm.select_set(True)
+            bpy.context.view_layer.objects.active = arm
+            bpy.ops.object.parent_set(type="ARMATURE_NAME")
+            _segment_weights(mesh, arm)
     bpy.ops.object.select_all(action="DESELECT")
     mesh.select_set(True)
     bpy.context.view_layer.objects.active = mesh
@@ -196,7 +285,7 @@ def rig_and_export(agent_key, bake_ao=True):
     # no vertex may be unweighted (exporter would invent a neutral_bone)
     from mathutils import Vector as _V
     segs = [(mesh.vertex_groups.get(n), _V(h), _V(t))
-            for n, h, t, p, c in [(b[0], b[1], b[2], b[3], b[4]) for b in BONES]
+            for n, h, t, p, c in [(b[0], b[1], b[2], b[3], b[4]) for b in bones]
             if n != "root" and mesh.vertex_groups.get(n)]
     filled = 0
     for v in mesh.data.vertices:
